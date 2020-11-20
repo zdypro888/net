@@ -15,8 +15,7 @@ type ProxyType int
 //代理类型
 const (
 	HTTP   ProxyType = 0
-	HTTPS  ProxyType = 1
-	SOCKS5 ProxyType = 2
+	SOCKS5 ProxyType = 1
 )
 
 //Proxy 代理
@@ -52,8 +51,6 @@ func (proxy *Proxy) GetProxyURL(req *http.Request) (*url.URL, error) {
 	switch proxy.Type {
 	case HTTP:
 		proxyURL.Scheme = "http"
-	case HTTPS:
-		proxyURL.Scheme = "https"
 	case SOCKS5:
 		proxyURL.Scheme = "socks5"
 	default:
