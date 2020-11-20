@@ -29,6 +29,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/zdypro888/net/socks5"
+
 	"github.com/zdypro888/net/http/httptrace"
 
 	"golang.org/x/net/http/httpguts"
@@ -1595,15 +1597,15 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *pers
 		// Do nothing. Not using a proxy.
 	case cm.proxyURL.Scheme == "socks5":
 		conn := pconn.conn
-		d := socksNewDialer("tcp", conn.RemoteAddr().String())
+		d := socks5.NewDialer("tcp", conn.RemoteAddr().String())
 		if u := cm.proxyURL.User; u != nil {
-			auth := &socksUsernamePassword{
+			auth := &socks5.UsernamePassword{
 				Username: u.Username(),
 			}
 			auth.Password, _ = u.Password()
-			d.AuthMethods = []socksAuthMethod{
-				socksAuthMethodNotRequired,
-				socksAuthMethodUsernamePassword,
+			d.AuthMethods = []socks5.AuthMethod{
+				socks5.AuthMethodNotRequired,
+				socks5.AuthMethodUsernamePassword,
 			}
 			d.Authenticate = auth.Authenticate
 		}
