@@ -29,10 +29,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/zdypro888/net/socks5"
-
 	"github.com/zdypro888/net/http/httptrace"
-
+	"github.com/zdypro888/net/socks5"
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/http/httpproxy"
 )
