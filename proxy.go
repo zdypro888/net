@@ -1,19 +1,22 @@
 package net
 
 import (
+	"fmt"
+	"net/url"
 	"strings"
 
+	"github.com/zdypro888/net/http"
 	"github.com/zdypro888/utils"
 )
 
 //ProxyType 代理种类
 type ProxyType int
 
+//代理类型
 const (
-	//HTTP HTTP代理
-	HTTP ProxyType = 0
-	//SOCKS5 Socks5代理
-	SOCKS5 ProxyType = 1
+	HTTP   ProxyType = 0
+	HTTPS  ProxyType = 1
+	SOCKS5 ProxyType = 2
 )
 
 //Proxy 代理
@@ -40,4 +43,24 @@ func LoadProxys(pt ProxyType, i interface{}) ([]*Proxy, error) {
 		return nil, err
 	}
 	return proxys, nil
+}
+
+//GetProxyURL 取得代理地址
+func (proxy *Proxy) GetProxyURL(req *http.Request) (*url.URL, error) {
+	proxyURL := new(url.URL)
+	proxyURL.Host = proxy.Address
+	switch proxy.Type {
+	case HTTP:
+		proxyURL.Scheme = "http"
+	case HTTPS:
+		proxyURL.Scheme = "https"
+	case SOCKS5:
+		proxyURL.Scheme = "socks5"
+	default:
+		return nil, fmt.Errorf("type not supported: %d", proxy.Type)
+	}
+	if proxy.UserName != "" {
+		proxyURL.User = url.UserPassword(proxy.UserName, proxy.Password)
+	}
+	return proxyURL, nil
 }

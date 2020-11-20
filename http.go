@@ -13,7 +13,6 @@ import (
 	"github.com/andybalholm/brotli"
 	"github.com/zdypro888/net/http"
 	"github.com/zdypro888/net/http2"
-	netproxy "golang.org/x/net/proxy"
 )
 
 //HTTPDebugProxy 调试代理
@@ -122,27 +121,7 @@ func requestMethod(httpv2 bool, url string, method string, proxy *Proxy, headers
 		proxy = GobalProxy
 	}
 	if proxy != nil {
-		switch proxy.Type {
-		case HTTP:
-			proxyURL, err := nurl.Parse(proxy.Address)
-			if proxy.UserName != "" {
-				proxyURL.User = nurl.UserPassword(proxy.UserName, proxy.Password)
-			}
-			if err != nil {
-				return nil, err
-			}
-			transport.Proxy = http.ProxyURL(proxyURL)
-		case SOCKS5:
-			var auth *netproxy.Auth
-			if proxy.UserName != "" {
-				auth = &netproxy.Auth{User: proxy.UserName, Password: proxy.Password}
-			}
-			dialer, err := netproxy.SOCKS5("tcp", proxy.Address, auth, netproxy.Direct)
-			if err != nil {
-				return nil, err
-			}
-			transport.Dial = dialer.Dial
-		}
+		transport.Proxy = proxy.GetProxyURL
 	}
 	client := &http.Client{
 		Transport: transport,
