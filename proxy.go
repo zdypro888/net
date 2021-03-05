@@ -61,7 +61,15 @@ func (proxy *Proxy) GetProxyURL(req *http.Request) (*url.URL, error) {
 		return nil, fmt.Errorf("type not supported: %d", proxy.Type)
 	}
 	if proxy.UserName != "" {
-		proxyURL.User = url.UserPassword(proxy.UserName, proxy.Password)
+		username, err := utils.RandomTemplateText(proxy.UserName)
+		if err != nil {
+			return nil, err
+		}
+		password, err := utils.RandomTemplateText(proxy.Password)
+		if err != nil {
+			return nil, err
+		}
+		proxyURL.User = url.UserPassword(username, password)
 	}
 	return proxyURL, nil
 }
@@ -71,10 +79,18 @@ func (proxy *Proxy) Dial(network, address string) (net.Conn, error) {
 	if proxy.Type == SOCKS5 {
 		d := socks5.NewDialer("tcp", proxy.Address)
 		if proxy.UserName != "" {
-			auth := &socks5.UsernamePassword{
-				Username: proxy.UserName,
+			username, err := utils.RandomTemplateText(proxy.UserName)
+			if err != nil {
+				return nil, err
 			}
-			auth.Password = proxy.Password
+			password, err := utils.RandomTemplateText(proxy.Password)
+			if err != nil {
+				return nil, err
+			}
+			auth := &socks5.UsernamePassword{
+				Username: username,
+			}
+			auth.Password = password
 			d.AuthMethods = []socks5.AuthMethod{
 				socks5.AuthMethodNotRequired,
 				socks5.AuthMethodUsernamePassword,
@@ -94,7 +110,15 @@ func (proxy *Proxy) Dial(network, address string) (net.Conn, error) {
 		}
 		connectReq.Header = make(http.Header)
 		if proxy.UserName != "" {
-			auth := proxy.UserName + ":" + proxy.Password
+			username, err := utils.RandomTemplateText(proxy.UserName)
+			if err != nil {
+				return nil, err
+			}
+			password, err := utils.RandomTemplateText(proxy.Password)
+			if err != nil {
+				return nil, err
+			}
+			auth := username + ":" + password
 			connectReq.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(auth)))
 		}
 		if err = connectReq.Write(conn); err != nil {
