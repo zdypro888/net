@@ -2,6 +2,7 @@ package net
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"net"
@@ -50,13 +51,17 @@ func LoadProxys(pt ProxyType, i interface{}) ([]*Proxy, error) {
 
 //GetProxyURL 取得代理地址
 func (proxy *Proxy) GetProxyURL(req *http.Request) (*url.URL, error) {
-	proxyURL := new(url.URL)
-	proxyURL.Host = proxy.Address
+	var proxyURL *url.URL
 	switch proxy.Type {
 	case HTTP:
-		proxyURL.Scheme = "http"
+		var err error
+		if proxyURL, err = url.Parse(proxy.Address); err != nil {
+			return nil, err
+		}
 	case SOCKS5:
+		proxyURL := new(url.URL)
 		proxyURL.Scheme = "socks5"
+		proxyURL.Host = proxy.Address
 	default:
 		return nil, fmt.Errorf("type not supported: %d", proxy.Type)
 	}
@@ -97,7 +102,7 @@ func (proxy *Proxy) Dial(network, address string) (net.Conn, error) {
 			}
 			d.Authenticate = auth.Authenticate
 		}
-		return d.Dial(network, address)
+		return d.DialContext(context.Background(), network, address)
 	} else if proxy.Type == HTTP {
 		conn, err := net.Dial("tcp", proxy.Address)
 		if err != nil {
