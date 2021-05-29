@@ -59,7 +59,7 @@ func (proxy *Proxy) GetProxyURL(req *http.Request) (*url.URL, error) {
 			return nil, err
 		}
 	case SOCKS5:
-		proxyURL := new(url.URL)
+		proxyURL = new(url.URL)
 		proxyURL.Scheme = "socks5"
 		proxyURL.Host = proxy.Address
 	default:
