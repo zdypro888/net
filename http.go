@@ -16,7 +16,7 @@ import (
 )
 
 //HTTPDebugProxy 调试代理
-var HTTPDebugProxy = &Proxy{Type: HTTP, Address: "http://127.0.0.1:8888"}
+var HTTPDebugProxy = &Proxy{Address: "http://127.0.0.1:8888"}
 
 //GobalProxy 通用代理
 var GobalProxy *Proxy

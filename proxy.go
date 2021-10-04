@@ -7,41 +7,22 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"strings"
 
 	"github.com/zdypro888/net/http"
 	"github.com/zdypro888/net/socks5"
 	"github.com/zdypro888/utils"
 )
 
-//ProxyType 代理种类
-type ProxyType int
-
-//代理类型
-const (
-	HTTP   ProxyType = 0
-	SOCKS5 ProxyType = 1
-)
-
 //Proxy 代理
 type Proxy struct {
-	Type     ProxyType `bson:"Type" json:"Type"`
-	Address  string    `bson:"Address" json:"Address"`
-	UserName string    `bson:"UserName" json:"UserName"`
-	Password string    `bson:"Password" json:"Password"`
+	Address string `bson:"Address" json:"Address"`
 }
 
 //LoadProxys 从文件读取所有代理信息
-func LoadProxys(pt ProxyType, i interface{}) ([]*Proxy, error) {
+func LoadProxys(i interface{}) ([]*Proxy, error) {
 	proxys := make([]*Proxy, 0)
 	if err := utils.ReadLines(i, func(line string) error {
-		if ua := strings.Split(line, "@"); len(ua) == 2 {
-			if up := strings.Split(ua[0], ":"); len(up) == 2 {
-				proxys = append(proxys, &Proxy{Type: pt, Address: ua[1], UserName: up[0], Password: up[1]})
-			}
-		} else if len(ua) == 1 {
-			proxys = append(proxys, &Proxy{Type: pt, Address: ua[0]})
-		}
+		proxys = append(proxys, &Proxy{Address: line})
 		return nil
 	}); err != nil {
 		return nil, err
@@ -51,51 +32,30 @@ func LoadProxys(pt ProxyType, i interface{}) ([]*Proxy, error) {
 
 //GetProxyURL 取得代理地址
 func (proxy *Proxy) GetProxyURL(req *http.Request) (*url.URL, error) {
-	var proxyURL *url.URL
-	switch proxy.Type {
-	case HTTP:
-		var err error
-		if proxyURL, err = url.Parse(proxy.Address); err != nil {
-			return nil, err
-		}
-	case SOCKS5:
-		proxyURL = new(url.URL)
-		proxyURL.Scheme = "socks5"
-		proxyURL.Host = proxy.Address
-	default:
-		return nil, fmt.Errorf("type not supported: %d", proxy.Type)
+	address, err := utils.RandomTemplateText(proxy.Address)
+	if err != nil {
+		return nil, err
 	}
-	if proxy.UserName != "" {
-		username, err := utils.RandomTemplateText(proxy.UserName)
-		if err != nil {
-			return nil, err
-		}
-		password, err := utils.RandomTemplateText(proxy.Password)
-		if err != nil {
-			return nil, err
-		}
-		proxyURL.User = url.UserPassword(username, password)
-	}
-	return proxyURL, nil
+	return url.Parse(address)
 }
 
 //Dial 拨号
 func (proxy *Proxy) Dial(network, address string) (net.Conn, error) {
-	if proxy.Type == SOCKS5 {
+	address, err := utils.RandomTemplateText(proxy.Address)
+	if err != nil {
+		return nil, err
+	}
+	proxyURL, err := url.Parse(address)
+	if err != nil {
+		return nil, err
+	}
+	if proxyURL.Scheme == "socks5" {
 		d := socks5.NewDialer("tcp", proxy.Address)
-		if proxy.UserName != "" {
-			username, err := utils.RandomTemplateText(proxy.UserName)
-			if err != nil {
-				return nil, err
-			}
-			password, err := utils.RandomTemplateText(proxy.Password)
-			if err != nil {
-				return nil, err
-			}
+		if proxyURL.User != nil {
 			auth := &socks5.UsernamePassword{
-				Username: username,
+				Username: proxyURL.User.Username(),
 			}
-			auth.Password = password
+			auth.Password, _ = proxyURL.User.Password()
 			d.AuthMethods = []socks5.AuthMethod{
 				socks5.AuthMethodNotRequired,
 				socks5.AuthMethodUsernamePassword,
@@ -103,7 +63,7 @@ func (proxy *Proxy) Dial(network, address string) (net.Conn, error) {
 			d.Authenticate = auth.Authenticate
 		}
 		return d.DialContext(context.Background(), network, address)
-	} else if proxy.Type == HTTP {
+	} else if proxyURL.Scheme == "http" || proxyURL.Scheme == "https" {
 		conn, err := net.Dial("tcp", proxy.Address)
 		if err != nil {
 			return nil, err
@@ -114,16 +74,8 @@ func (proxy *Proxy) Dial(network, address string) (net.Conn, error) {
 			Host:   address,
 		}
 		connectReq.Header = make(http.Header)
-		if proxy.UserName != "" {
-			username, err := utils.RandomTemplateText(proxy.UserName)
-			if err != nil {
-				return nil, err
-			}
-			password, err := utils.RandomTemplateText(proxy.Password)
-			if err != nil {
-				return nil, err
-			}
-			auth := username + ":" + password
+		if proxyURL.User != nil {
+			auth := proxyURL.User.String()
 			connectReq.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(auth)))
 		}
 		if err = connectReq.Write(conn); err != nil {
@@ -142,5 +94,5 @@ func (proxy *Proxy) Dial(network, address string) (net.Conn, error) {
 		}
 		return conn, nil
 	}
-	return nil, fmt.Errorf("type: %d not supported", proxy.Type)
+	return nil, fmt.Errorf("type: %d not supported", proxyURL.Scheme)
 }
