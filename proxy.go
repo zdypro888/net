@@ -13,6 +13,9 @@ import (
 	"github.com/zdypro888/utils"
 )
 
+//HTTPDebugProxy 调试代理
+var HTTPDebugProxy = &Proxy{Address: "http://127.0.0.1:8888"}
+
 //Proxy 代理
 type Proxy struct {
 	Address string `bson:"Address" json:"Address"`
@@ -94,5 +97,5 @@ func (proxy *Proxy) Dial(network, address string) (net.Conn, error) {
 		}
 		return conn, nil
 	}
-	return nil, fmt.Errorf("type: %d not supported", proxyURL.Scheme)
+	return nil, fmt.Errorf("type: %s not supported", proxyURL.Scheme)
 }

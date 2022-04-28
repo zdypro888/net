@@ -2,6 +2,7 @@ package net
 
 import (
 	"compress/gzip"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -14,12 +15,6 @@ import (
 	"github.com/zdypro888/net/http"
 	"github.com/zdypro888/net/http2"
 )
-
-//HTTPDebugProxy 调试代理
-var HTTPDebugProxy = &Proxy{Address: "http://127.0.0.1:8888"}
-
-//GobalProxy 通用代理
-var GobalProxy *Proxy
 
 //Header 头
 type Header = http.Header
@@ -40,57 +35,37 @@ func (res *Response) Error() string {
 }
 
 //Request Get or Post
-func Request(url string, proxy *Proxy, headers Header, body io.Reader) (*Response, error) {
-	return request(false, url, proxy, headers, body)
-}
-
-//RequestWithCookie Get or Post
-func RequestWithCookie(url string, proxy *Proxy, headers Header, cookieJar CookieJar, body io.Reader) (*Response, error) {
-	return requestWithCookie(false, url, proxy, headers, cookieJar, body)
+func Request(ctx context.Context, url string, headers Header, body io.Reader) (*Response, error) {
+	return request(ctx, false, url, headers, body)
 }
 
 //RequestMethod Http
-func RequestMethod(url string, method string, proxy *Proxy, headers Header, cookieJar CookieJar, body io.Reader) (*Response, error) {
-	return requestMethod(false, url, method, proxy, headers, cookieJar, body)
+func RequestMethod(ctx context.Context, url string, method string, headers Header, body io.Reader) (*Response, error) {
+	return requestMethod(ctx, false, url, method, headers, body)
 }
 
 //Request2 Get or Post
-func Request2(url string, proxy *Proxy, headers Header, body io.Reader) (*Response, error) {
-	return request(true, url, proxy, headers, body)
-}
-
-//RequestWithCookie2 Get or Post
-func RequestWithCookie2(url string, proxy *Proxy, headers Header, cookieJar CookieJar, body io.Reader) (*Response, error) {
-	return requestWithCookie(true, url, proxy, headers, cookieJar, body)
+func Request2(ctx context.Context, url string, headers Header, body io.Reader) (*Response, error) {
+	return request(ctx, true, url, headers, body)
 }
 
 //RequestMethod2 Http
-func RequestMethod2(url string, method string, proxy *Proxy, headers Header, cookieJar CookieJar, body io.Reader) (*Response, error) {
-	return requestMethod(true, url, method, proxy, headers, cookieJar, body)
+func RequestMethod2(ctx context.Context, url string, method string, headers Header, body io.Reader) (*Response, error) {
+	return requestMethod(ctx, true, url, method, headers, body)
 }
 
-func request(httpv2 bool, url string, proxy *Proxy, headers Header, body io.Reader) (*Response, error) {
+func request(ctx context.Context, httpv2 bool, url string, headers Header, body io.Reader) (*Response, error) {
 	var method string
 	if body == nil {
 		method = "GET"
 	} else {
 		method = "POST"
 	}
-	return RequestMethod(url, method, proxy, headers, nil, body)
+	return RequestMethod(ctx, url, method, headers, body)
 }
 
-func requestWithCookie(httpv2 bool, url string, proxy *Proxy, headers Header, cookieJar CookieJar, body io.Reader) (*Response, error) {
-	var method string
-	if body == nil {
-		method = "GET"
-	} else {
-		method = "POST"
-	}
-	return RequestMethod(url, method, proxy, headers, cookieJar, body)
-}
-
-func requestMethod(httpv2 bool, url string, method string, proxy *Proxy, headers Header, cookieJar CookieJar, body io.Reader) (*Response, error) {
-	request, err := http.NewRequest(method, url, body)
+func requestMethod(ctx context.Context, httpv2 bool, url string, method string, headers Header, body io.Reader) (*Response, error) {
+	request, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return nil, err
 	}
@@ -117,16 +92,19 @@ func requestMethod(httpv2 bool, url string, method string, proxy *Proxy, headers
 			return nil, err
 		}
 	}
-	if proxy == nil && GobalProxy != nil {
-		proxy = GobalProxy
-	}
-	if proxy != nil {
-		transport.Proxy = proxy.GetProxyURL
+	if pctx, ok := ctx.(ProxyContext); ok {
+		if proxy := pctx.WithProxy(); proxy != nil {
+			transport.Proxy = proxy.GetProxyURL
+		}
 	}
 	client := &http.Client{
 		Transport: transport,
 		Timeout:   120 * time.Second,
-		Jar:       cookieJar,
+	}
+	if jctx, ok := ctx.(CookieContext); ok {
+		if cookieJar := jctx.WithCookie(); cookieJar != nil {
+			client.Jar = cookieJar
+		}
 	}
 	var redirects []*nurl.URL
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
