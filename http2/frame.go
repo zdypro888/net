@@ -198,7 +198,7 @@ func (h FrameHeader) writeDebug(buf *bytes.Buffer) {
 			if name != "" {
 				buf.WriteString(name)
 			} else {
-				fmt.Fprintf(buf, "0x%x", 1<<i)
+				fmt.Fprintf(buf, "%#x", 1<<i)
 			}
 		}
 	}

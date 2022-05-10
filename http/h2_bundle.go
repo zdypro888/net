@@ -1129,7 +1129,7 @@ func (e http2ErrCode) String() string {
 	if s, ok := http2errCodeName[e]; ok {
 		return s
 	}
-	return fmt.Sprintf("unknown error code 0x%x", uint32(e))
+	return fmt.Sprintf("unknown error code %#x", uint32(e))
 }
 
 // ConnectionError is an error that results in the termination of the
@@ -1438,7 +1438,7 @@ func (h http2FrameHeader) writeDebug(buf *bytes.Buffer) {
 			if name != "" {
 				buf.WriteString(name)
 			} else {
-				fmt.Fprintf(buf, "0x%x", 1<<i)
+				fmt.Fprintf(buf, "%#x", 1<<i)
 			}
 		}
 	}
