@@ -4,8 +4,8 @@ go 1.18
 
 require (
 	github.com/andybalholm/brotli v1.0.4
-	github.com/zdypro888/utils v1.10.0
-	golang.org/x/crypto v0.0.0-20220411220226-7b82a4e95df4
+	github.com/zdypro888/utils v1.20.0
+	golang.org/x/crypto v0.0.0-20220507011949-2cf3adece122
 	golang.org/x/net v0.0.0-20220425223048-2871e0cb64e4
 )
 
