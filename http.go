@@ -8,19 +8,13 @@ import (
 	"io"
 	"io/ioutil"
 	"net"
+	"net/http"
 	nurl "net/url"
 	"time"
 
 	"github.com/andybalholm/brotli"
-	"github.com/zdypro888/net/http"
-	"github.com/zdypro888/net/http2"
+	"golang.org/x/net/http2"
 )
-
-//Header 头
-type Header = http.Header
-
-//CookieJar cookeis
-type CookieJar = http.CookieJar
 
 //Response 请求返回
 type Response struct {
@@ -35,26 +29,26 @@ func (res *Response) Error() string {
 }
 
 //Request Get or Post
-func Request(ctx context.Context, url string, headers Header, body io.Reader) (*Response, error) {
+func Request(ctx context.Context, url string, headers http.Header, body io.Reader) (*Response, error) {
 	return request(ctx, false, url, headers, body)
 }
 
 //RequestMethod Http
-func RequestMethod(ctx context.Context, url string, method string, headers Header, body io.Reader) (*Response, error) {
+func RequestMethod(ctx context.Context, url string, method string, headers http.Header, body io.Reader) (*Response, error) {
 	return requestMethod(ctx, false, url, method, headers, body)
 }
 
 //Request2 Get or Post
-func Request2(ctx context.Context, url string, headers Header, body io.Reader) (*Response, error) {
+func Request2(ctx context.Context, url string, headers http.Header, body io.Reader) (*Response, error) {
 	return request(ctx, true, url, headers, body)
 }
 
 //RequestMethod2 Http
-func RequestMethod2(ctx context.Context, url string, method string, headers Header, body io.Reader) (*Response, error) {
+func RequestMethod2(ctx context.Context, url string, method string, headers http.Header, body io.Reader) (*Response, error) {
 	return requestMethod(ctx, true, url, method, headers, body)
 }
 
-func request(ctx context.Context, httpv2 bool, url string, headers Header, body io.Reader) (*Response, error) {
+func request(ctx context.Context, httpv2 bool, url string, headers http.Header, body io.Reader) (*Response, error) {
 	var method string
 	if body == nil {
 		method = "GET"
@@ -64,7 +58,7 @@ func request(ctx context.Context, httpv2 bool, url string, headers Header, body 
 	return RequestMethod(ctx, url, method, headers, body)
 }
 
-func requestMethod(ctx context.Context, httpv2 bool, url string, method string, headers Header, body io.Reader) (*Response, error) {
+func requestMethod(ctx context.Context, httpv2 bool, url string, method string, headers http.Header, body io.Reader) (*Response, error) {
 	request, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return nil, err
@@ -93,7 +87,7 @@ func requestMethod(ctx context.Context, httpv2 bool, url string, method string, 
 		}
 	}
 	if pctx, ok := ctx.(ProxyContext); ok {
-		if proxy := pctx.WithProxy(); proxy != nil {
+		if proxy := pctx.GetProxy(); proxy != nil {
 			transport.Proxy = proxy.GetProxyURL
 		}
 	}
@@ -102,7 +96,7 @@ func requestMethod(ctx context.Context, httpv2 bool, url string, method string, 
 		Timeout:   120 * time.Second,
 	}
 	if jctx, ok := ctx.(CookieContext); ok {
-		if cookieJar := jctx.WithCookie(); cookieJar != nil {
+		if cookieJar := jctx.GetCookie(); cookieJar != nil {
 			client.Jar = cookieJar
 		}
 	}

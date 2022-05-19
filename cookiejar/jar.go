@@ -9,13 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"sort"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/zdypro888/net/http"
 )
 
 // PublicSuffixList provides the public suffix of a domain. For example:

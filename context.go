@@ -1,55 +1,56 @@
 package net
 
-import "context"
+import (
+	"context"
+	"net/http"
+)
 
 //GobalProxy 通用代理
 var GobalProxy *Proxy
 
 type ProxyContext interface {
 	context.Context
-	WithProxy() *Proxy
+	GetProxy() *Proxy
+	SetProxy(*Proxy)
 }
 
 type CookieContext interface {
 	context.Context
-	WithCookie() CookieJar
+	GetCookie() http.CookieJar
+	SetCookie(http.CookieJar)
 }
 
 type Context struct {
 	context.Context
 	Proxy *Proxy
-	Jar   CookieJar
+	Jar   http.CookieJar
 }
 
-func (ctx *Context) WithProxy() *Proxy {
+func (ctx *Context) GetProxy() *Proxy {
 	return ctx.Proxy
 }
-func (ctx *Context) WithCookie() CookieJar {
+func (ctx *Context) SetProxy(proxy *Proxy) {
+	ctx.Proxy = proxy
+}
+func (ctx *Context) GetCookie() http.CookieJar {
 	return ctx.Jar
 }
+func (ctx *Context) SetCookie(jar http.CookieJar) {
+	ctx.Jar = jar
+}
 
-func WithProxy(proxy *Proxy) *Context {
+func WithProxy(proxy *Proxy) context.Context {
 	return ContextWithProxy(context.Background(), proxy)
 }
-func WithCookie(jar CookieJar) *Context {
+func WithCookie(jar http.CookieJar) context.Context {
 	return ContextWithCookie(context.Background(), jar)
 }
-func ContextWithProxy(ctx context.Context, proxy *Proxy) *Context {
-	return &Context{
-		Context: ctx,
-		Proxy:   proxy,
-	}
+func ContextWithProxy(ctx context.Context, proxy *Proxy) context.Context {
+	return &Context{Context: ctx, Proxy: proxy}
 }
-func ContextWithCookie(ctx context.Context, jar CookieJar) *Context {
-	return &Context{
-		Context: ctx,
-		Jar:     jar,
-	}
+func ContextWithCookie(ctx context.Context, jar http.CookieJar) context.Context {
+	return &Context{Context: ctx, Jar: jar}
 }
-func ContextWithProxyCookie(ctx context.Context, proxy *Proxy, jar CookieJar) *Context {
-	return &Context{
-		Context: ctx,
-		Proxy:   proxy,
-		Jar:     jar,
-	}
+func ContextWithProxyCookie(ctx context.Context, proxy *Proxy, jar http.CookieJar) context.Context {
+	return &Context{Context: ctx, Proxy: proxy, Jar: jar}
 }

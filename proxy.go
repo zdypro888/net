@@ -6,9 +6,9 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 
-	"github.com/zdypro888/net/http"
 	"github.com/zdypro888/net/socks5"
 	"github.com/zdypro888/utils"
 )
@@ -44,16 +44,16 @@ func (proxy *Proxy) GetProxyURL(req *http.Request) (*url.URL, error) {
 
 //Dial 拨号
 func (proxy *Proxy) Dial(network, address string) (net.Conn, error) {
-	address, err := utils.RandomTemplateText(proxy.Address)
+	paddress, err := utils.RandomTemplateText(proxy.Address)
 	if err != nil {
 		return nil, err
 	}
-	proxyURL, err := url.Parse(address)
+	proxyURL, err := url.Parse(paddress)
 	if err != nil {
 		return nil, err
 	}
 	if proxyURL.Scheme == "socks5" {
-		d := socks5.NewDialer("tcp", proxy.Address)
+		d := socks5.NewDialer("tcp", proxyURL.Host)
 		if proxyURL.User != nil {
 			auth := &socks5.UsernamePassword{
 				Username: proxyURL.User.Username(),
@@ -67,7 +67,7 @@ func (proxy *Proxy) Dial(network, address string) (net.Conn, error) {
 		}
 		return d.DialContext(context.Background(), network, address)
 	} else if proxyURL.Scheme == "http" || proxyURL.Scheme == "https" {
-		conn, err := net.Dial("tcp", proxy.Address)
+		conn, err := net.Dial("tcp", proxyURL.Host)
 		if err != nil {
 			return nil, err
 		}
