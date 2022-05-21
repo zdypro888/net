@@ -13,6 +13,8 @@ import (
 	"github.com/zdypro888/utils"
 )
 
+type Conn = net.Conn
+
 //HTTPDebugProxy 调试代理
 var HTTPDebugProxy = &Proxy{Address: "http://127.0.0.1:8888"}
 
@@ -43,7 +45,7 @@ func (proxy *Proxy) GetProxyURL(req *http.Request) (*url.URL, error) {
 }
 
 //Dial 拨号
-func (proxy *Proxy) Dial(network, address string) (net.Conn, error) {
+func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	paddress, err := utils.RandomTemplateText(proxy.Address)
 	if err != nil {
 		return nil, err
@@ -65,17 +67,18 @@ func (proxy *Proxy) Dial(network, address string) (net.Conn, error) {
 			}
 			d.Authenticate = auth.Authenticate
 		}
-		return d.DialContext(context.Background(), network, address)
+		return d.DialContext(ctx, network, address)
 	} else if proxyURL.Scheme == "http" || proxyURL.Scheme == "https" {
 		conn, err := net.Dial("tcp", proxyURL.Host)
 		if err != nil {
 			return nil, err
 		}
-		connectReq := &http.Request{
-			Method: "CONNECT",
-			URL:    &url.URL{Opaque: address},
-			Host:   address,
+		connectReq, err := http.NewRequestWithContext(ctx, "CONNECT", address, nil)
+		if err != nil {
+			return nil, err
 		}
+		connectReq.URL = &url.URL{Opaque: address}
+		connectReq.Host = address
 		connectReq.Header = make(http.Header)
 		if proxyURL.User != nil {
 			auth := proxyURL.User.String()

@@ -55,7 +55,7 @@ func request(ctx context.Context, httpv2 bool, url string, headers http.Header, 
 	} else {
 		method = "POST"
 	}
-	return RequestMethod(ctx, url, method, headers, body)
+	return requestMethod(ctx, httpv2, url, method, headers, body)
 }
 
 func requestMethod(ctx context.Context, httpv2 bool, url string, method string, headers http.Header, body io.Reader) (*Response, error) {
@@ -86,17 +86,15 @@ func requestMethod(ctx context.Context, httpv2 bool, url string, method string, 
 			return nil, err
 		}
 	}
-	if pctx, ok := ctx.(ProxyContext); ok {
-		if proxy := pctx.GetProxy(); proxy != nil {
-			transport.Proxy = proxy.GetProxyURL
-		}
+	if proxyContext, ok := ctx.(ProxyContext); ok {
+		transport.Proxy = proxyContext.GetProxyURL
 	}
 	client := &http.Client{
 		Transport: transport,
 		Timeout:   120 * time.Second,
 	}
 	if jctx, ok := ctx.(CookieContext); ok {
-		if cookieJar := jctx.GetCookie(); cookieJar != nil {
+		if cookieJar := jctx.GetCookie(url); cookieJar != nil {
 			client.Jar = cookieJar
 		}
 	}
@@ -105,9 +103,22 @@ func requestMethod(ctx context.Context, httpv2 bool, url string, method string, 
 		redirects = append(redirects, req.URL)
 		return nil
 	}
-	response, err := client.Do(request)
-	if err != nil {
-		return nil, err
+	var response *http.Response
+	for {
+		if err = ctx.Err(); err != nil {
+			return nil, err
+		}
+		if response, err = client.Do(request); err != nil {
+			proxyContext, ok := ctx.(ProxyContext)
+			if !ok {
+				return nil, err
+			}
+			if err = proxyContext.GetProxyError(err); err != nil {
+				return nil, err
+			}
+		} else {
+			break
+		}
 	}
 	defer response.Body.Close()
 	data, err := ReadResponse(response)
