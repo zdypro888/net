@@ -73,12 +73,11 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 		if err != nil {
 			return nil, err
 		}
-		connectReq, err := http.NewRequestWithContext(ctx, "CONNECT", address, nil)
+		connectReq, err := http.NewRequestWithContext(ctx, "CONNECT", fmt.Sprintf("%s://%s", network, address), nil)
 		if err != nil {
 			return nil, err
 		}
-		connectReq.URL = &url.URL{Opaque: address}
-		connectReq.Host = address
+		// connectReq.URL = &url.URL{Opaque: address}
 		connectReq.Header = make(http.Header)
 		if proxyURL.User != nil {
 			auth := proxyURL.User.String()

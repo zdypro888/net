@@ -63,7 +63,6 @@ func requestMethod(ctx context.Context, httpv2 bool, url string, method string, 
 	if err != nil {
 		return nil, err
 	}
-	// request.Close = true
 	if headers != nil {
 		request.Header = http.Header(headers).Clone()
 	}
@@ -109,12 +108,16 @@ func requestMethod(ctx context.Context, httpv2 bool, url string, method string, 
 			return nil, err
 		}
 		if response, err = client.Do(request); err != nil {
-			proxyContext, ok := ctx.(ProxyContext)
-			if !ok {
+			if proxyContext, ok := ctx.(ProxyContext); !ok {
+				return nil, err
+			} else if err = proxyContext.GetProxyError(err); err != nil {
 				return nil, err
 			}
-			if err = proxyContext.GetProxyError(err); err != nil {
+		} else if responseContext, ok := ctx.(ResponseContext); ok {
+			if response, err = responseContext.Do(response); err != nil {
 				return nil, err
+			} else if response != nil {
+				break
 			}
 		} else {
 			break

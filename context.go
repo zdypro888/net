@@ -7,8 +7,10 @@ import (
 	"net/url"
 )
 
-//GobalProxy 通用代理
-var GobalProxy *Proxy
+type ResponseContext interface {
+	context.Context
+	Do(*http.Response) (*http.Response, error)
+}
 
 type ProxyContext interface {
 	context.Context
