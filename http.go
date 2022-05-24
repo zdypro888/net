@@ -29,26 +29,26 @@ func (res *Response) Error() string {
 }
 
 //Request Get or Post
-func Request(ctx context.Context, url string, headers http.Header, body io.Reader) (*Response, error) {
+func Request(ctx context.Context, url string, headers http.Header, body io.ReadSeeker) (*Response, error) {
 	return request(ctx, false, url, headers, body)
 }
 
 //RequestMethod Http
-func RequestMethod(ctx context.Context, url string, method string, headers http.Header, body io.Reader) (*Response, error) {
+func RequestMethod(ctx context.Context, url string, method string, headers http.Header, body io.ReadSeeker) (*Response, error) {
 	return requestMethod(ctx, false, url, method, headers, body)
 }
 
 //Request2 Get or Post
-func Request2(ctx context.Context, url string, headers http.Header, body io.Reader) (*Response, error) {
+func Request2(ctx context.Context, url string, headers http.Header, body io.ReadSeeker) (*Response, error) {
 	return request(ctx, true, url, headers, body)
 }
 
 //RequestMethod2 Http
-func RequestMethod2(ctx context.Context, url string, method string, headers http.Header, body io.Reader) (*Response, error) {
+func RequestMethod2(ctx context.Context, url string, method string, headers http.Header, body io.ReadSeeker) (*Response, error) {
 	return requestMethod(ctx, true, url, method, headers, body)
 }
 
-func request(ctx context.Context, httpv2 bool, url string, headers http.Header, body io.Reader) (*Response, error) {
+func request(ctx context.Context, httpv2 bool, url string, headers http.Header, body io.ReadSeeker) (*Response, error) {
 	var method string
 	if body == nil {
 		method = "GET"
@@ -58,7 +58,7 @@ func request(ctx context.Context, httpv2 bool, url string, headers http.Header, 
 	return requestMethod(ctx, httpv2, url, method, headers, body)
 }
 
-func requestMethod(ctx context.Context, httpv2 bool, url string, method string, headers http.Header, body io.Reader) (*Response, error) {
+func requestMethod(ctx context.Context, httpv2 bool, url string, method string, headers http.Header, body io.ReadSeeker) (*Response, error) {
 	request, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return nil, err
@@ -102,10 +102,17 @@ func requestMethod(ctx context.Context, httpv2 bool, url string, method string, 
 		redirects = append(redirects, req.URL)
 		return nil
 	}
+	var currentOffset int64
+	if body != nil {
+		currentOffset, _ = body.Seek(0, io.SeekCurrent)
+	}
 	var response *http.Response
 	for {
 		if err = ctx.Err(); err != nil {
 			return nil, err
+		}
+		if body != nil {
+			body.Seek(currentOffset, io.SeekStart)
 		}
 		if response, err = client.Do(request); err != nil {
 			if proxyContext, ok := ctx.(ProxyContext); !ok {
