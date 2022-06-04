@@ -85,14 +85,14 @@ func requestMethod(ctx context.Context, httpv2 bool, url string, method string, 
 			return nil, err
 		}
 	}
-	if proxyContext, ok := ctx.(ProxyContext); ok {
+	if proxyContext, ok := ctx.(ContextProxy); ok {
 		transport.Proxy = proxyContext.GetProxyURL
 	}
 	client := &http.Client{
 		Transport: transport,
 		Timeout:   120 * time.Second,
 	}
-	if jctx, ok := ctx.(CookieContext); ok {
+	if jctx, ok := ctx.(ContextCookie); ok {
 		if cookieJar := jctx.GetCookie(url); cookieJar != nil {
 			client.Jar = cookieJar
 		}
@@ -115,12 +115,12 @@ func requestMethod(ctx context.Context, httpv2 bool, url string, method string, 
 			body.Seek(currentOffset, io.SeekStart)
 		}
 		if response, err = client.Do(request); err != nil {
-			if proxyContext, ok := ctx.(ProxyContext); !ok {
+			if proxyContext, ok := ctx.(ContextProxy); !ok {
 				return nil, err
 			} else if err = proxyContext.GetProxyError(err); err != nil {
 				return nil, err
 			}
-		} else if responseContext, ok := ctx.(ResponseContext); ok {
+		} else if responseContext, ok := ctx.(ContextDo); ok {
 			if response, err = responseContext.Do(response); err != nil {
 				return nil, err
 			} else if response != nil {
