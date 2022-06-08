@@ -13,6 +13,13 @@ import (
 	"github.com/zdypro888/utils"
 )
 
+type ContextKey int
+
+const (
+	ContextProxyKey ContextKey = iota
+	ContextHTTPKey  ContextKey = iota
+)
+
 type Conn = net.Conn
 
 //HTTPDebugProxy 调试代理
@@ -36,7 +43,7 @@ func LoadProxys(i interface{}) ([]*Proxy, error) {
 }
 
 //GetProxyURL 取得代理地址
-func (proxy *Proxy) GetProxyURL(req *http.Request) (*url.URL, error) {
+func (proxy *Proxy) ProxyURL(req *http.Request) (*url.URL, error) {
 	address, err := utils.RandomTemplateText(proxy.Address)
 	if err != nil {
 		return nil, err

@@ -7,19 +7,30 @@ import (
 	"net/url"
 )
 
-type ContextDo interface {
-	context.Context
-	Do(*http.Response) (*http.Response, error)
+type ProxyDelegate interface {
+	DialContext(context.Context, string, string) (net.Conn, error)
+	ProxyURL(*http.Request) (*url.URL, error)
+	OnError(context.Context, error) error
 }
 
-type ContextProxy interface {
-	context.Context
-	GetProxyURL(req *http.Request) (*url.URL, error)
-	Dial(network, address string) (net.Conn, error)
-	GetProxyError(error) error
+func ContextWithProxy(ctx context.Context, proxy ProxyDelegate) context.Context {
+	return context.WithValue(ctx, ContextProxyKey, proxy)
 }
 
-type ContextCookie interface {
-	context.Context
-	GetCookie(url string) http.CookieJar
+func ContextProxyValue(ctx context.Context) ProxyDelegate {
+	if pi := ctx.Value(ContextProxyKey); pi != nil {
+		return pi.(ProxyDelegate)
+	}
+	return nil
+}
+
+func ContextWithHTTP(ctx context.Context, h *HTTP) context.Context {
+	return context.WithValue(ctx, ContextHTTPKey, h)
+}
+
+func ContextHTTPValue(ctx context.Context) *HTTP {
+	if hi := ctx.Value(ContextHTTPKey); hi != nil {
+		return hi.(*HTTP)
+	}
+	return nil
 }
