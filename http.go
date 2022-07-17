@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/andybalholm/brotli"
+	"github.com/lucas-clemente/quic-go/http3"
 	"golang.org/x/net/http2"
 )
 
@@ -33,7 +34,7 @@ func (res *Response) Error() string {
 }
 
 type HTTP struct {
-	transport        *http.Transport
+	transport        http.RoundTripper
 	client           *http.Client
 	proxyDelegate    ProxyDelegate
 	responseDelegate ResponseDelegate
@@ -66,20 +67,37 @@ func NewHTTP() *HTTP {
 }
 
 func (h *HTTP) Dispose() {
-	h.transport.CloseIdleConnections()
+	switch transport := h.transport.(type) {
+	case *http.Transport:
+		transport.CloseIdleConnections()
+	case *http3.RoundTripper:
+		transport.Close()
+	}
 }
 
 func (h *HTTP) ConfigureV2() error {
-	return http2.ConfigureTransport(h.transport)
+	switch transport := h.transport.(type) {
+	case *http.Transport:
+		return http2.ConfigureTransport(transport)
+	case *http3.RoundTripper:
+		return errors.New("quic protocol can not set to http2.0")
+	}
+	return nil
 }
 
 func (h *HTTP) ConfigureCookie(cookies http.CookieJar) {
 	h.client.Jar = cookies
 }
 
-func (h *HTTP) ConfigureProxy(delegate ProxyDelegate) {
+func (h *HTTP) ConfigureProxy(delegate ProxyDelegate) error {
 	h.proxyDelegate = delegate
-	h.transport.Proxy = h.proxyDelegate.ProxyURL
+	switch transport := h.transport.(type) {
+	case *http.Transport:
+		transport.Proxy = h.proxyDelegate.ProxyURL
+	case *http3.RoundTripper:
+		return errors.New("quic protocol can not set proxy")
+	}
+	return nil
 }
 
 func (h *HTTP) ConfigureResponse(delegate ResponseDelegate) {

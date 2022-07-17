@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 
 	"github.com/zdypro888/net/socks5"
 	"github.com/zdypro888/utils"
@@ -23,18 +25,35 @@ const (
 type Conn = net.Conn
 
 //HTTPDebugProxy 调试代理
-var HTTPDebugProxy = &Proxy{Address: "http://127.0.0.1:8888"}
+var HTTPDebugProxy = &Proxy{Address: "http://127.0.0.1:8888", Forbit: math.MaxUint64}
 
 //Proxy 代理
 type Proxy struct {
 	Address string `bson:"Address" json:"Address"`
+	Forbit  uint64 `bson:"Forbit" json:"Forbit"`
+	Banbit  uint64 `bson:"Banbit,omitempty" json:"Banbit"`
 }
 
 //LoadProxys 从文件读取所有代理信息
 func LoadProxys(i interface{}) ([]*Proxy, error) {
 	proxys := make([]*Proxy, 0)
 	if err := utils.ReadLines(i, func(line string) error {
-		proxys = append(proxys, &Proxy{Address: line})
+		proxy := &Proxy{}
+		if urlInfo, err := url.Parse(line); err == nil {
+			query := urlInfo.Query()
+			if userFor := query.Get("Forbit"); userFor != "" {
+				query.Del("Forbit")
+				if proxy.Forbit, err = strconv.ParseUint(userFor, 0, 64); err != nil {
+					proxy.Forbit = math.MaxUint64
+				}
+			}
+			urlInfo.RawQuery = query.Encode()
+			proxy.Address = urlInfo.String()
+		} else {
+			proxy.Forbit = math.MaxUint64
+			proxy.Address = line
+		}
+		proxys = append(proxys, proxy)
 		return nil
 	}); err != nil {
 		return nil, err
