@@ -135,6 +135,7 @@ func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, hea
 			body.Seek(currentOffset, io.SeekStart)
 		}
 		if response, err = h.client.Do(request); err != nil {
+			h.client.CloseIdleConnections()
 			if h.proxyDelegate == nil {
 				return nil, err
 			} else if err = h.proxyDelegate.OnError(ctx, err); err != nil {

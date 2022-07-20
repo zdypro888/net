@@ -18,14 +18,25 @@ func Http3Client() *http.Client {
 	}
 	return &http.Client{Transport: roundTripper}
 }
+
+type withCloseIdleConnections struct {
+	*http3.RoundTripper
+}
+
+func (transport *withCloseIdleConnections) CloseIdleConnections() {
+	transport.Close()
+}
+
 func NewHTTP3() *HTTP {
-	transport := &http3.RoundTripper{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-			MinVersion:         tls.VersionTLS11,
-			MaxVersion:         tls.VersionTLS13,
+	transport := &withCloseIdleConnections{
+		RoundTripper: &http3.RoundTripper{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+				MinVersion:         tls.VersionTLS11,
+				MaxVersion:         tls.VersionTLS13,
+			},
+			QuicConfig: &quic.Config{},
 		},
-		QuicConfig: &quic.Config{},
 	}
 	client := &http.Client{
 		Transport: transport,
