@@ -7,6 +7,14 @@ import (
 	"net/url"
 )
 
+type ContextKey int
+
+const (
+	ContextProxyKey  ContextKey = iota
+	ContextHTTPKey   ContextKey = iota
+	ContextCookieKey ContextKey = iota
+)
+
 type ProxyDelegate interface {
 	DialContext(context.Context, string, string) (net.Conn, error)
 	ProxyURL(*http.Request) (*url.URL, error)
@@ -31,6 +39,17 @@ func ContextWithHTTP(ctx context.Context, h *HTTP) context.Context {
 func ContextHTTPValue(ctx context.Context) *HTTP {
 	if hi := ctx.Value(ContextHTTPKey); hi != nil {
 		return hi.(*HTTP)
+	}
+	return nil
+}
+
+func ContextWithCookie(ctx context.Context, c http.CookieJar) context.Context {
+	return context.WithValue(ctx, ContextCookieKey, c)
+}
+
+func ContextCookieValue(ctx context.Context) http.CookieJar {
+	if ci := ctx.Value(ContextCookieKey); ci != nil {
+		return ci.(http.CookieJar)
 	}
 	return nil
 }

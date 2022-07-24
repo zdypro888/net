@@ -126,6 +126,9 @@ func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, hea
 	if body != nil {
 		currentOffset, _ = body.Seek(0, io.SeekCurrent)
 	}
+	if jar := ContextCookieValue(ctx); jar != nil {
+		h.ConfigureCookie(jar)
+	}
 	var response *http.Response
 	for {
 		if err = ctx.Err(); err != nil {

@@ -15,13 +15,6 @@ import (
 	"github.com/zdypro888/utils"
 )
 
-type ContextKey int
-
-const (
-	ContextProxyKey ContextKey = iota
-	ContextHTTPKey  ContextKey = iota
-)
-
 type Conn = net.Conn
 
 //HTTPDebugProxy 调试代理
