@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"time"
@@ -17,12 +16,12 @@ import (
 	"golang.org/x/net/http2"
 )
 
-//ResponseDelegate 结果处理
+// ResponseDelegate 结果处理
 type ResponseDelegate interface {
 	Response(context.Context, *http.Response) (*http.Response, error)
 }
 
-//Response 请求返回
+// Response 请求返回
 type Response struct {
 	Code   int
 	Header http.Header
@@ -163,7 +162,7 @@ func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, hea
 	}, err
 }
 
-//ReadResponse 读取 response body
+// ReadResponse 读取 response body
 func ReadResponse(response *http.Response) ([]byte, error) {
 	var err error
 	var body []byte
@@ -174,12 +173,12 @@ func ReadResponse(response *http.Response) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		body, err = ioutil.ReadAll(reader)
+		body, err = io.ReadAll(reader)
 	case "br":
 		reader := brotli.NewReader(response.Body)
-		body, err = ioutil.ReadAll(reader)
+		body, err = io.ReadAll(reader)
 	default:
-		body, err = ioutil.ReadAll(response.Body)
+		body, err = io.ReadAll(response.Body)
 	}
 	return body, err
 }
