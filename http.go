@@ -98,6 +98,15 @@ func (h *HTTP) ConfigureProxy(delegate ProxyDelegate) error {
 	}
 	return nil
 }
+func (h *HTTP) ConfigureDebug() error {
+	switch transport := h.transport.(type) {
+	case *http.Transport:
+		transport.Proxy = HTTPDebugProxy.ProxyURL
+	case *http3.RoundTripper:
+		return errors.New("quic protocol can not set proxy")
+	}
+	return nil
+}
 
 func (h *HTTP) ConfigureResponse(delegate ResponseDelegate) {
 	h.responseDelegate = delegate
