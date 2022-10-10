@@ -17,18 +17,18 @@ import (
 
 type Conn = net.Conn
 
-//HTTPDebugProxy 调试代理
+// HTTPDebugProxy 调试代理
 var HTTPDebugProxy = &Proxy{Address: "http://127.0.0.1:8888", Forbit: math.MaxUint64}
 
-//Proxy 代理
+// Proxy 代理
 type Proxy struct {
 	Address string `bson:"Address" json:"Address"`
 	Forbit  uint64 `bson:"Forbit" json:"Forbit"`
 	Banbit  uint64 `bson:"Banbit,omitempty" json:"Banbit"`
 }
 
-//LoadProxys 从文件读取所有代理信息
-func LoadProxys(i interface{}) ([]*Proxy, error) {
+// LoadProxys 从文件读取所有代理信息
+func LoadProxys(i any) ([]*Proxy, error) {
 	proxys := make([]*Proxy, 0)
 	if err := utils.ReadLines(i, func(line string) error {
 		proxy := &Proxy{}
@@ -54,7 +54,7 @@ func LoadProxys(i interface{}) ([]*Proxy, error) {
 	return proxys, nil
 }
 
-//GetProxyURL 取得代理地址
+// GetProxyURL 取得代理地址
 func (proxy *Proxy) ProxyURL(req *http.Request) (*url.URL, error) {
 	address, err := utils.RandomTemplateText(proxy.Address)
 	if err != nil {
@@ -63,7 +63,7 @@ func (proxy *Proxy) ProxyURL(req *http.Request) (*url.URL, error) {
 	return url.Parse(address)
 }
 
-//Dial 拨号
+// Dial 拨号
 func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	paddress, err := utils.RandomTemplateText(proxy.Address)
 	if err != nil {
