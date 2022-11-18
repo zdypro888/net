@@ -25,13 +25,12 @@ type ResponseDelegate interface {
 
 // Response 请求返回
 type Response struct {
-	Code   int
-	Header http.Header
+	*http.Response
 	Reader io.ReadCloser
 }
 
 func (res *Response) Error() string {
-	return fmt.Sprintf("response status code: %d", res.Code)
+	return fmt.Sprintf("%s(%d)", res.Status, res.StatusCode)
 }
 
 func (res *Response) Data() ([]byte, error) {
@@ -181,9 +180,8 @@ func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, hea
 	// defer response.Body.Close()
 	reader, err := ReadResponse(response)
 	return &Response{
-		Code:   response.StatusCode,
-		Header: response.Header,
-		Reader: reader,
+		Response: response,
+		Reader:   reader,
 	}, err
 }
 
