@@ -16,6 +16,8 @@ import (
 	"golang.org/x/net/http2"
 )
 
+var ErrContextNotContainHTTP = errors.New("context not contain http")
+
 // ResponseDelegate 结果处理
 type ResponseDelegate interface {
 	Response(context.Context, *http.Response) (*http.Response, error)
@@ -25,11 +27,20 @@ type ResponseDelegate interface {
 type Response struct {
 	Code   int
 	Header http.Header
-	Body   []byte
+	Reader io.ReadCloser
 }
 
 func (res *Response) Error() string {
 	return fmt.Sprintf("response status code: %d", res.Code)
+}
+
+func (res *Response) Data() ([]byte, error) {
+	defer res.Close()
+	return io.ReadAll(res.Reader)
+}
+
+func (res *Response) Close() error {
+	return res.Reader.Close()
 }
 
 type HTTP struct {
@@ -98,6 +109,11 @@ func (h *HTTP) ConfigureProxy(delegate ProxyDelegate) error {
 	}
 	return nil
 }
+
+func (h *HTTP) ConfigureTimeout(timeout time.Duration) {
+	h.client.Timeout = timeout
+}
+
 func (h *HTTP) ConfigureDebug() error {
 	switch transport := h.transport.(type) {
 	case *http.Transport:
@@ -162,19 +178,33 @@ func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, hea
 			break
 		}
 	}
-	defer response.Body.Close()
-	data, err := ReadResponse(response)
+	// defer response.Body.Close()
+	reader, err := ReadResponse(response)
 	return &Response{
 		Code:   response.StatusCode,
 		Header: response.Header,
-		Body:   data,
+		Reader: reader,
 	}, err
 }
 
-// ReadResponse 读取 response body
-func ReadResponse(response *http.Response) ([]byte, error) {
+type delegateReadCloser struct {
+	io.Reader
+	closers []io.Closer
+}
+
+func (delegate *delegateReadCloser) Close() error {
 	var err error
-	var body []byte
+	for _, closer := range delegate.closers {
+		if lerr := closer.Close(); lerr != nil {
+			err = lerr
+		}
+	}
+	return err
+}
+
+// ReadResponse 读取 response body
+func ReadResponse(response *http.Response) (io.ReadCloser, error) {
+	var err error
 	switch response.Header.Get("Content-Encoding") {
 	case "gzip":
 		var reader *gzip.Reader
@@ -182,17 +212,14 @@ func ReadResponse(response *http.Response) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		body, err = io.ReadAll(reader)
+		return &delegateReadCloser{Reader: reader, closers: []io.Closer{reader, response.Body}}, nil
 	case "br":
 		reader := brotli.NewReader(response.Body)
-		body, err = io.ReadAll(reader)
+		return &delegateReadCloser{Reader: reader, closers: []io.Closer{response.Body}}, nil
 	default:
-		body, err = io.ReadAll(response.Body)
+		return &delegateReadCloser{Reader: response.Body, closers: []io.Closer{response.Body}}, nil
 	}
-	return body, err
 }
-
-var ErrContextNotContainHTTP = errors.New("context not contain http")
 
 func Request(ctx context.Context, url string, headers http.Header, body io.ReadSeeker) (*Response, error) {
 	if h := ContextHTTPValue(ctx); h != nil {
