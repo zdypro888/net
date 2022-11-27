@@ -1,6 +1,7 @@
 package net
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/tls"
@@ -20,26 +21,54 @@ var ErrContextNotContainHTTP = errors.New("context not contain http")
 
 // ResponseDelegate 结果处理
 type ResponseDelegate interface {
-	Response(context.Context, *http.Response) (*http.Response, error)
+	Response(context.Context, *http.Request, *http.Response) (bool, error)
 }
 
 // Response 请求返回
 type Response struct {
 	*http.Response
-	Reader io.ReadCloser
+	reader io.Reader
 }
 
-func (res *Response) Error() string {
-	return fmt.Sprintf("%s(%d)", res.Status, res.StatusCode)
+func (response *Response) Error() string {
+	return fmt.Sprintf("%s(%d)", response.Status, response.StatusCode)
+}
+
+func (response *Response) Read(p []byte) (int, error) {
+	if response.Body == nil {
+		return 0, io.EOF
+	}
+	if response.reader == nil {
+		switch response.Header.Get("Content-Encoding") {
+		case "gzip":
+			var err error
+			if response.reader, err = gzip.NewReader(response.Body); err != nil {
+				return 0, err
+			}
+		case "br":
+			response.reader = brotli.NewReader(response.Body)
+		default:
+			response.reader = response.Body
+		}
+	}
+	return response.reader.Read(p)
+}
+
+func (response *Response) Close() error {
+	if response.Body != nil {
+		if response.reader != nil {
+			if closer, ok := response.reader.(io.Closer); ok {
+				closer.Close()
+			}
+		}
+		return response.Body.Close()
+	}
+	return nil
 }
 
 func (res *Response) Data() ([]byte, error) {
 	defer res.Close()
-	return io.ReadAll(res.Reader)
-}
-
-func (res *Response) Close() error {
-	return res.Reader.Close()
+	return io.ReadAll(res)
 }
 
 type HTTP struct {
@@ -127,7 +156,7 @@ func (h *HTTP) ConfigureResponse(delegate ResponseDelegate) {
 	h.responseDelegate = delegate
 }
 
-func (h *HTTP) Request(ctx context.Context, url string, headers http.Header, body io.ReadSeeker) (*Response, error) {
+func (h *HTTP) Request(ctx context.Context, url string, headers http.Header, body []byte) (*Response, error) {
 	var method string
 	if body == nil {
 		method = "GET"
@@ -137,28 +166,23 @@ func (h *HTTP) Request(ctx context.Context, url string, headers http.Header, bod
 	return h.RequestMethod(ctx, url, method, headers, body)
 }
 
-func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, headers http.Header, body io.ReadSeeker) (*Response, error) {
-	request, err := http.NewRequestWithContext(ctx, method, url, body)
-	if err != nil {
-		return nil, err
-	}
-	if headers != nil {
-		request.Header = http.Header(headers).Clone()
-	}
-	var currentOffset int64
-	if body != nil {
-		currentOffset, _ = body.Seek(0, io.SeekCurrent)
-	}
+func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, headers http.Header, body []byte) (*Response, error) {
 	if jar := ContextCookieValue(ctx); jar != nil {
 		h.ConfigureCookie(jar)
 	}
+	var err error
+	var retry bool
+	var request *http.Request
 	var response *http.Response
 	for {
 		if err = ctx.Err(); err != nil {
 			return nil, err
 		}
-		if body != nil {
-			body.Seek(currentOffset, io.SeekStart)
+		if request, err = http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body)); err != nil {
+			return nil, err
+		}
+		if headers != nil {
+			request.Header = http.Header(headers).Clone()
 		}
 		if response, err = h.client.Do(request); err != nil {
 			h.client.CloseIdleConnections()
@@ -168,9 +192,9 @@ func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, hea
 				return nil, err
 			}
 		} else if h.responseDelegate != nil {
-			if response, err = h.responseDelegate.Response(ctx, response); err != nil {
+			if retry, err = h.responseDelegate.Response(ctx, request, response); err != nil {
 				return nil, err
-			} else if response != nil {
+			} else if !retry  {
 				break
 			}
 		} else {
@@ -178,55 +202,17 @@ func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, hea
 		}
 	}
 	// defer response.Body.Close()
-	reader, err := ReadResponse(response)
-	return &Response{
-		Response: response,
-		Reader:   reader,
-	}, err
+	return &Response{Response: response}, err
 }
 
-type delegateReadCloser struct {
-	io.Reader
-	closers []io.Closer
-}
-
-func (delegate *delegateReadCloser) Close() error {
-	var err error
-	for _, closer := range delegate.closers {
-		if lerr := closer.Close(); lerr != nil {
-			err = lerr
-		}
-	}
-	return err
-}
-
-// ReadResponse 读取 response body
-func ReadResponse(response *http.Response) (io.ReadCloser, error) {
-	var err error
-	switch response.Header.Get("Content-Encoding") {
-	case "gzip":
-		var reader *gzip.Reader
-		reader, err = gzip.NewReader(response.Body)
-		if err != nil {
-			return nil, err
-		}
-		return &delegateReadCloser{Reader: reader, closers: []io.Closer{reader, response.Body}}, nil
-	case "br":
-		reader := brotli.NewReader(response.Body)
-		return &delegateReadCloser{Reader: reader, closers: []io.Closer{response.Body}}, nil
-	default:
-		return &delegateReadCloser{Reader: response.Body, closers: []io.Closer{response.Body}}, nil
-	}
-}
-
-func Request(ctx context.Context, url string, headers http.Header, body io.ReadSeeker) (*Response, error) {
+func Request(ctx context.Context, url string, headers http.Header, body []byte) (*Response, error) {
 	if h := ContextHTTPValue(ctx); h != nil {
 		return h.Request(ctx, url, headers, body)
 	}
 	return nil, ErrContextNotContainHTTP
 }
 
-func RequestMethod(ctx context.Context, url string, method string, headers http.Header, body io.ReadSeeker) (*Response, error) {
+func RequestMethod(ctx context.Context, url string, method string, headers http.Header, body []byte) (*Response, error) {
 	if h := ContextHTTPValue(ctx); h != nil {
 		return h.RequestMethod(ctx, url, method, headers, body)
 	}
