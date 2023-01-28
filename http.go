@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/andybalholm/brotli"
-	"github.com/lucas-clemente/quic-go/http3"
+	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/net/http2"
 )
 
@@ -194,7 +194,7 @@ func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, hea
 		} else if h.responseDelegate != nil {
 			if retry, err = h.responseDelegate.Response(ctx, request, response); err != nil {
 				return nil, err
-			} else if !retry  {
+			} else if !retry {
 				break
 			}
 		} else {
