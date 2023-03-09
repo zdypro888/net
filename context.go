@@ -2,18 +2,20 @@ package net
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/url"
+	"time"
 )
 
 type ContextKey int
 
 const (
-	ContextProxyKey  ContextKey = iota
-	ContextHTTPKey   ContextKey = iota
-	ContextCookieKey ContextKey = iota
+	ContextHTTPKey ContextKey = iota
 )
+
+var ErrHTTPNotInContext = errors.New("http not in context")
 
 type ProxyDelegate interface {
 	DialContext(context.Context, string, string) (net.Conn, error)
@@ -21,35 +23,45 @@ type ProxyDelegate interface {
 	OnError(context.Context, error) error
 }
 
-func ContextWithProxy(ctx context.Context, proxy ProxyDelegate) context.Context {
-	return context.WithValue(ctx, ContextProxyKey, proxy)
-}
-
-func ContextProxyValue(ctx context.Context) ProxyDelegate {
-	if pi := ctx.Value(ContextProxyKey); pi != nil {
-		return pi.(ProxyDelegate)
-	}
-	return nil
-}
-
-func ContextWithHTTP(ctx context.Context, h *HTTP) context.Context {
+func Context(ctx context.Context, h *HTTP) context.Context {
 	return context.WithValue(ctx, ContextHTTPKey, h)
 }
 
-func ContextHTTPValue(ctx context.Context) *HTTP {
+func FromContext(ctx context.Context) *HTTP {
 	if hi := ctx.Value(ContextHTTPKey); hi != nil {
 		return hi.(*HTTP)
 	}
 	return nil
 }
 
-func ContextWithCookie(ctx context.Context, c http.CookieJar) context.Context {
-	return context.WithValue(ctx, ContextCookieKey, c)
+func SetProxy(ctx context.Context, proxy ProxyDelegate) error {
+	if h := FromContext(ctx); h != nil {
+		h.ConfigureProxy(proxy)
+		return nil
+	}
+	return ErrHTTPNotInContext
 }
 
-func ContextCookieValue(ctx context.Context) http.CookieJar {
-	if ci := ctx.Value(ContextCookieKey); ci != nil {
-		return ci.(http.CookieJar)
+func SetCookie(ctx context.Context, c http.CookieJar) error {
+	if h := FromContext(ctx); h != nil {
+		h.ConfigureCookie(c)
+		return nil
 	}
-	return nil
+	return ErrHTTPNotInContext
+}
+
+func SetTimeout(ctx context.Context, timeout time.Duration) error {
+	if h := FromContext(ctx); h != nil {
+		h.ConfigureTimeout(timeout)
+		return nil
+	}
+	return ErrHTTPNotInContext
+}
+
+func SetResponse(ctx context.Context, r ResponseDelegate) error {
+	if h := FromContext(ctx); h != nil {
+		h.ConfigureResponse(r)
+		return nil
+	}
+	return ErrHTTPNotInContext
 }

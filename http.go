@@ -167,9 +167,6 @@ func (h *HTTP) Request(ctx context.Context, url string, headers http.Header, bod
 }
 
 func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, headers http.Header, body []byte) (*Response, error) {
-	if jar := ContextCookieValue(ctx); jar != nil {
-		h.ConfigureCookie(jar)
-	}
 	var err error
 	var retry bool
 	var request *http.Request
@@ -206,14 +203,14 @@ func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, hea
 }
 
 func Request(ctx context.Context, url string, headers http.Header, body []byte) (*Response, error) {
-	if h := ContextHTTPValue(ctx); h != nil {
+	if h := FromContext(ctx); h != nil {
 		return h.Request(ctx, url, headers, body)
 	}
 	return nil, ErrContextNotContainHTTP
 }
 
 func RequestMethod(ctx context.Context, url string, method string, headers http.Header, body []byte) (*Response, error) {
-	if h := ContextHTTPValue(ctx); h != nil {
+	if h := FromContext(ctx); h != nil {
 		return h.RequestMethod(ctx, url, method, headers, body)
 	}
 	return nil, ErrContextNotContainHTTP
