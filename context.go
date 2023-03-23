@@ -12,7 +12,8 @@ import (
 type ContextKey int
 
 const (
-	ContextHTTPKey ContextKey = iota
+	ContextHTTPKey  ContextKey = iota
+	ContextProxyKey ContextKey = iota
 )
 
 var ErrHTTPNotInContext = errors.New("http not in context")
@@ -64,4 +65,13 @@ func SetResponse(ctx context.Context, r ResponseDelegate) error {
 		return nil
 	}
 	return ErrHTTPNotInContext
+}
+
+func ContextProxy(ctx context.Context) *Proxy {
+	if p := ctx.Value(ContextProxyKey); p != nil {
+		if proxy, ok := p.(*Proxy); ok {
+			return proxy
+		}
+	}
+	return nil
 }
