@@ -85,7 +85,14 @@ type HTTP struct {
 	responseDelegate ResponseDelegate
 }
 
-func NewHTTP() *HTTP {
+func NewHTTP(config *tls.Config) *HTTP {
+	if config == nil {
+		config = &tls.Config{
+			InsecureSkipVerify: true,
+			MinVersion:         tls.VersionTLS11,
+			MaxVersion:         tls.VersionTLS13,
+		}
+	}
 	transport := &http.Transport{
 		Dial: (&net.Dialer{
 			Timeout: 20 * time.Second,
@@ -93,11 +100,7 @@ func NewHTTP() *HTTP {
 		ResponseHeaderTimeout: 20 * time.Second,
 		ExpectContinueTimeout: 5 * time.Second,
 		TLSHandshakeTimeout:   30 * time.Second,
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-			MinVersion:         tls.VersionTLS11,
-			MaxVersion:         tls.VersionTLS13,
-		},
+		TLSClientConfig:       config,
 	}
 	client := &http.Client{
 		Transport: transport,
