@@ -71,6 +71,13 @@ func (res *Response) Data() ([]byte, error) {
 	return io.ReadAll(res)
 }
 
+func NewReader(data []byte) io.Reader {
+	if len(data) == 0 {
+		return nil
+	}
+	return bytes.NewReader(data)
+}
+
 type HTTP struct {
 	transport        http.RoundTripper
 	client           *http.Client
@@ -156,7 +163,7 @@ func (h *HTTP) ConfigureResponse(delegate ResponseDelegate) {
 	h.responseDelegate = delegate
 }
 
-func (h *HTTP) Request(ctx context.Context, url string, headers http.Header, body []byte) (*Response, error) {
+func (h *HTTP) Request(ctx context.Context, url string, headers http.Header, body io.Reader) (*Response, error) {
 	var method string
 	if body == nil {
 		method = "GET"
@@ -166,7 +173,7 @@ func (h *HTTP) Request(ctx context.Context, url string, headers http.Header, bod
 	return h.RequestMethod(ctx, url, method, headers, body)
 }
 
-func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, headers http.Header, body []byte) (*Response, error) {
+func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, headers http.Header, body io.Reader) (*Response, error) {
 	var err error
 	var retry bool
 	var request *http.Request
@@ -175,7 +182,7 @@ func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, hea
 		if err = ctx.Err(); err != nil {
 			return nil, err
 		}
-		if request, err = http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body)); err != nil {
+		if request, err = http.NewRequestWithContext(ctx, method, url, body); err != nil {
 			return nil, err
 		}
 		if headers != nil {
@@ -202,14 +209,14 @@ func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, hea
 	return &Response{Response: response}, err
 }
 
-func Request(ctx context.Context, url string, headers http.Header, body []byte) (*Response, error) {
+func Request(ctx context.Context, url string, headers http.Header, body io.Reader) (*Response, error) {
 	if h := FromContext(ctx); h != nil {
 		return h.Request(ctx, url, headers, body)
 	}
 	return nil, ErrContextNotContainHTTP
 }
 
-func RequestMethod(ctx context.Context, url string, method string, headers http.Header, body []byte) (*Response, error) {
+func RequestMethod(ctx context.Context, url string, method string, headers http.Header, body io.Reader) (*Response, error) {
 	if h := FromContext(ctx); h != nil {
 		return h.RequestMethod(ctx, url, method, headers, body)
 	}
