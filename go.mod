@@ -5,7 +5,7 @@ go 1.20
 require (
 	github.com/andybalholm/brotli v1.0.5
 	github.com/quic-go/quic-go v0.36.0
-	github.com/zdypro888/utils v1.60.0
+	github.com/zdypro888/utils v0.0.0-20230701143214-cb20eea39e0e
 	golang.org/x/net v0.11.0
 )
 
