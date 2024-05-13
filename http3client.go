@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 )
 
@@ -14,7 +13,6 @@ func Http3Client() *http.Client {
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: false,
 		},
-		QuicConfig: &quic.Config{},
 	}
 	return &http.Client{Transport: roundTripper}
 }
@@ -35,7 +33,6 @@ func NewHTTP3() *HTTP {
 				MinVersion:         tls.VersionTLS11,
 				MaxVersion:         tls.VersionTLS13,
 			},
-			QuicConfig: &quic.Config{},
 		},
 	}
 	client := &http.Client{
