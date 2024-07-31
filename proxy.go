@@ -120,3 +120,7 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 	}
 	return nil, fmt.Errorf("type: %s not supported", proxyURL.Scheme)
 }
+
+func (proxy *Proxy) OnError(ctx context.Context, err error) error {
+	return err
+}
