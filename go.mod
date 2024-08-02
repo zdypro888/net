@@ -6,7 +6,7 @@ toolchain go1.22.3
 
 require (
 	github.com/andybalholm/brotli v1.1.0
-	github.com/quic-go/quic-go v0.45.1
+	github.com/quic-go/quic-go v0.45.2
 	github.com/zdypro888/utils v0.0.0-20240731164115-e7aaa690408e
 	golang.org/x/net v0.27.0
 )
