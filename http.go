@@ -14,6 +14,7 @@ import (
 
 	"github.com/andybalholm/brotli"
 	"github.com/quic-go/quic-go/http3"
+	"github.com/zdypro888/utils"
 	"golang.org/x/net/http2"
 )
 
@@ -187,6 +188,16 @@ func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, hea
 		}
 		if request, err = http.NewRequestWithContext(ctx, method, url, body); err != nil {
 			return nil, err
+		}
+		if body != nil {
+			switch v := body.(type) {
+			case *utils.Reader:
+				request.ContentLength = v.Size()
+				snapshot := v.Temporary()
+				request.GetBody = func() (io.ReadCloser, error) {
+					return snapshot, nil
+				}
+			}
 		}
 		if headers != nil {
 			request.Header = http.Header(headers).Clone()
