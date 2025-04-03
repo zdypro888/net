@@ -119,7 +119,7 @@ func (h *HTTP) Dispose() {
 	switch transport := h.transport.(type) {
 	case *http.Transport:
 		transport.CloseIdleConnections()
-	case *http3.RoundTripper:
+	case *http3.Transport:
 		transport.Close()
 	}
 }
@@ -128,7 +128,7 @@ func (h *HTTP) ConfigureV2() error {
 	switch transport := h.transport.(type) {
 	case *http.Transport:
 		return http2.ConfigureTransport(transport)
-	case *http3.RoundTripper:
+	case *http3.Transport:
 		return errors.New("quic protocol can not set to http2.0")
 	}
 	return nil
@@ -143,7 +143,7 @@ func (h *HTTP) ConfigureProxy(delegate ProxyDelegate) error {
 	switch transport := h.transport.(type) {
 	case *http.Transport:
 		transport.Proxy = h.proxyDelegate.ProxyURL
-	case *http3.RoundTripper:
+	case *http3.Transport:
 		return errors.New("quic protocol can not set proxy")
 	}
 	return nil
@@ -157,7 +157,7 @@ func (h *HTTP) ConfigureDebug() error {
 	switch transport := h.transport.(type) {
 	case *http.Transport:
 		transport.Proxy = HTTPDebugProxy.ProxyURL
-	case *http3.RoundTripper:
+	case *http3.Transport:
 		return errors.New("quic protocol can not set proxy")
 	}
 	return nil
@@ -165,6 +165,10 @@ func (h *HTTP) ConfigureDebug() error {
 
 func (h *HTTP) ConfigureResponse(delegate ResponseDelegate) {
 	h.responseDelegate = delegate
+}
+
+func (h *HTTP) ConfigureRedirect(checkRedirect func(req *http.Request, via []*http.Request) error) {
+	h.client.CheckRedirect = checkRedirect
 }
 
 func (h *HTTP) Request(ctx context.Context, url string, headers http.Header, body io.Reader) (*Response, error) {

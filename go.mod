@@ -8,7 +8,7 @@ require (
 	github.com/andybalholm/brotli v1.1.1
 	github.com/quic-go/quic-go v0.50.1
 	github.com/zdypro888/utils v0.0.0-20250322075515-057e0c298ad2
-	golang.org/x/net v0.37.0
+	golang.org/x/net v0.38.0
 )
 
 require (

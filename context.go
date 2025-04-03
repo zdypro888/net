@@ -12,8 +12,9 @@ import (
 type ContextKey int
 
 const (
-	ContextHTTPKey  ContextKey = iota
-	ContextProxyKey ContextKey = iota
+	ContextHTTPKey     ContextKey = iota
+	ContextProxyKey    ContextKey = iota
+	ContextRedirectKey ContextKey = iota
 )
 
 var ErrHTTPNotInContext = errors.New("http not in context")
@@ -62,6 +63,14 @@ func SetTimeout(ctx context.Context, timeout time.Duration) error {
 func SetResponse(ctx context.Context, r ResponseDelegate) error {
 	if h := FromContext(ctx); h != nil {
 		h.ConfigureResponse(r)
+		return nil
+	}
+	return ErrHTTPNotInContext
+}
+
+func SetRedirect(ctx context.Context, r func(req *http.Request, via []*http.Request) error) error {
+	if h := FromContext(ctx); h != nil {
+		h.ConfigureRedirect(r)
 		return nil
 	}
 	return ErrHTTPNotInContext
