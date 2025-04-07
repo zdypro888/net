@@ -9,7 +9,7 @@ import (
 )
 
 func Http3Client() *http.Client {
-	roundTripper := &http3.RoundTripper{
+	roundTripper := &http3.Transport{
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: false,
 		},
@@ -27,7 +27,7 @@ func (transport *withCloseIdleConnections) CloseIdleConnections() {
 
 func NewHTTP3() *HTTP {
 	transport := &withCloseIdleConnections{
-		RoundTripper: &http3.RoundTripper{
+		RoundTripper: &http3.Transport{
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: true,
 				MinVersion:         tls.VersionTLS11,

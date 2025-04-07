@@ -142,11 +142,17 @@ func (h *HTTP) ConfigureProxy(delegate ProxyDelegate) error {
 	h.proxyDelegate = delegate
 	switch transport := h.transport.(type) {
 	case *http.Transport:
-		transport.Proxy = h.proxyDelegate.ProxyURL
+		if delegate != nil {
+			transport.Proxy = h.proxyDelegate.ProxyURL
+		}
 	case *http3.Transport:
 		return errors.New("quic protocol can not set proxy")
 	}
 	return nil
+}
+
+func (h *HTTP) GetProxy() ProxyDelegate {
+	return h.proxyDelegate
 }
 
 func (h *HTTP) ConfigureTimeout(timeout time.Duration) {
