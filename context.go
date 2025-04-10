@@ -79,3 +79,11 @@ func SetRedirect(ctx context.Context, r func(req *http.Request, via []*http.Requ
 	}
 	return ErrHTTPNotInContext
 }
+
+func SetAutoRetry(ctx context.Context, autoRetry int) error {
+	if h := FromContext(ctx); h != nil {
+		h.ConfigureAutoRetry(autoRetry)
+		return nil
+	}
+	return ErrHTTPNotInContext
+}

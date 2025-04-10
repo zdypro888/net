@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/andybalholm/brotli"
@@ -78,6 +79,7 @@ type HTTP struct {
 	transport     http.RoundTripper
 	client        *http.Client
 	proxyDelegate ProxyDelegate
+	autoRetry     int
 }
 
 func NewHTTP(config *tls.Config) *HTTP {
@@ -126,6 +128,10 @@ func (h *HTTP) ConfigureV2() error {
 		return errors.New("quic protocol can not set to http2.0")
 	}
 	return nil
+}
+
+func (h *HTTP) ConfigureAutoRetry(autoRetry int) {
+	h.autoRetry = autoRetry
 }
 
 func (h *HTTP) ConfigureCookie(cookies http.CookieJar) {
@@ -177,7 +183,7 @@ func (h *HTTP) Request(ctx context.Context, url string, headers http.Header, bod
 	return h.RequestMethod(ctx, url, method, headers, body)
 }
 
-func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, headers http.Header, body io.Reader) (*Response, error) {
+func (h *HTTP) requestMethodDo(ctx context.Context, url string, method string, headers http.Header, body io.Reader) (*Response, error) {
 	request, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return nil, err
@@ -205,6 +211,41 @@ func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, hea
 		return nil, err
 	}
 	return &Response{Response: response}, nil
+}
+
+func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, headers http.Header, body io.Reader) (*Response, error) {
+	if h.autoRetry == 0 {
+		return h.requestMethodDo(ctx, url, method, headers, body)
+	}
+	var bodyReader *utils.Reader
+	if body != nil {
+		switch v := body.(type) {
+		case *bytes.Buffer:
+			bodyReader, _ = utils.NewReader(bytes.NewReader(v.Bytes()))
+		case *bytes.Reader:
+			bodyReader, _ = utils.NewReader(v)
+		case *strings.Reader:
+			bodyReader, _ = utils.NewReader(v)
+		case *utils.Reader:
+			bodyReader = v.Temporary()
+		}
+	}
+	if bodyReader == nil {
+		return h.requestMethodDo(ctx, url, method, headers, body)
+	}
+	var err error
+	var response *Response
+	for i := h.autoRetry; i > 0; i-- {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if response, err = h.requestMethodDo(ctx, url, method, headers, bodyReader); err != nil {
+			continue
+		} else {
+			break
+		}
+	}
+	return response, err
 }
 
 func Request(ctx context.Context, url string, headers http.Header, body io.Reader) (*Response, error) {
