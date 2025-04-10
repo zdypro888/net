@@ -239,7 +239,7 @@ func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, hea
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		if response, err = h.requestMethodDo(ctx, url, method, headers, bodyReader); err != nil {
+		if response, err = h.requestMethodDo(ctx, url, method, headers, bodyReader.Temporary()); err != nil {
 			continue
 		} else {
 			break
