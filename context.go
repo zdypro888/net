@@ -72,14 +72,6 @@ func SetTimeout(ctx context.Context, timeout time.Duration) error {
 	return ErrHTTPNotInContext
 }
 
-func SetResponse(ctx context.Context, r ResponseDelegate) error {
-	if h := FromContext(ctx); h != nil {
-		h.ConfigureResponse(r)
-		return nil
-	}
-	return ErrHTTPNotInContext
-}
-
 func SetRedirect(ctx context.Context, r func(req *http.Request, via []*http.Request) error) error {
 	if h := FromContext(ctx); h != nil {
 		h.ConfigureRedirect(r)

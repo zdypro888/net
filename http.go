@@ -20,11 +20,6 @@ import (
 
 var ErrContextNotContainHTTP = errors.New("context not contain http")
 
-// ResponseDelegate 结果处理
-type ResponseDelegate interface {
-	Response(context.Context, *http.Request, *http.Response) (bool, error)
-}
-
 // Response 请求返回
 type Response struct {
 	*http.Response
@@ -80,10 +75,9 @@ func NewReader(data []byte) io.Reader {
 }
 
 type HTTP struct {
-	transport        http.RoundTripper
-	client           *http.Client
-	proxyDelegate    ProxyDelegate
-	responseDelegate ResponseDelegate
+	transport     http.RoundTripper
+	client        *http.Client
+	proxyDelegate ProxyDelegate
 }
 
 func NewHTTP(config *tls.Config) *HTTP {
@@ -169,10 +163,6 @@ func (h *HTTP) ConfigureDebug() error {
 	return nil
 }
 
-func (h *HTTP) ConfigureResponse(delegate ResponseDelegate) {
-	h.responseDelegate = delegate
-}
-
 func (h *HTTP) ConfigureRedirect(checkRedirect func(req *http.Request, via []*http.Request) error) {
 	h.client.CheckRedirect = checkRedirect
 }
@@ -188,49 +178,33 @@ func (h *HTTP) Request(ctx context.Context, url string, headers http.Header, bod
 }
 
 func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, headers http.Header, body io.Reader) (*Response, error) {
-	var err error
-	var retry bool
-	var request *http.Request
-	var response *http.Response
-	for {
-		if err = ctx.Err(); err != nil {
-			return nil, err
-		}
-		if request, err = http.NewRequestWithContext(ctx, method, url, body); err != nil {
-			return nil, err
-		}
-		if body != nil {
-			switch v := body.(type) {
-			case *utils.Reader:
-				request.ContentLength = v.Size()
-				snapshot := v.Temporary()
-				request.GetBody = func() (io.ReadCloser, error) {
-					return snapshot, nil
-				}
+	request, err := http.NewRequestWithContext(ctx, method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	// 扩展 body 处理
+	if body != nil {
+		switch v := body.(type) {
+		case *utils.Reader:
+			request.ContentLength = v.Size()
+			snapshot := v.Temporary()
+			request.GetBody = func() (io.ReadCloser, error) {
+				return snapshot, nil
 			}
-		}
-		if headers != nil {
-			request.Header = http.Header(headers).Clone()
-		}
-		if response, err = h.client.Do(request); err != nil {
-			h.client.CloseIdleConnections()
-			if h.proxyDelegate == nil {
-				return nil, err
-			} else if err = h.proxyDelegate.OnError(ctx, err); err != nil {
-				return nil, err
-			}
-		} else if h.responseDelegate != nil {
-			if retry, err = h.responseDelegate.Response(ctx, request, response); err != nil {
-				return nil, err
-			} else if !retry {
-				break
-			}
-		} else {
-			break
 		}
 	}
-	// defer response.Body.Close()
-	return &Response{Response: response}, err
+	if headers != nil {
+		request.Header = http.Header(headers).Clone()
+	}
+	response, err := h.client.Do(request)
+	if err != nil {
+		h.client.CloseIdleConnections()
+		if h.proxyDelegate != nil {
+			err = h.proxyDelegate.OnError(ctx, err)
+		}
+		return nil, err
+	}
+	return &Response{Response: response}, nil
 }
 
 func Request(ctx context.Context, url string, headers http.Header, body io.Reader) (*Response, error) {
