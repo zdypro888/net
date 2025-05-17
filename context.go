@@ -18,9 +18,9 @@ const (
 var ErrHTTPNotInContext = errors.New("http not in context")
 
 type ProxyDelegate interface {
-	DialContext(context.Context, string, string) (net.Conn, error)
 	ProxyURL(*http.Request) (*url.URL, error)
-	OnError(context.Context, error) error
+	DialContext(context.Context, string, string) (net.Conn, error)
+	OnResponse(context.Context, *http.Request, *http.Response, error) (*http.Response, error)
 }
 
 func Context(ctx context.Context, h *HTTP) context.Context {

@@ -205,9 +205,11 @@ func (h *HTTP) requestMethodDo(ctx context.Context, url string, method string, h
 	response, err := h.client.Do(request)
 	if err != nil {
 		h.client.CloseIdleConnections()
-		if h.proxyDelegate != nil {
-			err = h.proxyDelegate.OnError(ctx, err)
-		}
+	}
+	if h.proxyDelegate != nil {
+		response, err = h.proxyDelegate.OnResponse(ctx, request, response, err)
+	}
+	if err != nil {
 		return nil, err
 	}
 	return &Response{Response: response}, nil

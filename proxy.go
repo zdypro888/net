@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -17,13 +16,12 @@ import (
 type Conn = net.Conn
 
 // HTTPDebugProxy 调试代理
-var HTTPDebugProxy = &Proxy{Address: "http://127.0.0.1:8888", Forbit: math.MaxUint64}
+var HTTPDebugProxy = &Proxy{Address: "http://127.0.0.1:8888"}
 
 // Proxy 代理
 type Proxy struct {
-	Address string `bson:"Address" json:"Address"`
-	Forbit  uint64 `bson:"Forbit" json:"Forbit"`
-	Banbit  uint64 `bson:"Banbit,omitempty" json:"Banbit"`
+	Address  string `bson:"Address" json:"Address"`
+	Delegate func(ctx context.Context, request *http.Request, response *http.Response, err error) (*http.Response, error)
 }
 
 // GetProxyURL 取得代理地址
@@ -93,6 +91,9 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 	return nil, fmt.Errorf("type: %s not supported", proxyURL.Scheme)
 }
 
-func (proxy *Proxy) OnError(ctx context.Context, err error) error {
-	return err
+func (proxy *Proxy) OnResponse(ctx context.Context, request *http.Request, response *http.Response, err error) (*http.Response, error) {
+	if proxy.Delegate != nil {
+		return proxy.Delegate(ctx, request, response, err)
+	}
+	return response, err
 }
