@@ -17,12 +17,6 @@ const (
 
 var ErrHTTPNotInContext = errors.New("http not in context")
 
-type ProxyDelegate interface {
-	ProxyURL(*http.Request) (*url.URL, error)
-	DialContext(context.Context, string, string) (net.Conn, error)
-	OnResponse(context.Context, *http.Request, *http.Response, error) (*http.Response, error)
-}
-
 func Context(ctx context.Context, h *HTTP) context.Context {
 	return context.WithValue(ctx, ContextHTTPKey, h)
 }
@@ -34,7 +28,7 @@ func FromContext(ctx context.Context) *HTTP {
 	return nil
 }
 
-func SetProxy(ctx context.Context, proxy ProxyDelegate) error {
+func SetProxy(ctx context.Context, proxy func(*http.Request) (*url.URL, error)) error {
 	if h := FromContext(ctx); h != nil {
 		h.ConfigureProxy(proxy)
 		return nil
@@ -42,11 +36,12 @@ func SetProxy(ctx context.Context, proxy ProxyDelegate) error {
 	return ErrHTTPNotInContext
 }
 
-func GetProxy(ctx context.Context) ProxyDelegate {
+func SetDialContext(ctx context.Context, dialContext func(ctx context.Context, network, addr string) (net.Conn, error)) error {
 	if h := FromContext(ctx); h != nil {
-		return h.proxyDelegate
+		h.ConfigureDialContext(dialContext)
+		return nil
 	}
-	return nil
+	return ErrHTTPNotInContext
 }
 
 func SetCookie(ctx context.Context, c http.CookieJar) error {
@@ -75,14 +70,6 @@ func SetTimeout(ctx context.Context, timeout time.Duration) error {
 func SetRedirect(ctx context.Context, r func(req *http.Request, via []*http.Request) error) error {
 	if h := FromContext(ctx); h != nil {
 		h.ConfigureRedirect(r)
-		return nil
-	}
-	return ErrHTTPNotInContext
-}
-
-func SetAutoRetry(ctx context.Context, autoRetry int) error {
-	if h := FromContext(ctx); h != nil {
-		h.ConfigureAutoRetry(autoRetry)
 		return nil
 	}
 	return ErrHTTPNotInContext

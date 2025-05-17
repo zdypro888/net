@@ -20,8 +20,7 @@ var HTTPDebugProxy = &Proxy{Address: "http://127.0.0.1:8888"}
 
 // Proxy 代理
 type Proxy struct {
-	Address  string `bson:"Address" json:"Address"`
-	Delegate func(ctx context.Context, request *http.Request, response *http.Response, err error) (*http.Response, error)
+	Address string `bson:"Address" json:"Address"`
 }
 
 // GetProxyURL 取得代理地址
@@ -89,11 +88,4 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 		return conn, nil
 	}
 	return nil, fmt.Errorf("type: %s not supported", proxyURL.Scheme)
-}
-
-func (proxy *Proxy) OnResponse(ctx context.Context, request *http.Request, response *http.Response, err error) (*http.Response, error) {
-	if proxy.Delegate != nil {
-		return proxy.Delegate(ctx, request, response, err)
-	}
-	return response, err
 }

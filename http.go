@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -76,10 +77,10 @@ func NewReader(data []byte) io.Reader {
 }
 
 type HTTP struct {
-	transport     http.RoundTripper
-	client        *http.Client
-	proxyDelegate ProxyDelegate
-	autoRetry     int
+	transport  http.RoundTripper
+	client     *http.Client
+	OnResponse func(ctx context.Context, req *http.Request, res *http.Response, err error) (*http.Response, error)
+	AutoRetry  int
 }
 
 func NewHTTP(config *tls.Config) *HTTP {
@@ -130,43 +131,36 @@ func (h *HTTP) ConfigureV2() error {
 	return nil
 }
 
-func (h *HTTP) ConfigureAutoRetry(autoRetry int) {
-	h.autoRetry = autoRetry
-}
-
 func (h *HTTP) ConfigureCookie(cookies http.CookieJar) {
 	h.client.Jar = cookies
 }
 
-func (h *HTTP) ConfigureProxy(delegate ProxyDelegate) error {
-	h.proxyDelegate = delegate
+func (h *HTTP) ConfigureProxy(proxy func(*http.Request) (*url.URL, error)) error {
 	switch transport := h.transport.(type) {
 	case *http.Transport:
-		if delegate != nil {
-			transport.Proxy = h.proxyDelegate.ProxyURL
-		}
+		transport.Proxy = proxy
 	case *http3.Transport:
 		return errors.New("quic protocol can not set proxy")
 	}
 	return nil
 }
 
-func (h *HTTP) GetProxy() ProxyDelegate {
-	return h.proxyDelegate
+func (h *HTTP) ConfigureDebug() error {
+	return h.ConfigureProxy(HTTPDebugProxy.ProxyURL)
+}
+
+func (h *HTTP) ConfigureDialContext(dialContext func(ctx context.Context, network, addr string) (net.Conn, error)) error {
+	switch transport := h.transport.(type) {
+	case *http.Transport:
+		transport.DialContext = dialContext
+	case *http3.Transport:
+		return errors.New("quic protocol can not set proxy")
+	}
+	return nil
 }
 
 func (h *HTTP) ConfigureTimeout(timeout time.Duration) {
 	h.client.Timeout = timeout
-}
-
-func (h *HTTP) ConfigureDebug() error {
-	switch transport := h.transport.(type) {
-	case *http.Transport:
-		transport.Proxy = HTTPDebugProxy.ProxyURL
-	case *http3.Transport:
-		return errors.New("quic protocol can not set proxy")
-	}
-	return nil
 }
 
 func (h *HTTP) ConfigureRedirect(checkRedirect func(req *http.Request, via []*http.Request) error) {
@@ -206,8 +200,8 @@ func (h *HTTP) requestMethodDo(ctx context.Context, url string, method string, h
 	if err != nil {
 		h.client.CloseIdleConnections()
 	}
-	if h.proxyDelegate != nil {
-		response, err = h.proxyDelegate.OnResponse(ctx, request, response, err)
+	if h.OnResponse != nil {
+		response, err = h.OnResponse(ctx, request, response, err)
 	}
 	if err != nil {
 		return nil, err
@@ -216,7 +210,7 @@ func (h *HTTP) requestMethodDo(ctx context.Context, url string, method string, h
 }
 
 func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, headers http.Header, body io.Reader) (*Response, error) {
-	if h.autoRetry == 0 {
+	if h.AutoRetry == 0 {
 		return h.requestMethodDo(ctx, url, method, headers, body)
 	}
 	var bodyReader *utils.Reader
@@ -237,7 +231,7 @@ func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, hea
 	}
 	var err error
 	var response *Response
-	for i := h.autoRetry; i > 0; i-- {
+	for i := h.AutoRetry; i > 0; i-- {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
