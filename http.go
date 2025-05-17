@@ -137,8 +137,10 @@ func (h *HTTP) ConfigureCookie(cookies http.CookieJar) {
 	h.client.Jar = cookies
 }
 
-func (h *HTTP) ConfigureProxy(proxy func(*http.Request) (*url.URL, error)) error {
-	h.proxyURL = proxy
+func (h *HTTP) ConfigureProxy(proxy func(*http.Request) (*url.URL, error), storeCache bool) error {
+	if storeCache {
+		h.proxyURL = proxy
+	}
 	switch transport := h.transport.(type) {
 	case *http.Transport:
 		transport.Proxy = proxy
@@ -149,11 +151,13 @@ func (h *HTTP) ConfigureProxy(proxy func(*http.Request) (*url.URL, error)) error
 }
 
 func (h *HTTP) ConfigureDebug() error {
-	return h.ConfigureProxy(HTTPDebugProxy.ProxyURL)
+	return h.ConfigureProxy(HTTPDebugProxy.ProxyURL, false)
 }
 
-func (h *HTTP) ConfigureProxyDial(dialContext func(ctx context.Context, network, addr string) (net.Conn, error)) error {
-	h.proxyDial = dialContext
+func (h *HTTP) ConfigureProxyDial(dialContext func(ctx context.Context, network, addr string) (net.Conn, error), storeCache bool) error {
+	if storeCache {
+		h.proxyDial = dialContext
+	}
 	switch transport := h.transport.(type) {
 	case *http.Transport:
 		transport.DialContext = dialContext

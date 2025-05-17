@@ -28,17 +28,17 @@ func FromContext(ctx context.Context) *HTTP {
 	return nil
 }
 
-func SetProxy(ctx context.Context, proxy func(*http.Request) (*url.URL, error)) error {
+func SetProxy(ctx context.Context, proxy func(*http.Request) (*url.URL, error), storeCache bool) error {
 	if h := FromContext(ctx); h != nil {
-		h.ConfigureProxy(proxy)
+		h.ConfigureProxy(proxy, storeCache)
 		return nil
 	}
 	return ErrHTTPNotInContext
 }
 
-func SetProxyDial(ctx context.Context, dialContext func(ctx context.Context, network, addr string) (net.Conn, error)) error {
+func SetProxyDial(ctx context.Context, dialContext func(ctx context.Context, network, addr string) (net.Conn, error), storeCache bool) error {
 	if h := FromContext(ctx); h != nil {
-		h.ConfigureProxyDial(dialContext)
+		h.ConfigureProxyDial(dialContext, storeCache)
 		return nil
 	}
 	return ErrHTTPNotInContext
