@@ -36,9 +36,9 @@ func SetProxy(ctx context.Context, proxy func(*http.Request) (*url.URL, error)) 
 	return ErrHTTPNotInContext
 }
 
-func SetDialContext(ctx context.Context, dialContext func(ctx context.Context, network, addr string) (net.Conn, error)) error {
+func SetProxyDial(ctx context.Context, dialContext func(ctx context.Context, network, addr string) (net.Conn, error)) error {
 	if h := FromContext(ctx); h != nil {
-		h.ConfigureDialContext(dialContext)
+		h.ConfigureProxyDial(dialContext)
 		return nil
 	}
 	return ErrHTTPNotInContext

@@ -79,7 +79,9 @@ func NewReader(data []byte) io.Reader {
 type HTTP struct {
 	transport  http.RoundTripper
 	client     *http.Client
-	OnResponse func(ctx context.Context, req *http.Request, res *http.Response, err error) (*http.Response, error)
+	proxyURL   func(*http.Request) (*url.URL, error)
+	proxyDial  func(ctx context.Context, network, addr string) (net.Conn, error)
+	OnResponse func(ctx context.Context, req *http.Request, res *http.Response, err error) (*http.Response, error, bool)
 	AutoRetry  int
 }
 
@@ -136,6 +138,7 @@ func (h *HTTP) ConfigureCookie(cookies http.CookieJar) {
 }
 
 func (h *HTTP) ConfigureProxy(proxy func(*http.Request) (*url.URL, error)) error {
+	h.proxyURL = proxy
 	switch transport := h.transport.(type) {
 	case *http.Transport:
 		transport.Proxy = proxy
@@ -149,7 +152,8 @@ func (h *HTTP) ConfigureDebug() error {
 	return h.ConfigureProxy(HTTPDebugProxy.ProxyURL)
 }
 
-func (h *HTTP) ConfigureDialContext(dialContext func(ctx context.Context, network, addr string) (net.Conn, error)) error {
+func (h *HTTP) ConfigureProxyDial(dialContext func(ctx context.Context, network, addr string) (net.Conn, error)) error {
+	h.proxyDial = dialContext
 	switch transport := h.transport.(type) {
 	case *http.Transport:
 		transport.DialContext = dialContext
@@ -157,6 +161,22 @@ func (h *HTTP) ConfigureDialContext(dialContext func(ctx context.Context, networ
 		return errors.New("quic protocol can not set proxy")
 	}
 	return nil
+}
+
+func (h *HTTP) ConfigureProxyClear() {
+	switch transport := h.transport.(type) {
+	case *http.Transport:
+		transport.Proxy = nil
+		transport.DialContext = nil
+	}
+}
+
+func (h *HTTP) ConfigureProxyReset() {
+	switch transport := h.transport.(type) {
+	case *http.Transport:
+		transport.Proxy = h.proxyURL
+		transport.DialContext = h.proxyDial
+	}
 }
 
 func (h *HTTP) ConfigureTimeout(timeout time.Duration) {
@@ -197,11 +217,12 @@ func (h *HTTP) requestMethodDo(ctx context.Context, url string, method string, h
 		request.Header = http.Header(headers).Clone()
 	}
 	response, err := h.client.Do(request)
-	if err != nil {
-		h.client.CloseIdleConnections()
-	}
+	var closeIdleConn bool
 	if h.OnResponse != nil {
-		response, err = h.OnResponse(ctx, request, response, err)
+		response, err, closeIdleConn = h.OnResponse(ctx, request, response, err)
+	}
+	if err != nil || closeIdleConn {
+		h.client.CloseIdleConnections()
 	}
 	if err != nil {
 		return nil, err
