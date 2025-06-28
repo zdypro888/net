@@ -8,32 +8,16 @@ import (
 	"github.com/quic-go/quic-go/http3"
 )
 
-func Http3Client() *http.Client {
-	roundTripper := &http3.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: false,
-		},
+func NewHTTP3(config *tls.Config) *HTTP {
+	if config == nil {
+		config = &tls.Config{
+			InsecureSkipVerify: true,
+			MinVersion:         tls.VersionTLS11,
+			MaxVersion:         tls.VersionTLS13,
+		}
 	}
-	return &http.Client{Transport: roundTripper}
-}
-
-type withCloseIdleConnections struct {
-	*http3.RoundTripper
-}
-
-func (transport *withCloseIdleConnections) CloseIdleConnections() {
-	transport.Close()
-}
-
-func NewHTTP3() *HTTP {
-	transport := &withCloseIdleConnections{
-		RoundTripper: &http3.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-				MinVersion:         tls.VersionTLS11,
-				MaxVersion:         tls.VersionTLS13,
-			},
-		},
+	transport := &http3.Transport{
+		TLSClientConfig: config,
 	}
 	client := &http.Client{
 		Transport: transport,
