@@ -238,28 +238,25 @@ func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, hea
 		return h.requestMethodDo(ctx, url, method, headers, body)
 	}
 	var err error
-	var bodyReader *utils.Reader
+	var retryReader *utils.Reader
 	if body != nil {
 		switch v := body.(type) {
 		case *bytes.Buffer:
-			bodyReader, _ = utils.NewReader(v.Bytes())
+			retryReader, _ = utils.NewReader(v.Bytes())
 		case *utils.Reader:
-			bodyReader = v.Temporary()
+			retryReader = v.Temporary()
 		default:
-			if bodyReader, err = utils.NewReader(body); err != nil {
-				return nil, err
+			if retryReader, err = utils.NewReader(body); err != nil {
+				return h.requestMethodDo(ctx, url, method, headers, body)
 			}
 		}
-	}
-	if bodyReader == nil {
-		return h.requestMethodDo(ctx, url, method, headers, body)
 	}
 	var response *Response
 	for i := h.AutoRetry; i > 0; i-- {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		if response, err = h.requestMethodDo(ctx, url, method, headers, bodyReader.Temporary()); err != nil {
+		if response, err = h.requestMethodDo(ctx, url, method, headers, retryReader.Temporary()); err != nil {
 			continue
 		} else {
 			break
