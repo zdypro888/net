@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/andybalholm/brotli"
@@ -238,23 +237,23 @@ func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, hea
 	if h.AutoRetry == 0 {
 		return h.requestMethodDo(ctx, url, method, headers, body)
 	}
+	var err error
 	var bodyReader *utils.Reader
 	if body != nil {
 		switch v := body.(type) {
 		case *bytes.Buffer:
-			bodyReader, _ = utils.NewReader(bytes.NewReader(v.Bytes()))
-		case *bytes.Reader:
-			bodyReader, _ = utils.NewReader(v)
-		case *strings.Reader:
-			bodyReader, _ = utils.NewReader(v)
+			bodyReader, _ = utils.NewReader(v.Bytes())
 		case *utils.Reader:
 			bodyReader = v.Temporary()
+		default:
+			if bodyReader, err = utils.NewReader(body); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if bodyReader == nil {
 		return h.requestMethodDo(ctx, url, method, headers, body)
 	}
-	var err error
 	var response *Response
 	for i := h.AutoRetry; i > 0; i-- {
 		if ctx.Err() != nil {
