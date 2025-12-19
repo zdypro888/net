@@ -16,6 +16,8 @@ github.com/zdypro888/utils v0.0.0-20251218071638-73c6d4a2793c h1:0mZEDgJwNkT7zUM
 github.com/zdypro888/utils v0.0.0-20251218071638-73c6d4a2793c/go.mod h1:ume6M7UlgUlvYJXI4+l0Mha/5k+jUQDri4BfK++FfKs=
 github.com/zdypro888/utils v0.0.0-20251218085431-ac8b60123165 h1:IydCV5AzeSGv82ElR0iO1GylY963o/ceLlzO5IPSj3Y=
 github.com/zdypro888/utils v0.0.0-20251218085431-ac8b60123165/go.mod h1:ume6M7UlgUlvYJXI4+l0Mha/5k+jUQDri4BfK++FfKs=
+github.com/zdypro888/utils v0.0.0-20251219050431-85fd5ff703ac h1:yEx1zLQIhmtGcr3Jrw6ta9dKQRPy8kCFt8vreI1xZRI=
+github.com/zdypro888/utils v0.0.0-20251219050431-85fd5ff703ac/go.mod h1:ume6M7UlgUlvYJXI4+l0Mha/5k+jUQDri4BfK++FfKs=
 go.uber.org/mock v0.6.0 h1:hyF9dfmbgIX5EfOdasqLsWD6xqpNZlXblLB/Dbnwv3Y=
 go.uber.org/mock v0.6.0/go.mod h1:KiVJ4BqZJaMj4svdfmHM0AUx4NJYO8ZNpPnZn1Z+BBU=
 golang.org/x/crypto v0.46.0 h1:cKRW/pmt1pKAfetfu+RCEvjvZkA9RimPbh7bhFjGVBU=
