@@ -5,7 +5,7 @@ go 1.24.1
 require (
 	github.com/andybalholm/brotli v1.2.0
 	github.com/quic-go/quic-go v0.58.0
-	github.com/zdypro888/utils v0.0.0-20251226124029-9b8c92e5b04d
+	github.com/zdypro888/utils v0.0.0-20251226143211-35895b21a54f
 	golang.org/x/net v0.48.0
 )
 
