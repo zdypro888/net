@@ -13,8 +13,6 @@ import (
 	"github.com/zdypro888/utils"
 )
 
-type Conn = net.Conn
-
 // HTTPDebugProxy 调试代理
 var HTTPDebugProxy = &Proxy{Address: "http://127.0.0.1:8888"}
 
@@ -42,7 +40,8 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 	if err != nil {
 		return nil, err
 	}
-	if proxyURL.Scheme == "socks5" {
+	switch proxyURL.Scheme {
+	case "socks5":
 		d := socks5.NewDialer("tcp", proxyURL.Host)
 		if proxyURL.User != nil {
 			auth := &socks5.UsernamePassword{
@@ -56,7 +55,7 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 			d.Authenticate = auth.Authenticate
 		}
 		return d.DialContext(ctx, network, address)
-	} else if proxyURL.Scheme == "http" || proxyURL.Scheme == "https" {
+	case "http", "https":
 		conn, err := net.Dial("tcp", proxyURL.Host)
 		if err != nil {
 			return nil, err
