@@ -24,8 +24,8 @@ type Conn interface {
 	Write(ctx context.Context, data any) error
 
 	// Handle 处理无法匹配到请求的消息（如服务端主动推送）。
-	// 由 Client 在独立的 goroutine 中调用。
-	Handle(ctx context.Context, data any)
+	// 在唯一的处理协程中调用，保证线程安全。
+	Handle(ctx context.Context, data any) any
 }
 
 type ConnHeart interface {

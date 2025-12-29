@@ -35,6 +35,7 @@ type Client struct {
 	waiter sync.WaitGroup     // 等待 goroutine 退出
 	cancel context.CancelFunc // 取消内部 context
 
+	conn      Conn        // 底层连接实现
 	running   atomic.Bool // 运行状态标志
 	lastError error       // 最后发生的错误
 
@@ -73,6 +74,12 @@ func (client *Client) Reset(ctx context.Context, conn Conn) error {
 	return nil
 }
 
+func (client *Client) Conn() Conn {
+	client.locker.Lock()
+	defer client.locker.Unlock()
+	return client.conn
+}
+
 // onConnected 初始化连接状态并启动工作协程。
 // 必须在持有锁或初始化时调用。
 func (client *Client) onConnected(ctx context.Context, conn Conn) {
@@ -88,6 +95,8 @@ func (client *Client) onConnected(ctx context.Context, conn Conn) {
 	recvchan := make(chan *receiveEvent, 16)
 	cctx, cancel := context.WithCancel(ctx)
 	client.cancel = cancel
+
+	client.conn = conn
 
 	// 初始化心跳时间
 	if heartConn, ok := conn.(ConnHeart); ok {
@@ -205,7 +214,13 @@ func (client *Client) asyncGo(ctx context.Context, conn Conn, sendchan <-chan *s
 				}
 				if !foundNotify {
 					// 无匹配请求，作为服务端推送处理
-					go conn.Handle(ctx, recv.Data)
+					if data := conn.Handle(ctx, recv.Data); data != nil {
+						// 处理返回的数据（如果有）
+						if err := conn.Write(ctx, data); err != nil {
+							client.lastError = err
+							client.running.Store(false)
+						}
+					}
 				}
 			}
 
