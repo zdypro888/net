@@ -256,7 +256,11 @@ func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, hea
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		if response, err = h.requestMethodDo(ctx, url, method, headers, retryReader.Temporary()); err != nil {
+		var reqBody io.Reader
+		if retryReader != nil {
+			reqBody = retryReader.Temporary()
+		}
+		if response, err = h.requestMethodDo(ctx, url, method, headers, reqBody); err != nil {
 			continue
 		} else {
 			break
