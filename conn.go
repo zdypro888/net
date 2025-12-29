@@ -2,7 +2,10 @@
 // 支持请求-响应模式的异步通信，适用于 RPC、WebSocket 等场景。
 package net
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // Conn 定义了通用的网络连接接口。
 // 实现者需要提供线程安全的读写操作。
@@ -23,6 +26,11 @@ type Conn interface {
 	// Handle 处理无法匹配到请求的消息（如服务端主动推送）。
 	// 由 Client 在独立的 goroutine 中调用。
 	Handle(ctx context.Context, data any)
+}
+
+type ConnHeart interface {
+	// Heart 返回心跳消息的数据和下次心跳的时间点。
+	Heart(connect bool, count uint64) (any, time.Time)
 }
 
 // Notify 定义了可用于请求-响应匹配的消息接口。

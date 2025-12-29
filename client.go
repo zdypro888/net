@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Client 是一个支持请求-响应模式的多路复用网络客户端。
@@ -30,15 +31,18 @@ import (
 //	// 请求-响应（message 需实现 Notify 接口）
 //	resp, err := client.Request(ctx, request)
 type Client struct {
-	locker sync.RWMutex     // 保护 Client 状态的读写锁
-	waiter sync.WaitGroup   // 等待 goroutine 退出
+	locker sync.RWMutex       // 保护 Client 状态的读写锁
+	waiter sync.WaitGroup     // 等待 goroutine 退出
 	cancel context.CancelFunc // 取消内部 context
 
 	running   atomic.Bool // 运行状态标志
 	lastError error       // 最后发生的错误
 
-	sendchan chan *sendEvent  // 发送队列
-	stopChan chan struct{}    // 停止信号，通知 Write/Request 连接已关闭
+	heartCount atomic.Uint64
+	heartTime  time.Time // 下次心跳时间
+
+	sendchan chan *sendEvent // 发送队列
+	stopChan chan struct{}   // 停止信号，通知 Write/Request 连接已关闭
 }
 
 // receiveEvent 封装从连接接收到的数据
@@ -84,6 +88,14 @@ func (client *Client) onConnected(ctx context.Context, conn Conn) {
 	recvchan := make(chan *receiveEvent, 16)
 	cctx, cancel := context.WithCancel(ctx)
 	client.cancel = cancel
+
+	// 初始化心跳时间
+	if heartConn, ok := conn.(ConnHeart); ok {
+		_, heartTime := heartConn.Heart(true, 0)
+		client.heartTime = heartTime
+	} else {
+		client.heartTime = time.Now().Add(60 * time.Second)
+	}
 
 	// 启动工作协程
 	client.stopChan = make(chan struct{})
@@ -164,6 +176,10 @@ func (client *Client) asyncGo(ctx context.Context, conn Conn, sendchan <-chan *s
 			client.running.Store(false)
 			client.lastError = ctx.Err()
 
+		case <-stopchan:
+			// 收到停止信号
+			client.running.Store(false)
+
 		case recv, ok := <-recvchan:
 			// 处理接收到的数据
 			if !ok {
@@ -200,13 +216,19 @@ func (client *Client) asyncGo(ctx context.Context, conn Conn, sendchan <-chan *s
 				// 写入数据到连接
 				err := conn.Write(ctx, send.Data)
 				isNotify := false
-				if err == nil && send.Notify {
-					// 写入成功且需要等待响应
-					var notify Notify
-					if notify, isNotify = send.Data.(Notify); isNotify {
-						// 注册到等待队列
-						notifys[notify.Id()] = send.Response
+				if err == nil {
+					if send.Notify {
+						// 写入成功且需要等待响应
+						var notify Notify
+						if notify, isNotify = send.Data.(Notify); isNotify {
+							// 注册到等待队列
+							notifys[notify.Id()] = send.Response
+						}
 					}
+				} else {
+					// 写入时发生错误
+					client.lastError = err
+					client.running.Store(false)
 				}
 				if !isNotify {
 					// 不需要等待响应，或数据未实现 Notify 接口
@@ -214,6 +236,20 @@ func (client *Client) asyncGo(ctx context.Context, conn Conn, sendchan <-chan *s
 					send.Response <- &dataOrErr{Error: err}
 					close(send.Response)
 				}
+			}
+
+		case <-time.After(time.Until(client.heartTime)):
+			// 处理心跳
+			if heartConn, ok := conn.(ConnHeart); ok {
+				var heartData any
+				heartData, client.heartTime = heartConn.Heart(false, client.heartCount.Add(1))
+				if err := conn.Write(ctx, heartData); err != nil {
+					client.lastError = err
+					client.running.Store(false)
+				}
+			} else {
+				// 无心跳支持，设置为较远的时间点
+				client.heartTime = time.Now().Add(60 * time.Second)
 			}
 		}
 	}
@@ -254,9 +290,9 @@ type dataOrErr struct {
 
 // sendEvent 封装发送请求
 type sendEvent struct {
-	Data     any              // 要发送的数据
-	Notify   bool             // 是否需要等待响应
-	Response chan *dataOrErr  // 响应通道
+	Data     any             // 要发送的数据
+	Notify   bool            // 是否需要等待响应
+	Response chan *dataOrErr // 响应通道
 }
 
 // Write 发送数据到连接，不等待响应。
