@@ -191,17 +191,19 @@ func (client *Client) asyncGo(ctx context.Context, conn Conn, sendchan <-chan *s
 				client.running.Store(false)
 			} else {
 				// 尝试匹配请求
-				found := false
+				foundNotify := false
 				if notify, ok := recv.Data.(Notify); ok {
-					var respChan chan *dataOrErr
-					if respChan, found = notifys[notify.Id()]; found {
-						// 找到匹配的请求，发送响应
-						respChan <- &dataOrErr{Data: recv.Data}
-						close(respChan)
-						delete(notifys, notify.Id())
+					if notifyId, ok := notify.Id(); ok {
+						if respChan, ok := notifys[notifyId]; ok {
+							// 找到匹配的请求，发送响应
+							respChan <- &dataOrErr{Data: recv.Data}
+							close(respChan)
+							delete(notifys, notifyId)
+							foundNotify = true
+						}
 					}
 				}
-				if !found {
+				if !foundNotify {
 					// 无匹配请求，作为服务端推送处理
 					go conn.Handle(ctx, recv.Data)
 				}
@@ -215,14 +217,16 @@ func (client *Client) asyncGo(ctx context.Context, conn Conn, sendchan <-chan *s
 			} else {
 				// 写入数据到连接
 				err := conn.Write(ctx, send.Data)
-				isNotify := false
+				isNotifySuccess := false
 				if err == nil {
 					if send.Notify {
 						// 写入成功且需要等待响应
-						var notify Notify
-						if notify, isNotify = send.Data.(Notify); isNotify {
-							// 注册到等待队列
-							notifys[notify.Id()] = send.Response
+						if notify, ok := send.Data.(Notify); ok {
+							if notifyId, ok := notify.Id(); ok {
+								// 注册到等待队列
+								notifys[notifyId] = send.Response
+								isNotifySuccess = true
+							}
 						}
 					}
 				} else {
@@ -230,7 +234,7 @@ func (client *Client) asyncGo(ctx context.Context, conn Conn, sendchan <-chan *s
 					client.lastError = err
 					client.running.Store(false)
 				}
-				if !isNotify {
+				if !isNotifySuccess {
 					// 不需要等待响应，或数据未实现 Notify 接口
 					// 立即返回结果
 					send.Response <- &dataOrErr{Error: err}
@@ -262,11 +266,12 @@ func (client *Client) asyncGo(ctx context.Context, conn Conn, sendchan <-chan *s
 	// 处理 recvchan 中残留的数据，尝试匹配响应
 	for recv := range recvchan {
 		if notify, ok := recv.Data.(Notify); ok {
-			notifyId := notify.Id()
-			if respChan, found := notifys[notifyId]; found {
-				respChan <- &dataOrErr{Data: recv.Data, Error: recv.Error}
-				close(respChan)
-				delete(notifys, notifyId)
+			if notifyId, ok := notify.Id(); ok {
+				if respChan, found := notifys[notifyId]; found {
+					respChan <- &dataOrErr{Data: recv.Data, Error: recv.Error}
+					close(respChan)
+					delete(notifys, notifyId)
+				}
 			}
 		}
 	}

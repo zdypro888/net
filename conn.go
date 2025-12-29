@@ -40,5 +40,5 @@ type Notify interface {
 	// Id 返回消息的唯一标识符。
 	// 请求和响应必须返回相同的 Id 才能正确匹配。
 	// 返回值必须是可比较的类型（用于 map key）。
-	Id() any
+	Id() (any, bool)
 }
