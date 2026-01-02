@@ -58,10 +58,11 @@ func (slaver *Slaver) Run(ctx context.Context, addr string) error {
 }
 
 func (slaver *Slaver) dialContext(ctx context.Context, wsConn *websocket.Conn, network, address string) {
-	conn, err := net.Dial(network, address)
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, network, address)
 	if err != nil {
 		// 发送连接错误响应，忽略写入错误（连接可能已断开）
-		_ = wsConn.WriteJSON(&connPacket{
+		wsConn.WriteJSON(&connPacket{
 			Id:     slaver.Id,
 			Method: MethodSlaverDialoutError, // 连接错误
 			Error:  err.Error(),

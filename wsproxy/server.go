@@ -71,6 +71,15 @@ func (server *Server) DialContext(ctx context.Context, network, address string) 
 	if session == nil {
 		return nil, ErrNoConnection
 	}
+
+	// 设置超时，防止阻塞
+	timeout := 30 * time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		timeout = time.Until(deadline)
+	}
+	session.Conn.SetWriteDeadline(time.Now().Add(timeout))
+	session.Conn.SetReadDeadline(time.Now().Add(timeout))
+
 	outgoing := &connPacket{
 		Id:      session.Id,
 		Method:  MethodSlaverDialout, // Dial
@@ -86,6 +95,11 @@ func (server *Server) DialContext(ctx context.Context, network, address string) 
 		session.Close()
 		return nil, err
 	}
+
+	// 清除超时，后续由 copyLoop 管理
+	session.Conn.SetWriteDeadline(time.Time{})
+	session.Conn.SetReadDeadline(time.Time{})
+
 	if incoming.Method != MethodSlaverDialoutSuccess {
 		session.Close()
 		if incoming.Error != "" {

@@ -35,23 +35,27 @@ type pump struct {
 }
 
 func (p *pump) copyLoop(ctx context.Context, wsConn *websocket.Conn, conn net.Conn) error {
+	// 监听 ctx 取消，主动关闭连接以中断阻塞的读操作
+	go func() {
+		<-ctx.Done()
+		wsConn.Close()
+		conn.Close()
+	}()
+
 	defer wsConn.Close()
 	defer conn.Close()
 
 	var waiter sync.WaitGroup
 	waiter.Add(2)
-	go p.wsCopyToConn(ctx, &waiter, wsConn, conn)
-	go p.connCopyToWs(ctx, &waiter, conn, wsConn)
+	go p.wsCopyToConn(&waiter, wsConn, conn)
+	go p.connCopyToWs(&waiter, conn, wsConn)
 	waiter.Wait()
 	return nil
 }
 
-func (p *pump) wsCopyToConn(ctx context.Context, waiter *sync.WaitGroup, wsConn *websocket.Conn, conn net.Conn) error {
+func (p *pump) wsCopyToConn(waiter *sync.WaitGroup, wsConn *websocket.Conn, conn net.Conn) error {
 	defer waiter.Done()
 	for {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
 		_, message, err := wsConn.ReadMessage()
 		if err != nil {
 			return err
@@ -62,13 +66,10 @@ func (p *pump) wsCopyToConn(ctx context.Context, waiter *sync.WaitGroup, wsConn 
 	}
 }
 
-func (p *pump) connCopyToWs(ctx context.Context, waiter *sync.WaitGroup, conn net.Conn, wsConn *websocket.Conn) error {
+func (p *pump) connCopyToWs(waiter *sync.WaitGroup, conn net.Conn, wsConn *websocket.Conn) error {
 	defer waiter.Done()
 	buf := make([]byte, 32*1024)
 	for {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
 		n, err := conn.Read(buf)
 		if err != nil {
 			return err

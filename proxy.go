@@ -88,10 +88,12 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 		}
 		return conn, nil
 	case "ws", "wss":
-		if proxy.server == nil {
-			proxy.server = wsproxy.DefaultServer
+		if proxy.server != nil {
+			return proxy.server.DialContext(ctx, network, address)
+		} else {
+			client := wsproxy.NewClient(proxyURL.String())
+			return client.Dial(ctx, network, address)
 		}
-		return proxy.server.DialContext(ctx, network, address)
 	}
 	return nil, fmt.Errorf("type: %s not supported", proxyURL.Scheme)
 }
