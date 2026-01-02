@@ -10,6 +10,7 @@ import (
 	"net/url"
 
 	"github.com/zdypro888/net/socks5"
+	"github.com/zdypro888/net/wsproxy"
 	"github.com/zdypro888/utils"
 )
 
@@ -18,7 +19,8 @@ var HTTPDebugProxy = &Proxy{Address: "http://127.0.0.1:8888"}
 
 // Proxy 代理
 type Proxy struct {
-	Address string `bson:"Address" json:"Address"`
+	Address string          `bson:"Address" json:"Address"`
+	server  *wsproxy.Server `bson:"-" json:"-"`
 }
 
 // GetProxyURL 取得代理地址
@@ -85,6 +87,15 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 			return nil, fmt.Errorf("connect http tunnel faild: %d", response.StatusCode)
 		}
 		return conn, nil
+	case "ws", "wss":
+		if proxy.server == nil {
+			proxy.server = wsproxy.DefaultServer
+		}
+		return proxy.server.DialContext(ctx, network, address)
 	}
 	return nil, fmt.Errorf("type: %s not supported", proxyURL.Scheme)
+}
+
+func (proxy *Proxy) WithWSServer(server *wsproxy.Server) {
+	proxy.server = server
 }
