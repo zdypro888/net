@@ -261,10 +261,11 @@ func (client *Client) asyncGo(ctx context.Context, conn Conn, sendchan <-chan *s
 			// 处理心跳
 			if heartConn, ok := conn.(ConnHeart); ok {
 				var heartData any
-				heartData, client.heartTime = heartConn.Heart(false, client.heartCount.Add(1))
-				if err := conn.Write(ctx, heartData); err != nil {
-					client.lastError = err
-					client.running.Store(false)
+				if heartData, client.heartTime = heartConn.Heart(false, client.heartCount.Add(1)); heartData != nil {
+					if err := conn.Write(ctx, heartData); err != nil {
+						client.lastError = err
+						client.running.Store(false)
+					}
 				}
 			} else {
 				// 无心跳支持，设置为较远的时间点
@@ -319,6 +320,9 @@ type sendEvent struct {
 // 阻塞直到数据被写入或发生错误。
 // 线程安全，可并发调用。
 func (client *Client) Write(ctx context.Context, data any) error {
+	if data == nil {
+		return fmt.Errorf("data is nil")
+	}
 	client.locker.RLock()
 	defer client.locker.RUnlock()
 
@@ -354,6 +358,9 @@ func (client *Client) Write(ctx context.Context, data any) error {
 // 阻塞直到收到响应或发生错误。
 // 线程安全，可并发调用。
 func (client *Client) Request(ctx context.Context, data any) (any, error) {
+	if data == nil {
+		return nil, fmt.Errorf("data is nil")
+	}
 	client.locker.RLock()
 	defer client.locker.RUnlock()
 
