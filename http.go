@@ -200,25 +200,7 @@ func (h *HTTP) Request(ctx context.Context, url string, headers http.Header, bod
 	return h.RequestMethod(ctx, url, method, headers, body)
 }
 
-func (h *HTTP) requestMethodDo(ctx context.Context, url string, method string, headers http.Header, body io.Reader) (*Response, error) {
-	request, err := http.NewRequestWithContext(ctx, method, url, body)
-	if err != nil {
-		return nil, err
-	}
-	// 扩展 body 处理
-	if body != nil {
-		switch v := body.(type) {
-		case *utils.Reader:
-			request.ContentLength = v.Size()
-			snapshot := v.Temporary()
-			request.GetBody = func() (io.ReadCloser, error) {
-				return snapshot, nil
-			}
-		}
-	}
-	if headers != nil {
-		request.Header = http.Header(headers).Clone()
-	}
+func (h *HTTP) requestWithRequest(ctx context.Context, request *http.Request) (*Response, error) {
 	response, err := h.client.Do(request)
 	var closeIdleConn bool
 	if h.OnResponse != nil {
@@ -233,34 +215,73 @@ func (h *HTTP) requestMethodDo(ctx context.Context, url string, method string, h
 	return &Response{Response: response}, nil
 }
 
+// requestMethodDo 发送请求
+func (h *HTTP) requestMethodDo(ctx context.Context, url string, method string, headers http.Header, body io.Reader) (*Response, error) {
+	request, err := http.NewRequestWithContext(ctx, method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	if body != nil {
+		// 如果是 utils.Reader 则扩展处理
+		if breader, ok := body.(*utils.Reader); ok {
+			defer breader.Close()
+			request.ContentLength = breader.Size()
+			request.Body = breader.Temporary()
+			request.GetBody = func() (io.ReadCloser, error) {
+				return breader.Temporary(), nil // 快照, 用于301重定向等场景
+			}
+		}
+	}
+	if headers != nil {
+		request.Header = http.Header(headers).Clone()
+	}
+	return h.requestWithRequest(ctx, request)
+}
+
 func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, headers http.Header, body io.Reader) (*Response, error) {
 	if h.AutoRetry == 0 {
 		return h.requestMethodDo(ctx, url, method, headers, body)
 	}
 	var err error
-	var retryReader *utils.Reader
+	var breader *utils.Reader
 	if body != nil {
+		if bodyCloser, ok := body.(io.Closer); ok {
+			defer bodyCloser.Close()
+		}
 		switch v := body.(type) {
 		case *bytes.Buffer:
-			retryReader, _ = utils.NewReader(v.Bytes())
+			// 应该不会发生错误, 因为 bytes.Buffer 不会出错
+			if breader, err = utils.NewReader(v.Bytes()); err != nil {
+				return nil, err
+			}
 		case *utils.Reader:
-			retryReader = v.Temporary()
+			// 创建快照用作body重试
+			breader = v.Temporary()
 		default:
-			if retryReader, err = utils.NewReader(body); err != nil {
+			// 其他类型都尝试读取到内存中
+			if breader, err = utils.NewReader(v); err != nil {
+				// 转换 body 失败, 则不进行重试
 				return h.requestMethodDo(ctx, url, method, headers, body)
 			}
 		}
+	}
+	request, err := http.NewRequestWithContext(ctx, method, url, breader)
+	if err != nil {
+		return nil, err
 	}
 	var response *Response
 	for i := h.AutoRetry; i > 0; i-- {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		var reqBody io.Reader
-		if retryReader != nil {
-			reqBody = retryReader.Temporary()
+		if breader != nil {
+			request.ContentLength = breader.Size()
+			request.Body = breader.Temporary()
+			request.GetBody = func() (io.ReadCloser, error) {
+				return breader.Temporary(), nil
+			}
 		}
-		if response, err = h.requestMethodDo(ctx, url, method, headers, reqBody); err != nil {
+		if response, err = h.requestWithRequest(ctx, request); err != nil {
 			continue
 		} else {
 			break
