@@ -269,6 +269,9 @@ func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, hea
 	if err != nil {
 		return nil, err
 	}
+	if headers != nil {
+		request.Header = http.Header(headers).Clone()
+	}
 	var response *Response
 	for i := h.AutoRetry; i > 0; i-- {
 		if ctx.Err() != nil {
