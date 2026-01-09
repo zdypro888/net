@@ -6,7 +6,7 @@ require (
 	github.com/andybalholm/brotli v1.2.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/quic-go/quic-go v0.58.0
-	github.com/zdypro888/utils v0.0.0-20260109063253-cf95c9428b4e
+	github.com/zdypro888/utils v0.0.0-20260109064507-70fed68b69f4
 	golang.org/x/net v0.48.0
 )
 
