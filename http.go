@@ -264,8 +264,9 @@ func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, hea
 				return h.requestMethodDo(ctx, url, method, headers, body)
 			}
 		}
+		body = breader
 	}
-	request, err := http.NewRequestWithContext(ctx, method, url, breader)
+	request, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return nil, err
 	}
