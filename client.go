@@ -40,7 +40,7 @@ const (
 type asynRequest[M any, T Conn[M]] struct {
 	Command  AsyncCommand
 	Callback func(ctx context.Context, conn T)
-	Message  *messageRequest[M]
+	Message  *asyncMessage[M]
 }
 
 // NewClient 创建并启动一个新的 Client。
@@ -135,10 +135,10 @@ func (client *Client[M, T]) receiveGo(ctx context.Context, conn T, recvchan chan
 // 3. 匹配请求和响应（通过 Notify.Id）
 // 4. 分发未匹配的消息到 Handle
 func (client *Client[M, T]) asyncGo(ctx context.Context, cancel context.CancelFunc, conn T, asynchan <-chan *asynRequest[M, T], recvchan <-chan M, stopchan chan struct{}) {
-	// notifys 存储等待响应的请求，key 是 Notify.Id()
-	notifys := make(map[any]*messageRequest[M])
+	// asyncNotifys 存储等待响应的请求，key 是 Notify.Id()
+	asyncNotifys := make(map[any]*asyncMessage[M])
+	var zeroM M
 	running := true
-	// 主循环：处理发送和接收
 	heartTimer := time.NewTimer(time.Until(client.heartTime))
 	defer heartTimer.Stop()
 	for running {
@@ -157,10 +157,10 @@ func (client *Client[M, T]) asyncGo(ctx context.Context, cancel context.CancelFu
 				foundNotify := false
 				if notify, ok := any(recv).(NotifyMessage); ok {
 					if notifyId, ok := notify.Id(); ok {
-						if request, ok := notifys[notifyId]; ok {
+						if asyncRequest, ok := asyncNotifys[notifyId]; ok {
 							// 找到匹配的请求，发送响应
-							request.Response(&messageResponse[M]{Data: recv})
-							delete(notifys, notifyId)
+							asyncRequest.Response(recv, nil)
+							delete(asyncNotifys, notifyId)
 							foundNotify = true
 						}
 					}
@@ -178,30 +178,30 @@ func (client *Client[M, T]) asyncGo(ctx context.Context, cancel context.CancelFu
 			} else {
 				switch asyncall.Command {
 				case AsyncCommandSend:
-					request := asyncall.Message
+					asyncRequest := asyncall.Message
 					// 写入数据到连接
-					err := conn.Write(ctx, request.Data)
-					isNotifySuccess := false
-					if err == nil {
-						if request.Notify {
-							// 写入成功且需要等待响应
-							if notify, ok := any(request.Data).(NotifyMessage); ok {
+					err := conn.Write(ctx, asyncRequest.Data)
+					if asyncRequest.Notify {
+						if err != nil {
+							asyncRequest.Response(zeroM, err)
+						} else {
+							// 注册到等待队列
+							if notify, ok := any(asyncRequest.Data).(NotifyMessage); ok {
 								if notifyId, ok := notify.Id(); ok {
 									// 注册到等待队列
-									notifys[notifyId] = request
-									isNotifySuccess = true
+									asyncNotifys[notifyId] = asyncRequest
+									asyncRequest = nil
 								}
 							}
+							if asyncRequest != nil {
+								// 没有实现 Notify 接口，无法匹配响应
+								asyncRequest.Response(zeroM, fmt.Errorf("message does not implement Notify interface"))
+							}
 						}
-					} else {
-						// 写入时发生错误
+					}
+					if err != nil {
 						client.lastError = err
 						running = false
-					}
-					if !isNotifySuccess {
-						// 不需要等待响应，或数据未实现 Notify 接口
-						// 立即返回结果
-						request.Response(&messageResponse[M]{Error: err})
 					}
 				case AsyncCommandCallback:
 					if asyncall.Callback != nil {
@@ -227,11 +227,11 @@ func (client *Client[M, T]) asyncGo(ctx context.Context, cancel context.CancelFu
 			}
 			heartTimer.Reset(time.Until(client.heartTime))
 		}
-		if len(notifys) > 100 {
+		if len(asyncNotifys) > 100 {
 			// 清理已取消的请求，防止内存泄漏
-			for id, req := range notifys {
-				if req.Canceled.Load() {
-					delete(notifys, id)
+			for id, asyncRequest := range asyncNotifys {
+				if asyncRequest.Canceled() {
+					delete(asyncNotifys, id)
 				}
 			}
 		}
@@ -245,9 +245,9 @@ func (client *Client[M, T]) asyncGo(ctx context.Context, cancel context.CancelFu
 	for recv := range recvchan {
 		if notify, ok := any(recv).(NotifyMessage); ok {
 			if notifyId, ok := notify.Id(); ok {
-				if request, found := notifys[notifyId]; found {
-					request.Response(&messageResponse[M]{Data: recv})
-					delete(notifys, notifyId)
+				if asyncRequest, found := asyncNotifys[notifyId]; found {
+					asyncRequest.Response(recv, nil)
+					delete(asyncNotifys, notifyId)
 				}
 			}
 		}
@@ -256,72 +256,115 @@ func (client *Client[M, T]) asyncGo(ctx context.Context, cancel context.CancelFu
 		client.lastError = ErrConnectionClosed
 	}
 	// 通知所有未匹配的请求：连接已关闭
-	for _, request := range notifys {
-		request.Response(&messageResponse[M]{Error: client.lastError})
+	for _, asyncRequest := range asyncNotifys {
+		asyncRequest.Response(zeroM, client.lastError)
 	}
-	notifys = nil
+	asyncNotifys = nil
 	// 通知 Write/Request 连接已关闭
 	close(stopchan)
 	client.waiter.Done()
 }
 
-// messageResponse 封装响应数据或错误
-type messageResponse[M any] struct {
-	Data  M     // 响应数据
-	Error error // 错误信息
-}
-
-// messageRequest 封装发送请求
-type messageRequest[M any] struct {
-	Data     M                        // 要发送的数据
-	Notify   bool                     // 是否需要等待响应
-	Canceled atomic.Bool              // 是否已取消
-	response chan *messageResponse[M] // 响应通道
-}
-
-func (request *messageRequest[M]) Response(response *messageResponse[M]) {
-	if request.response != nil {
-		request.response <- response
-		close(request.response)
-		request.response = nil
-	}
-}
-
-// WriteUnsafe 发送数据到连接，不等待响应。
-// 阻塞直到数据被写入或发生错误。
-// 注意：此方法不持有锁，调用方需自行确保并发安全。
-func (client *Client[M, T]) WriteUnsafe(ctx context.Context, data M) error {
+func (client *Client[M, T]) async(ctx context.Context, request *asynRequest[M, T]) error {
 	if client.asynchan == nil {
 		return ErrNotConnected
 	}
-	request := &messageRequest[M]{Data: data, Notify: false, response: make(chan *messageResponse[M], 1)}
-	// 发送到队列
-	select {
-	case <-ctx.Done():
-		// 没有写入到 sendchan
-		close(request.response)
-		return ctx.Err()
-	case client.asynchan <- &asynRequest[M, T]{Command: AsyncCommandSend, Message: request}:
-		// 写入成功, 则 response 通道会被 asyncGo 填充响应
-	case <-client.stopChan:
-		// 没有写入到 sendchan
-		close(request.response)
-		return ErrConnectionClosed
-	}
-
-	// 等待写入完成
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case resp := <-request.response:
-		return resp.Error
+	case client.asynchan <- request:
+		return nil
 	case <-client.stopChan:
 		return ErrConnectionClosed
 	}
 }
 
-// Write 发送数据到连接，不等待响应。
-// 阻塞直到数据被写入或发生错误。
+type messageError[M any] struct {
+	Error    error
+	Response M
+}
+
+// asyncMessage 封装发送请求
+type asyncMessage[M any] struct {
+	Data     M                       // 要发送的数据
+	Notify   bool                    // 是否需要等待响应
+	callback func(resp M, err error) // 可选的回调函数
+	canceled atomic.Bool             // 是否已取消
+	waiter   chan *messageError[M]
+}
+
+func (request *asyncMessage[M]) Canceled() bool {
+	if request.canceled.Load() {
+		if request.waiter != nil {
+			close(request.waiter)
+			request.waiter = nil
+		}
+		if request.callback != nil {
+			var zeroM M
+			go request.callback(zeroM, fmt.Errorf("request canceled"))
+			request.callback = nil
+		}
+		return true
+	}
+	return false
+}
+
+// Response 处理响应数据或错误
+func (request *asyncMessage[M]) Response(resp M, err error) {
+	if request.callback != nil {
+		go request.callback(resp, err)
+		request.callback = nil
+	}
+	if request.waiter != nil {
+		select {
+		case request.waiter <- &messageError[M]{Response: resp, Error: err}:
+		default:
+		}
+		close(request.waiter)
+		request.waiter = nil
+	}
+}
+
+// RequestCallbackUnsafe 发送数据到连接(设置是否需要响应)
+// 注意：此方法不持有锁，调用方需自行确保并发安全。
+func (client *Client[M, T]) RequestCallbackUnsafe(ctx context.Context, data M, callback func(resp M, err error)) error {
+	message := &asyncMessage[M]{Data: data, Notify: true, callback: callback}
+	request := &asynRequest[M, T]{Command: AsyncCommandSend, Message: message}
+	if err := client.async(ctx, request); err != nil {
+		if callback != nil {
+			var zeroM M
+			go callback(zeroM, err)
+		}
+		return err
+	}
+	return nil
+}
+
+// asyncMessageUnsafe 发送数据到连接(设置是否需要响应)
+// 注意：此方法不持有锁，调用方需自行确保并发安全。
+func (client *Client[M, T]) asyncMessage(ctx context.Context, data M, notify bool) (*asyncMessage[M], error) {
+	message := &asyncMessage[M]{Data: data, Notify: notify}
+	if notify {
+		message.waiter = make(chan *messageError[M], 1)
+	}
+	request := &asynRequest[M, T]{Command: AsyncCommandSend, Message: message}
+	if err := client.async(ctx, request); err != nil {
+		if notify {
+			close(message.waiter)
+		}
+		return nil, err
+	}
+	return message, nil
+}
+
+// WriteUnsafe 发送数据到连接(不需要响应)
+// 注意：此方法不持有锁，调用方需自行确保并发安全。
+func (client *Client[M, T]) WriteUnsafe(ctx context.Context, data M) error {
+	_, err := client.asyncMessage(ctx, data, false)
+	return err
+}
+
+// Write 发送数据到连接(不需要响应)
 // 线程安全，可并发调用。
 func (client *Client[M, T]) Write(ctx context.Context, data M) error {
 	client.locker.RLock()
@@ -329,43 +372,30 @@ func (client *Client[M, T]) Write(ctx context.Context, data M) error {
 	return client.WriteUnsafe(ctx, data)
 }
 
-// RequestUnsafe 发送请求并等待响应。
-// data 必须实现 Notify 接口，否则行为与 Write 相同。
-// 响应通过 Notify.Id() 匹配。
-// 阻塞直到收到响应或发生错误。
+// RequestUnsafe 发送数据到连接, 等待响应.
+// *注意* 次方法会阻塞直到收到响应或发生错误, 所以不可以在 Handle 回调中调用此方法.
 // 注意：此方法不持有锁，调用方需自行确保并发安全。
 func (client *Client[M, T]) RequestUnsafe(ctx context.Context, data M) (M, error) {
 	var zeroM M
-	if client.asynchan == nil {
-		return zeroM, ErrNotConnected
+	message, err := client.asyncMessage(ctx, data, true)
+	if err != nil {
+		return zeroM, err
 	}
-	request := &messageRequest[M]{Data: data, Notify: true, response: make(chan *messageResponse[M], 1)}
-	// 发送到队列
 	select {
 	case <-ctx.Done():
-		// 没有写入到 sendchan
-		close(request.response)
+		message.canceled.Store(true)
 		return zeroM, ctx.Err()
-	case client.asynchan <- &asynRequest[M, T]{Command: AsyncCommandSend, Message: request}:
-		// 写入成功, 则 response 通道会被 asyncGo 填充响应
-	case <-client.stopChan:
-		// 没有写入到 sendchan
-		close(request.response)
-		return zeroM, ErrConnectionClosed
-	}
-
-	// 等待响应
-	select {
-	case <-ctx.Done():
-		request.Canceled.Store(true)
-		return zeroM, ctx.Err()
-	case resp := <-request.response:
-		return resp.Data, resp.Error
-	case <-client.stopChan:
-		return zeroM, ErrConnectionClosed
+	case resp, ok := <-message.waiter:
+		if !ok {
+			return zeroM, ErrConnectionClosed
+		}
+		return resp.Response, resp.Error
 	}
 }
 
+// Request 发送数据到连接, 等待响应.
+// *注意* 次方法会阻塞直到收到响应或发生错误, 所以不可以在 Handle 回调中调用此方法.
+// 线程安全，可并发调用。
 func (client *Client[M, T]) Request(ctx context.Context, data M) (M, error) {
 	client.locker.RLock()
 	defer client.locker.RUnlock()
@@ -376,20 +406,8 @@ func (client *Client[M, T]) Request(ctx context.Context, data M) (M, error) {
 // 回调在 asyncGo 协程中执行，保证回调内部线程安全。
 // 注意：此方法不持有锁，调用方需自行确保并发安全。
 func (client *Client[M, T]) AsyncCallUnsafe(ctx context.Context, callback func(ctx context.Context, conn T)) error {
-	if client.asynchan == nil {
-		return ErrNotConnected
-	}
 	request := &asynRequest[M, T]{Command: AsyncCommandCallback, Callback: callback}
-	// 发送到队列
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case client.asynchan <- request:
-		// 写入成功
-	case <-client.stopChan:
-		return ErrConnectionClosed
-	}
-	return nil
+	return client.async(ctx, request)
 }
 
 // AsyncCall 异步执行回调函数，传入当前连接。
