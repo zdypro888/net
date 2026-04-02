@@ -3,7 +3,7 @@ module github.com/zdypro888/net
 go 1.25.0
 
 require (
-	github.com/andybalholm/brotli v1.2.0
+	github.com/andybalholm/brotli v1.2.1
 	github.com/gorilla/websocket v1.5.3
 	github.com/quic-go/quic-go v0.59.0
 	github.com/zdypro888/utils v0.0.0-20260331135403-41cac8c7d9f9
