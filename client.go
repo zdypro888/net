@@ -11,6 +11,8 @@ import (
 var ErrNotConnected = fmt.Errorf("not connected")
 var ErrConnectionClosed = fmt.Errorf("connection closed")
 
+const DefaultBufferSize = 0x10
+
 // Client 是一个支持请求-响应模式的多路复用网络客户端。
 // 它封装了底层连接，实现了并发安全的读写操作，支持心跳和自动重连等功能。
 // M 是消息类型，T 是底层连接类型，必须实现 Conn[M] 接口。
@@ -25,6 +27,7 @@ type Client[M any, T Conn[M]] struct {
 
 	heartCount atomic.Uint64
 	heartTime  time.Time // 下次心跳时间
+	bufferSize int
 
 	asynchan chan *asynRequest[M, T]
 	stopChan chan struct{} // 停止信号，通知 Write/Request 连接已关闭(只可以再asyncGo中关闭)
@@ -45,8 +48,19 @@ type asynRequest[M any, T Conn[M]] struct {
 
 // NewClient 创建并启动一个新的 Client。
 func NewClient[M any, T Conn[M]]() *Client[M, T] {
-	client := &Client[M, T]{}
+	client := &Client[M, T]{bufferSize: DefaultBufferSize}
 	return client
+}
+
+// SetBufferSize 设置内部发送/接收队列容量.
+// 必须在 Reset 前调用; 已连接后修改不会影响当前连接的队列.
+func (client *Client[M, T]) SetBufferSize(size int) {
+	client.locker.Lock()
+	defer client.locker.Unlock()
+	if size <= 0 {
+		size = DefaultBufferSize
+	}
+	client.bufferSize = size
 }
 
 func (client *Client[M, T]) Conn() T {
@@ -66,8 +80,12 @@ func (client *Client[M, T]) ResetUnsafe(ctx context.Context, conn T) {
 
 	// 创建新的通道
 	client.stopChan = make(chan struct{})
-	client.asynchan = make(chan *asynRequest[M, T], 0x10)
-	recvchan := make(chan M, 0x10)
+	bufSize := client.bufferSize
+	if bufSize <= 0 {
+		bufSize = DefaultBufferSize
+	}
+	client.asynchan = make(chan *asynRequest[M, T], bufSize)
+	recvchan := make(chan M, bufSize)
 	cctx, cancel := context.WithCancel(ctx)
 
 	// 初始化心跳时间
@@ -123,7 +141,13 @@ func (client *Client[M, T]) receiveGo(ctx context.Context, conn T, recvchan chan
 		if err != nil {
 			break
 		}
-		recvchan <- data
+		select {
+		case recvchan <- data:
+		case <-ctx.Done():
+			close(recvchan)
+			client.waiter.Done()
+			return
+		}
 	}
 	close(recvchan)
 	client.waiter.Done()
@@ -293,27 +317,26 @@ type asyncMessage[M any] struct {
 	waiter   chan *messageError[M]
 }
 
+// Canceled 仅由 asyncGo 单 goroutine 调用; Canceled 与 Response 互斥(同一条 message 只会走其中一条),
+// 由 asyncGo 维护 "Canceled 返回 true 即从 asyncNotifys delete" 的不变量保证. 多线程调用会 double close panic.
 func (request *asyncMessage[M]) Canceled() bool {
 	if request.canceled.Load() {
+		var zeroM M
 		if request.waiter != nil {
 			close(request.waiter)
-			request.waiter = nil
 		}
 		if request.callback != nil {
-			var zeroM M
 			go request.callback(zeroM, fmt.Errorf("request canceled"))
-			request.callback = nil
 		}
 		return true
 	}
 	return false
 }
 
-// Response 处理响应数据或错误
+// Response 仅由 asyncGo 单 goroutine 调用; 见 Canceled 的并发约定.
 func (request *asyncMessage[M]) Response(resp M, err error) {
 	if request.callback != nil {
 		go request.callback(resp, err)
-		request.callback = nil
 	}
 	if request.waiter != nil {
 		select {
@@ -321,7 +344,6 @@ func (request *asyncMessage[M]) Response(resp M, err error) {
 		default:
 		}
 		close(request.waiter)
-		request.waiter = nil
 	}
 }
 
