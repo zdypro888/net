@@ -11,11 +11,18 @@ const (
 	HeartbeatInterval = 30 * time.Second
 	DefaultBufferSize = 0x10
 
-	// MaxMissedHeartbeats = 5
-	// SessionTimeout      = MaxMissedHeartbeats * HeartbeatInterval
 	HandshakeTimeout = 10 * time.Second
+	WriteTimeout     = 10 * time.Second
 
-// ReconnectInterval   = 2 * time.Second
+	// ReadIdleTimeout 读端静默上限. 这段时间内若没收到对方任何消息 (含心跳)
+	// 视为对端僵死, ReadJSON 立即返 net.ErrDeadlineExceeded → 上层关连接 + 重连.
+	//
+	// 为什么不能只靠"心跳 write 失败"做死检测: TCP 写入 OS send buffer 即返回成功,
+	// NAT/防火墙静默切断后 OS 重传 ~15min (tcp_retries2) 才报错, 期间发出去的心跳
+	// 全部"成功"沉默. 必须在 read 端用 deadline 才能秒级感知对端僵死.
+	//
+	// 取 2×HeartbeatInterval: 容忍单次心跳丢失 + 时序抖动, 又远小于 OS TCP 重传上限.
+	ReadIdleTimeout = 2 * HeartbeatInterval
 )
 
 // 错误定义

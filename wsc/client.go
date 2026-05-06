@@ -84,6 +84,12 @@ func (c *Client[T]) handleMessageGo(msgchan <-chan *Packet[T], stopChan <-chan s
 			if !ok {
 				running = false
 			} else if msg.Closed {
+				select {
+				case <-stopChan:
+					running = false
+					continue
+				case c.handleChan <- msg:
+				}
 				for running {
 					conn, err := c.dial(dialCtx)
 					if err != nil {
