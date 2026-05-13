@@ -381,9 +381,9 @@ func (client *Client[M, T]) asyncGo(ctx context.Context, cancel context.CancelFu
 		client.setLastError(lastErr)
 	}
 
-	// BUG-2 修复: 排空 asynchan 中已入队但未处理的请求, 通知 caller "失败".
-	// 旧实现 close(stopchan) 后直接走人, Write(notify=false) 路径的 caller 拿到的
-	// nil-error 实际是丢消息. 现在 drain 之后每条 request 都收到 lastError.
+	// BUG-2 修复: 排空 asynchan 中已入队但未处理的 notify request, 通知 caller "失败".
+	// Write(notify=false) 是 fire-and-forget, 入队成功即返回; 这里无法 retroactively
+	// 改变它的返回值, 但可以保证 Request/RequestCallback 不会永久等待.
 	// 注意: asynchan close 责任在 CloseUnsafe (Wlock 内), 这里只 drain 已入队的;
 	// 若 asynchan 未 close (Reset 路径 / ctx-cancel 路径), 用 select+default 拉空,
 	// caller 后续 send 会走 stopChan 分支拿到 ErrConnectionClosed.
