@@ -100,13 +100,12 @@ func (c *Client[T]) handleMessageGo(msgchan <-chan *Packet[T], stopChan <-chan s
 						}
 						continue
 					}
-					// 重置连接
-					c.session.locker.Lock()
-					if err := c.session.resetUnsafe(context.Background(), conn); err != nil {
+					// 重置连接. 用 Session.Reset 封装连接切换串行化, 不越界调用
+					// 内部 helper 或操作 session.locker.
+					if err := c.session.Reset(context.Background(), conn); err != nil {
 						conn.Close()
 						running = false
 					}
-					c.session.locker.Unlock()
 					break
 				}
 			} else {
@@ -129,10 +128,8 @@ func (c *Client[T]) Connect(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// 重置连接
-	c.session.locker.Lock()
-	defer c.session.locker.Unlock()
-	if err := c.session.resetUnsafe(ctx, conn); err != nil {
+	// 用 Session.Reset 而非越界拿 session.locker; Reset 内部负责连接切换串行化.
+	if err := c.session.Reset(ctx, conn); err != nil {
 		conn.Close()
 		return err
 	}

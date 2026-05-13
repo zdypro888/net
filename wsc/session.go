@@ -268,66 +268,41 @@ func (s *Session[T]) async(ctx context.Context, info *asyncInfo[T]) error {
 	}
 }
 
-// resetUnsafe 设置连接并通知等待者
-func (s *Session[T]) resetUnsafe(ctx context.Context, conn *websocket.Conn) error {
-	asyncall := &asyncInfo[T]{
+// Reset 切换 session 底层 ws 连接 (典型场景: client 断线重连). 入队 asyncCommandConn,
+// 由 asyncGo 处理. 持 WLock 是为了让连接切换命令先于后续 Write/Reply/Request
+// 入队; 否则并发调用可能把业务消息排到 reset 前面, 导致写到旧连接或未连接状态.
+func (s *Session[T]) Reset(ctx context.Context, conn *websocket.Conn) error {
+	s.locker.Lock()
+	defer s.locker.Unlock()
+	return s.async(ctx, &asyncInfo[T]{
 		Command: asyncCommandConn,
 		Conn:    conn,
-	}
-	return s.async(ctx, asyncall)
+	})
 }
 
-func (s *Session[T]) Reset(ctx context.Context, conn *websocket.Conn) error {
-	s.locker.RLock()
-	defer s.locker.RUnlock()
-	return s.resetUnsafe(ctx, conn)
-}
-
-// writeWithId 发送消息（内部方法，可选 ID）
-func (s *Session[T]) asyncWriteUnsafe(ctx context.Context, id string, data T) error {
-	msg := &asyncInfo[T]{
+// enqueueWrite 发送通知, id 非空表示是对请求的 Reply. Write / Reply 共用底层
+// 实现, 仅 id 不同. 调用方必须在入队阶段持有 RLock.
+func (s *Session[T]) enqueueWrite(ctx context.Context, id string, data T) error {
+	return s.async(ctx, &asyncInfo[T]{
 		Command: asyncCommandWrite,
 		Request: &Message[T]{ID: id, Data: data},
-	}
-	if err := s.async(ctx, msg); err != nil {
-		return err
-	}
-	return nil
+	})
 }
 
-// writeUnsafe 发送通知（不等待响应，无连接直接失败）
-func (s *Session[T]) writeUnsafe(ctx context.Context, data T) error {
-	return s.asyncWriteUnsafe(ctx, "", data)
-}
-
+// Write 发送通知 (不等待响应). 持 RLock — 跟其它 Write/Reply/Request/Reset 并发安全,
+// Close 拿 WLock 时互斥.
 func (s *Session[T]) Write(ctx context.Context, data T) error {
 	s.locker.RLock()
 	defer s.locker.RUnlock()
-	return s.writeUnsafe(ctx, data)
+	return s.enqueueWrite(ctx, "", data)
 }
 
-// replyUnsafe 回复请求（用于服务端响应客户端请求）
-func (s *Session[T]) replyUnsafe(ctx context.Context, id string, data T) error {
-	return s.asyncWriteUnsafe(ctx, id, data)
-}
-
-// Reply 回复请求（用于服务端响应客户端请求）
+// Reply 回复请求 (服务端响应客户端 Request 用). id 必须是收到的 Packet.ID, 跟
+// 客户端 Request 的 message.ID 匹配.
 func (s *Session[T]) Reply(ctx context.Context, id string, data T) error {
 	s.locker.RLock()
 	defer s.locker.RUnlock()
-	return s.replyUnsafe(ctx, id, data)
-}
-
-// requestUnsafe 发送请求并等待响应（自动管理 ID，断线返回错误）
-// 注意: 调用方应确保 enqueue 阶段持锁, wait 阶段释放锁 — 否则 Request 与 Close
-// 会死锁 (Wlock 等不到 RLock 释放). 推荐通过 Request() 入口走分段路径.
-func (s *Session[T]) requestUnsafe(ctx context.Context, data T) (T, error) {
-	request, err := s.enqueueRequest(ctx, data)
-	if err != nil {
-		var zero T
-		return zero, err
-	}
-	return s.waitRequest(ctx, request)
+	return s.enqueueWrite(ctx, id, data)
 }
 
 func (s *Session[T]) enqueueRequest(ctx context.Context, data T) (*asyncInfo[T], error) {
@@ -378,19 +353,16 @@ func (s *Session[T]) Request(ctx context.Context, data T) (T, error) {
 	return s.waitRequest(ctx, request)
 }
 
-// closeUnsafe 关闭
-func (s *Session[T]) closeUnsafe() error {
+// Close 关闭 session. 持 WLock 跟所有 in-flight 调用 (Reset/Write/Reply/Request
+// 入队阶段持 RLock) 互斥序列化. close(asyncChan) 后 asyncGo 退出走清理路径,
+// 后续 RLock 调用会看到 s.asyncChan == nil 返 ErrSessionClosed.
+func (s *Session[T]) Close() error {
+	s.locker.Lock()
+	defer s.locker.Unlock()
 	if s.asyncChan != nil {
 		close(s.asyncChan)
 		s.asyncChan = nil
 	}
 	s.waiter.Wait()
 	return nil
-}
-
-// Close 关闭
-func (s *Session[T]) Close() error {
-	s.locker.Lock()
-	defer s.locker.Unlock()
-	return s.closeUnsafe()
 }
