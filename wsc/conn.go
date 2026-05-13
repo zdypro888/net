@@ -2,7 +2,9 @@ package wsc
 
 import (
 	"context"
+	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -24,8 +26,13 @@ func (mc *messagechannel[T]) ToPacket() *Packet[T] {
 
 // wsconnection 封装 WebSocket 连接，实现 net.Conn 接口
 type wsconnection[T any] struct {
-	conn     *websocket.Conn
-	msgchan  chan *messagechannel[T]
+	conn    *websocket.Conn
+	msgchan chan *messagechannel[T]
+	// closed 用 atomic.Bool 而非"赋 nil 字段". Close 会 close(msgchan),
+	// Handle 必须先看 closed 决定是否 send (send 到 closed chan 会 panic).
+	// atomic.Bool 必须加: Close (closeMux 单写) 与 Handle (任意 goroutine 读)
+	// 跨 goroutine 访问同一字段, 不加同步会 race; 单字段 atomic.Bool 是最轻方案.
+	closed   atomic.Bool
 	closeMux sync.Once
 }
 
@@ -49,14 +56,17 @@ func (c *wsconnection[T]) Close(ctx context.Context) error {
 	var err error
 	c.closeMux.Do(func() {
 		err = c.conn.Close()
-		if c.msgchan != nil {
-			select {
-			case <-ctx.Done():
-			case c.msgchan <- &messagechannel[T]{Closed: true}:
-			}
-			close(c.msgchan)
-			c.msgchan = nil
+		// 先置 closed 标志: Handle 在见到 closed=true 后不再 send, 避免与
+		// close(msgchan) 之后的 send 撞上 panic.
+		c.closed.Store(true)
+		// best-effort: 在 close 前尝试投递一个 Closed=true 包给 reader 做
+		// reconnect 提示, 拥塞或 ctx 取消时就跳过.
+		select {
+		case <-ctx.Done():
+		case c.msgchan <- &messagechannel[T]{Closed: true}:
+		default:
 		}
+		close(c.msgchan)
 	})
 	return err
 }
@@ -95,10 +105,15 @@ func (c *wsconnection[T]) Heart(connect bool, count uint64) (*Message[T], time.T
 
 // Handle 处理对方发来的消息（请求或通知），返回响应数据（实现 net.Conn 接口, 不可以外部调用）
 func (c *wsconnection[T]) Handle(ctx context.Context, data *Message[T]) {
-	// 心跳消息不处理
-	if data.IsHeart || c.msgchan == nil {
+	// 心跳消息不处理; closed 后不再 send 到已 close 的 msgchan (send 到 closed 会 panic).
+	if data.IsHeart || c.closed.Load() {
 		return
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Debug("wsc dropped message while connection was closing", slog.Any("panic", r))
+		}
+	}()
 	msgchannel := &messagechannel[T]{
 		Message: data,
 	}

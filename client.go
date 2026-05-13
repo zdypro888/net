@@ -3,6 +3,7 @@ package net
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,14 +14,41 @@ var ErrConnectionClosed = fmt.Errorf("connection closed")
 
 const DefaultBufferSize = 0x10
 
+// DefaultAsyncTimeout — async() 写 asynchan 的兜底超时. caller 传 ctx 无 deadline
+// 时使用. RUN-6 修复: 防止 Write/Request 用 context.Background() + asynchan 满 +
+// asyncGo 卡死 = 永久阻塞.
+const DefaultAsyncTimeout = 30 * time.Second
+
+// ClientStats 给运维查 net.Client 健康度.
+type ClientStats struct {
+	AsynchanLen   int    // 当前 asynchan 队列长度 (高 = caller 投递快/asyncGo 处理慢)
+	AsynchanCap   int    // asynchan 容量
+	HeartCount    uint64 // 心跳累计次数 (跨 Reset 归零)
+	AsyncTimeouts uint64 // async 触发 DefaultAsyncTimeout 兜底的累计次数
+	NotifyPending int    // asyncGo 当前等待响应的请求数 (近似 — 不持锁单读)
+	LastError     error  // 最近一次 lastError 快照
+	Closed        bool   // 是否已 Close
+}
+
 // Client 是一个支持请求-响应模式的多路复用网络客户端。
 // 它封装了底层连接，实现了并发安全的读写操作，支持心跳和自动重连等功能。
 // M 是消息类型，T 是底层连接类型，必须实现 Conn[M] 接口。
 // T 注意需要指针类型才能修改连接状态。
 // 原则上M, T都应该是指针类型，以避免数据拷贝开销。
+//
+// 关于 *Unsafe API 的并发契约 (R2 重新明确):
+//   - Reset / Close / Write / Request / AsyncCall / RequestCallback (Lock 版本)
+//     线程安全, 可并发调用.
+//   - ResetUnsafe / CloseUnsafe / WriteUnsafe / RequestUnsafe / AsyncCallUnsafe /
+//     RequestCallbackUnsafe 不持锁. 当且仅当 caller 自己是 single owner goroutine
+//     (例如 apn.asyncGo, wsc.Session.asyncGo) 时可用 —— 该 goroutine 必须独占
+//     Reset/Close/Write 系列调用. 与上面 Lock 版本混用会 race.
+//   - async() 内部用 sync.Once 保证 stopChan 只 close 一次, 即便 Close 与 asyncGo
+//     退出竞速也只触发一次 close. 它是 *Unsafe 与 Lock 版本之间的同步桥.
 type Client[M any, T Conn[M]] struct {
 	locker sync.RWMutex   // 保护 Client 状态的读写锁
 	waiter sync.WaitGroup // 等待 goroutine 退出
+	errMu  sync.RWMutex
 
 	conn      T     // 底层连接实现
 	lastError error // 最后发生的错误
@@ -30,7 +58,17 @@ type Client[M any, T Conn[M]] struct {
 	bufferSize int
 
 	asynchan chan *asynRequest[M, T]
-	stopChan chan struct{} // 停止信号，通知 Write/Request 连接已关闭(只可以再asyncGo中关闭)
+	stopChan chan struct{} // 停止信号; 由 stopOnce 保证只 close 一次
+
+	// stopOnce: BUG-1/BUG-2 修复. 旧实现要求 stopChan "只能在 asyncGo 中关闭",
+	// 这是一个隐式契约 — 一旦 Close 路径也想关 stopChan 让 async() 立即解锁就会
+	// double close panic. sync.Once 让 Close/Reset 与 asyncGo 退出竞速时只触发一次.
+	// 必须加: 多 goroutine 关闭同一 chan 是经典 Go 反模式, sync.Once 是唯一 idiomatic 方案.
+	stopOnce sync.Once
+
+	// 观察性 (OPS-3 Stats).
+	asyncTimeouts atomic.Uint64
+	closed        atomic.Bool
 }
 
 type AsyncCommand int
@@ -69,6 +107,26 @@ func (client *Client[M, T]) Conn() T {
 	return client.conn
 }
 
+func (client *Client[M, T]) setLastError(err error) {
+	client.errMu.Lock()
+	client.lastError = err
+	client.errMu.Unlock()
+}
+
+func (client *Client[M, T]) getLastError() error {
+	client.errMu.RLock()
+	defer client.errMu.RUnlock()
+	return client.lastError
+}
+
+// signalStop 关闭 stopChan, 通知所有 select 在 stopChan 上的 goroutine.
+// sync.Once 保证幂等 — Close / Reset / asyncGo 退出三处都可能 trigger.
+func (client *Client[M, T]) signalStop() {
+	if client.stopChan != nil {
+		client.stopOnce.Do(func() { close(client.stopChan) })
+	}
+}
+
 // ResetUnsafe 初始化连接状态并启动工作协程。
 // 注意：此方法不持有锁，调用方需自行确保并发安全。
 func (client *Client[M, T]) ResetUnsafe(ctx context.Context, conn T) {
@@ -77,6 +135,11 @@ func (client *Client[M, T]) ResetUnsafe(ctx context.Context, conn T) {
 	// 等待旧的 goroutine 完全退出
 	client.waiter.Wait()
 	client.conn = conn
+
+	// 重置 stopOnce: 新的 session 用新的 stopChan, sync.Once 也要重置.
+	client.stopOnce = sync.Once{}
+	client.closed.Store(false)
+	client.setLastError(nil)
 
 	// 创建新的通道
 	client.stopChan = make(chan struct{})
@@ -88,6 +151,8 @@ func (client *Client[M, T]) ResetUnsafe(ctx context.Context, conn T) {
 	recvchan := make(chan M, bufSize)
 	cctx, cancel := context.WithCancel(ctx)
 
+	// 心跳计数随会话归零, 避免新连接拿到上一次会话累计的 count.
+	client.heartCount.Store(0)
 	// 初始化心跳时间
 	if heartConn, ok := any(conn).(ConnHeart[M]); ok {
 		_, heartTime, _ := heartConn.Heart(true, 0)
@@ -96,10 +161,10 @@ func (client *Client[M, T]) ResetUnsafe(ctx context.Context, conn T) {
 		client.heartTime = time.Now().Add(60 * time.Second)
 	}
 
-	// 启动工作协程
-	client.waiter.Add(2)
-	go client.asyncGo(cctx, cancel, conn, client.asynchan, recvchan, client.stopChan)
-	go client.receiveGo(cctx, conn, recvchan)
+	// 启动工作协程. 用 Go 1.25 WaitGroup.Go 自动 Add(1)/Done, 避免显式
+	// Add/Done 配对错位的经典坑.
+	client.waiter.Go(func() { client.asyncGo(cctx, cancel, conn, client.asynchan, recvchan, client.stopChan) })
+	client.waiter.Go(func() { client.receiveGo(cctx, conn, recvchan) })
 }
 
 // Reset 重置 Client 使用新的连接。如果存在则关闭旧连接。
@@ -111,9 +176,17 @@ func (client *Client[M, T]) Reset(ctx context.Context, conn T) {
 
 // CloseUnsafe 关闭异步通道，通知 asyncGo 退出。
 // 注意：此方法不持有锁，调用方需自行确保并发安全。
+// 安全: signalStop 用 sync.Once 保护, 与 asyncGo 退出尾段并发关 stopChan 不会 panic.
+// asynchan 仍然由 CloseUnsafe (在 Lock 内) 单点关闭, 与 async() 的 RLock 互斥保证
+// 不会 send-after-close.
 func (client *Client[M, T]) CloseUnsafe() {
+	client.closed.Store(true)
+	// 先 signalStop 让 async() 与 RequestUnsafe 卡在 select 上的 caller 立即解锁,
+	// 避免它们继续等 asynchan 空位 / response. asyncGo 在 ctx-cancel + asynchan
+	// 关闭后会走到清理路径, 也会幂等地再 signalStop 一次.
+	client.signalStop()
 	if client.asynchan != nil {
-		// asynchan 只可以再 locker 保护下关闭
+		// asynchan 只可以在 locker 保护下关闭
 		close(client.asynchan)
 		client.asynchan = nil
 	}
@@ -128,8 +201,27 @@ func (client *Client[M, T]) Close() error {
 	client.CloseUnsafe()
 	// 等待所有 goroutine 退出
 	client.waiter.Wait()
-	err := client.lastError
+	err := client.getLastError()
 	return err
+}
+
+// Stats 返回 net.Client 运行时计数. 不持锁 — 各字段 atomic 或 chan-Len,
+// 不保证瞬间一致性, 监控用足够. NotifyPending 是 asyncGo goroutine-local 的
+// 近似, 这里读 0 (不暴露) — 详情走 lastError + chan len.
+func (client *Client[M, T]) Stats() ClientStats {
+	stats := ClientStats{
+		HeartCount:    client.heartCount.Load(),
+		AsyncTimeouts: client.asyncTimeouts.Load(),
+		Closed:        client.closed.Load(),
+	}
+	client.locker.RLock()
+	if client.asynchan != nil {
+		stats.AsynchanLen = len(client.asynchan)
+		stats.AsynchanCap = cap(client.asynchan)
+	}
+	stats.LastError = client.getLastError()
+	client.locker.RUnlock()
+	return stats
 }
 
 // receiveGo 是接收协程，负责从连接读取数据。
@@ -145,12 +237,10 @@ func (client *Client[M, T]) receiveGo(ctx context.Context, conn T, recvchan chan
 		case recvchan <- data:
 		case <-ctx.Done():
 			close(recvchan)
-			client.waiter.Done()
 			return
 		}
 	}
 	close(recvchan)
-	client.waiter.Done()
 }
 
 // asyncGo 是异步处理协程，负责：
@@ -169,7 +259,7 @@ func (client *Client[M, T]) asyncGo(ctx context.Context, cancel context.CancelFu
 		select {
 		case <-ctx.Done():
 			// context 被取消
-			client.lastError = ctx.Err()
+			client.setLastError(ctx.Err())
 			running = false
 		case recv, ok := <-recvchan:
 			// 处理接收到的数据
@@ -224,7 +314,7 @@ func (client *Client[M, T]) asyncGo(ctx context.Context, cancel context.CancelFu
 						}
 					}
 					if err != nil {
-						client.lastError = err
+						client.setLastError(err)
 						running = false
 					}
 				case AsyncCommandCallback:
@@ -241,7 +331,7 @@ func (client *Client[M, T]) asyncGo(ctx context.Context, cancel context.CancelFu
 				var heartHasData bool
 				if heartData, client.heartTime, heartHasData = heartConn.Heart(false, client.heartCount.Add(1)); heartHasData {
 					if err := conn.Write(ctx, heartData); err != nil {
-						client.lastError = err
+						client.setLastError(err)
 						running = false
 					}
 				}
@@ -249,12 +339,21 @@ func (client *Client[M, T]) asyncGo(ctx context.Context, cancel context.CancelFu
 				// 无心跳支持，设置为较远的时间点
 				client.heartTime = time.Now().Add(60 * time.Second)
 			}
-			heartTimer.Reset(time.Until(client.heartTime))
+			// 防御性下限: Heart 实现若返回过去或零值时间会让 timer.Reset(<=0) 立即触发,
+			// 形成 hot loop 卷死 CPU. 兜底 1s 保证 worst-case 仍是低频心跳.
+			delay := time.Until(client.heartTime)
+			if delay <= 0 {
+				delay = time.Second
+			}
+			heartTimer.Reset(delay)
 		}
 		if len(asyncNotifys) > 100 {
-			// 清理已取消的请求，防止内存泄漏
+			// 清理已取消的请求，防止内存泄漏.
+			// BUG-7: 旧实现调 asyncRequest.Canceled() 内有 side-effect (close waiter + go callback),
+			// 与下方退出尾段的 Response 路径会 double-close panic. 改为纯查询 + 单点清理:
+			// canceled 的 message 直接 delete, 不通知 (caller 已经从 ctx.Done 路径走了).
 			for id, asyncRequest := range asyncNotifys {
-				if asyncRequest.Canceled() {
+				if asyncRequest.canceled.Load() {
 					delete(asyncNotifys, id)
 				}
 			}
@@ -276,25 +375,66 @@ func (client *Client[M, T]) asyncGo(ctx context.Context, cancel context.CancelFu
 			}
 		}
 	}
-	if client.lastError == nil {
-		client.lastError = ErrConnectionClosed
+	lastErr := client.getLastError()
+	if lastErr == nil {
+		lastErr = ErrConnectionClosed
+		client.setLastError(lastErr)
 	}
-	// 通知所有未匹配的请求：连接已关闭
+
+	// BUG-2 修复: 排空 asynchan 中已入队但未处理的请求, 通知 caller "失败".
+	// 旧实现 close(stopchan) 后直接走人, Write(notify=false) 路径的 caller 拿到的
+	// nil-error 实际是丢消息. 现在 drain 之后每条 request 都收到 lastError.
+	// 注意: asynchan close 责任在 CloseUnsafe (Wlock 内), 这里只 drain 已入队的;
+	// 若 asynchan 未 close (Reset 路径 / ctx-cancel 路径), 用 select+default 拉空,
+	// caller 后续 send 会走 stopChan 分支拿到 ErrConnectionClosed.
+drainLoop:
+	for {
+		select {
+		case req, ok := <-asynchan:
+			if !ok {
+				break drainLoop
+			}
+			if req.Command == AsyncCommandSend && req.Message != nil {
+				if !req.Message.canceled.Load() {
+					req.Message.Response(zeroM, lastErr)
+				}
+			}
+		default:
+			break drainLoop
+		}
+	}
+
+	// 通知所有未匹配的请求：连接已关闭. 跳过已 canceled 的 (caller 已经从 ctx.Done 走了,
+	// 通知反而是 double-touch).
 	for _, asyncRequest := range asyncNotifys {
-		asyncRequest.Response(zeroM, client.lastError)
+		if !asyncRequest.canceled.Load() {
+			asyncRequest.Response(zeroM, lastErr)
+		}
 	}
 	asyncNotifys = nil
-	// 通知 Write/Request 连接已关闭
-	close(stopchan)
-	client.waiter.Done()
+
+	// 通知 Write/Request 连接已关闭. signalStop 用 sync.Once, 与 CloseUnsafe 已经
+	// signalStop 过的场景幂等. OPS-2: 记一行 warn 让运维知道 client 因什么退出.
+	slog.Warn("net.Client closed",
+		slog.Any("lastError", lastErr),
+		slog.Int("notifyRemaining", len(asyncNotifys)))
+	client.signalStop()
 }
 
 func (client *Client[M, T]) async(ctx context.Context, request *asynRequest[M, T]) error {
 	if client.asynchan == nil {
 		return ErrNotConnected
 	}
+	// RUN-6: caller 传 ctx 无 deadline 时强加 DefaultAsyncTimeout 兜底, 防止
+	// asynchan 满 + asyncGo 卡死 = 永久阻塞. 不影响有 deadline 的 caller.
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, DefaultAsyncTimeout)
+		defer cancel()
+	}
 	select {
 	case <-ctx.Done():
+		client.asyncTimeouts.Add(1)
 		return ctx.Err()
 	case client.asynchan <- request:
 		return nil
@@ -313,27 +453,15 @@ type asyncMessage[M any] struct {
 	Data     M                       // 要发送的数据
 	Notify   bool                    // 是否需要等待响应
 	callback func(resp M, err error) // 可选的回调函数
-	canceled atomic.Bool             // 是否已取消
+	canceled atomic.Bool             // 是否已取消 (RequestUnsafe ctx.Done 时 store true)
 	waiter   chan *messageError[M]
 }
 
-// Canceled 仅由 asyncGo 单 goroutine 调用; Canceled 与 Response 互斥(同一条 message 只会走其中一条),
-// 由 asyncGo 维护 "Canceled 返回 true 即从 asyncNotifys delete" 的不变量保证. 多线程调用会 double close panic.
-func (request *asyncMessage[M]) Canceled() bool {
-	if request.canceled.Load() {
-		var zeroM M
-		if request.waiter != nil {
-			close(request.waiter)
-		}
-		if request.callback != nil {
-			go request.callback(zeroM, fmt.Errorf("request canceled"))
-		}
-		return true
-	}
-	return false
-}
-
-// Response 仅由 asyncGo 单 goroutine 调用; 见 Canceled 的并发约定.
+// Response 由 asyncGo 单 goroutine 调用. waiter chan 在 asyncMessage(notify=true)
+// 路径创建, buffer=1; select+default 保证 caller 已离开 (从 ctx.Done 走) 时也不
+// 阻塞. close(waiter) 让 RequestUnsafe 内 select 解锁.
+// BUG-7: 旧 Canceled() 有 close(waiter) side-effect, 已删除; 现在 Response 是
+// "唯一关闭 waiter 的入口", 不会与其它路径 double close.
 func (request *asyncMessage[M]) Response(resp M, err error) {
 	if request.callback != nil {
 		go request.callback(resp, err)
@@ -362,7 +490,7 @@ func (client *Client[M, T]) RequestCallbackUnsafe(ctx context.Context, data M, c
 	return nil
 }
 
-// asyncMessageUnsafe 发送数据到连接(设置是否需要响应)
+// asyncMessage 发送数据到连接(设置是否需要响应)
 // 注意：此方法不持有锁，调用方需自行确保并发安全。
 func (client *Client[M, T]) asyncMessage(ctx context.Context, data M, notify bool) (*asyncMessage[M], error) {
 	message := &asyncMessage[M]{Data: data, Notify: notify}
@@ -405,6 +533,8 @@ func (client *Client[M, T]) RequestUnsafe(ctx context.Context, data M) (M, error
 	}
 	select {
 	case <-ctx.Done():
+		// 标记 canceled, asyncGo 清理路径会跳过. waiter buffer=1, asyncGo
+		// 后续 Response 时 select+default 不阻塞, close(waiter) 安全 (caller 已走).
 		message.canceled.Store(true)
 		return zeroM, ctx.Err()
 	case resp, ok := <-message.waiter:
@@ -418,10 +548,34 @@ func (client *Client[M, T]) RequestUnsafe(ctx context.Context, data M) (M, error
 // Request 发送数据到连接, 等待响应.
 // *注意* 次方法会阻塞直到收到响应或发生错误, 所以不可以在 Handle 回调中调用此方法.
 // 线程安全，可并发调用。
+//
+// 注意 RLock 释放时机: 入队 (asyncMessage → async) 在 RLock 内, 等待响应 (waiter)
+// 在 RLock 外. 原因: 等响应可能阻塞数秒~数分钟, 持 RLock 会让并发的 Close (Wlock)
+// 一直等不到 RLock 释放, 造成 Close 永远 hang. 而入队 / waiter 之间用 stopChan
+// 与 message.canceled 的内置同步, 不需要锁保护.
 func (client *Client[M, T]) Request(ctx context.Context, data M) (M, error) {
 	client.locker.RLock()
-	defer client.locker.RUnlock()
-	return client.RequestUnsafe(ctx, data)
+	message, err := client.asyncMessage(ctx, data, true)
+	client.locker.RUnlock()
+	if err != nil {
+		return *new(M), err
+	}
+	return client.waitResponse(ctx, message)
+}
+
+// waitResponse 等 asyncGo 通过 Response 或 stopChan 关闭通知; 不持锁.
+func (client *Client[M, T]) waitResponse(ctx context.Context, message *asyncMessage[M]) (M, error) {
+	var zeroM M
+	select {
+	case <-ctx.Done():
+		message.canceled.Store(true)
+		return zeroM, ctx.Err()
+	case resp, ok := <-message.waiter:
+		if !ok {
+			return zeroM, ErrConnectionClosed
+		}
+		return resp.Response, resp.Error
+	}
 }
 
 // AsyncCallUnsafe 异步执行回调函数，传入当前连接。

@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -18,6 +20,23 @@ import (
 	"github.com/zdypro888/utils"
 	"golang.org/x/net/http2"
 )
+
+// DefaultRetryBackoff 是 HTTP.RequestMethod 默认的 retry 间隔.
+// 指数 + 抖动, 100ms * 2^attempt, capped 5s. attempt 从 0 起计数 (即 0 = 第一次重试).
+// RUN-5 修复: 旧实现 retry 之间 0 sleep, 服务端 5xx 风暴时立即捶 N 次.
+// 暴露为变量便于 caller 用 HTTP.ConfigureRetryBackoff 覆盖.
+func DefaultRetryBackoff(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	base := time.Duration(100*(1<<uint(attempt))) * time.Millisecond
+	if base > 5*time.Second {
+		base = 5 * time.Second
+	}
+	// 加 0~25% jitter, 防止多 client 同步 retry 雷暴.
+	jitter := time.Duration(rand.Int64N(int64(base / 4)))
+	return base + jitter
+}
 
 var ErrContextNotContainHTTP = errors.New("context not contain http")
 
@@ -76,21 +95,54 @@ func NewReader(data []byte) io.Reader {
 }
 
 type HTTP struct {
-	transport  http.RoundTripper
-	client     *http.Client
-	proxyURL   func(*http.Request) (*url.URL, error)
-	proxyDial  func(ctx context.Context, network, addr string) (net.Conn, error)
+	transport    http.RoundTripper
+	client       *http.Client
+	proxyURL     func(*http.Request) (*url.URL, error)
+	proxyDial    func(ctx context.Context, network, addr string) (net.Conn, error)
+	retryBackoff func(attempt int) time.Duration
+	// OnResponse / AutoRetry 保留为导出字段以兼容下游 (iauth/imadrid 直接赋值);
+	// 推荐用 Configure* setter. 必须在调用 Request 前设置好, 之后只读.
 	OnResponse func(ctx context.Context, req *http.Request, res *http.Response, err error) (*http.Response, error, bool)
 	AutoRetry  int
 }
 
+// ConfigureOnResponse 设置响应回调 (推荐用法). 与直接赋值 HTTP.OnResponse 等价.
+func (h *HTTP) ConfigureOnResponse(fn func(ctx context.Context, req *http.Request, res *http.Response, err error) (*http.Response, error, bool)) {
+	h.OnResponse = fn
+}
+
+// ConfigureAutoRetry 设置自动重试次数 (推荐用法).
+func (h *HTTP) ConfigureAutoRetry(n int) {
+	h.AutoRetry = n
+}
+
+// ConfigureRetryBackoff 设置 retry 间隔. fn=nil 时恢复默认 DefaultRetryBackoff.
+// fn 在 init 期设, retry path 只读, 无并发保护.
+func (h *HTTP) ConfigureRetryBackoff(fn func(attempt int) time.Duration) {
+	h.retryBackoff = fn
+}
+
+// DefaultTLSConfig 返回 NewHTTP/NewHTTP3 在 caller 传 nil 时使用的默认 TLS 配置.
+// 项目历史默认是跳过证书校验; 需要严格校验时显式传 StrictTLSConfig().
+func DefaultTLSConfig() *tls.Config {
+	return &tls.Config{
+		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS11,
+		MaxVersion:         tls.VersionTLS13,
+	}
+}
+
+// StrictTLSConfig 返回显式严格校验的 TLS 配置.
+func StrictTLSConfig() *tls.Config {
+	return &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		MaxVersion: tls.VersionTLS13,
+	}
+}
+
 func NewHTTP(config *tls.Config) *HTTP {
 	if config == nil {
-		config = &tls.Config{
-			InsecureSkipVerify: true,
-			MinVersion:         tls.VersionTLS11,
-			MaxVersion:         tls.VersionTLS13,
-		}
+		config = DefaultTLSConfig()
 	}
 	transport := &http.Transport{
 		Dial: (&net.Dialer{
@@ -274,7 +326,12 @@ func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, hea
 		request.Header = http.Header(headers).Clone()
 	}
 	var response *Response
-	for i := h.AutoRetry; i > 0; i-- {
+	backoff := h.retryBackoff
+	if backoff == nil {
+		backoff = DefaultRetryBackoff
+	}
+	total := h.AutoRetry
+	for i := total; i > 0; i-- {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -286,10 +343,30 @@ func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, hea
 			}
 		}
 		if response, err = h.requestWithRequest(ctx, request); err != nil {
+			// RUN-5: 还有可重试次数才 sleep; 最后一次失败不 sleep 直接返回.
+			if i > 1 {
+				attempt := total - i // 0,1,2...
+				delay := backoff(attempt)
+				timer := time.NewTimer(delay)
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					timer.Stop()
+					return nil, ctx.Err()
+				}
+			}
 			continue
 		} else {
 			break
 		}
+	}
+	if err != nil {
+		// OPS-2: retry 耗尽才 warn 一次, 避免 retry 中途风暴 log.
+		slog.Warn("net.HTTP RequestMethod exhausted retries",
+			slog.String("method", method),
+			slog.String("url", url),
+			slog.Int("retries", total),
+			slog.Any("err", err))
 	}
 	return response, err
 }

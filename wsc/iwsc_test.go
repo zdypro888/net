@@ -2,6 +2,7 @@ package wsc
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -94,5 +95,119 @@ func TestClientServerWriteAndRequest(t *testing.T) {
 	case <-replyDone:
 	case <-ctx.Done():
 		t.Fatalf("timed out waiting for reply goroutine: %v", ctx.Err())
+	}
+}
+
+func TestRequestTimeoutAndCloseDoNotBlock(t *testing.T) {
+	server := NewServerWithBuffer[testPayload](64)
+	upgrader := websocket.Upgrader{}
+	sessionCh := make(chan *Session[testPayload], 1)
+	errCh := make(chan error, 1)
+
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		session, err := server.OnConnection(conn, nil)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		sessionCh <- session
+	}))
+	defer httpServer.Close()
+	defer server.Close()
+
+	client := NewClientWithBuffer[testPayload]("ws"+httpServer.URL[len("http"):], 64)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+
+	var session *Session[testPayload]
+	select {
+	case session = <-sessionCh:
+	case err := <-errCh:
+		t.Fatalf("server connection failed: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for session: %v", ctx.Err())
+	}
+
+	received := make(chan struct{})
+	go func() {
+		packet := <-session.Handle()
+		if packet.ID == "" {
+			t.Errorf("request missing id")
+		}
+		close(received)
+		// Intentionally do not reply. The client-side request context must own
+		// the wait, and Close must still be able to tear down the blocked read.
+	}()
+
+	reqCtx, reqCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	_, err := client.Request(reqCtx, testPayload{Kind: "request", Value: 99})
+	reqCancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Request error = %v, want context deadline", err)
+	}
+
+	select {
+	case <-received:
+	case <-time.After(time.Second):
+		t.Fatalf("server did not receive timed-out request")
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Close()
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("Close blocked after request timeout")
+	}
+}
+
+func TestWSConnectionCloseDoesNotBlockWhenMessageChannelIsFull(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		<-r.Context().Done()
+	}))
+	defer httpServer.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, "ws"+httpServer.URL[len("http"):], nil)
+	if err != nil {
+		t.Fatalf("Dial failed: %v", err)
+	}
+
+	wsConn := createWSConnection[testPayload](conn, 1)
+	wsConn.msgchan <- &messagechannel[testPayload]{Message: &Message[testPayload]{Data: testPayload{Kind: "queued"}}}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- wsConn.Close(context.Background())
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("Close blocked on full message channel")
 	}
 }

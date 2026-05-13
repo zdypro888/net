@@ -10,11 +10,7 @@ import (
 
 func NewHTTP3(config *tls.Config) *HTTP {
 	if config == nil {
-		config = &tls.Config{
-			InsecureSkipVerify: true,
-			MinVersion:         tls.VersionTLS11,
-			MaxVersion:         tls.VersionTLS13,
-		}
+		config = DefaultTLSConfig()
 	}
 	transport := &http3.Transport{
 		TLSClientConfig: config,

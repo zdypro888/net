@@ -23,7 +23,8 @@ func Context(ctx context.Context, h *HTTP) context.Context {
 
 func FromContext(ctx context.Context) *HTTP {
 	if hi := ctx.Value(ContextHTTPKey); hi != nil {
-		return hi.(*HTTP)
+		h, _ := hi.(*HTTP)
+		return h
 	}
 	return nil
 }

@@ -84,6 +84,18 @@ func New(o *Options) (*Jar, error) {
 	return jar, nil
 }
 
+// SetPublicSuffixList 设置 jar 的 PublicSuffixList.
+// psList 字段不参与 bson/json 序列化, 因此反序列化得到的 jar 必定 psList==nil,
+// 此时 jarKey/domainAndType 退化到"最后一个点之前"的算法, 与持久化前不一致.
+// caller 应在反序列化后立即调用本方法恢复. 必须加锁: psList 在 Cookies/SetCookies
+// 的 hot path 内被读 (j.psList.PublicSuffix(domain)), 与本 setter 真实并发.
+// 复用现有 j.mu (零成本, 不引入新锁).
+func (j *Jar) SetPublicSuffixList(psl PublicSuffixList) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.psList = psl
+}
+
 // Entry is the internal representation of a cookie.
 //
 // This struct type is not used outside of this package per se, but the exported

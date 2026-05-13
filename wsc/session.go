@@ -2,17 +2,43 @@ package wsc
 
 import (
 	"context"
+	"log/slog"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/zdypro888/net"
 )
 
+// DefaultAsyncTimeout — async() 写 asyncChan 的兜底超时. caller 传 ctx
+// 无 deadline 时使用. 防上层 Reply/Write/Request 在 asyncChan 满 + 卡死
+// 的 consumer 下永久阻塞.
+const DefaultAsyncTimeout = 30 * time.Second
+
+// HandchanBlockWarnThreshold — handleMessageGo 写 handchan 阻塞超过该窗口
+// 时 log warn, 提示上层 consume goroutine 卡住或 handchan 容量不足.
+// 不丢帧, 仅观察.
+const HandchanBlockWarnThreshold = 5 * time.Second
+
 type Packet[T any] struct {
 	ID     string // 请求 ID (用于回复)
 	Data   T
 	Closed bool
+}
+
+// SessionStats 给运维查 wsc 健康度.
+type SessionStats struct {
+	AsyncChanLen    int    // 当前 asyncChan 队列长度 (高 = 上层 reply/write 堆积)
+	AsyncChanCap    int    // asyncChan 容量
+	HandchanLen     int    // 当前 handchan 队列长度 (高 = 上层 consume 慢)
+	HandchanCap     int    // handchan 容量
+	AsyncTimeouts   uint64 // async 写 asyncChan 触发兜底超时的累计次数
+	HandchanWaitNS  uint64 // handleMessageGo 写 handchan 的累计阻塞纳秒数
+	HandchanWarnCnt uint64 // handchan 阻塞超过 HandchanBlockWarnThreshold 的累计次数
+	WriteErrors     uint64 // asyncGo 调 rawconn.WriteUnsafe / RequestCallbackUnsafe 返回 err 的累计次数 (BUG-3)
+	LastWriteError  error  // 最近一次 write/request 错误 (BUG-3); 仅观察, 不保证全局排序
 }
 
 // Session 通用会话（客户端和服务端共用）
@@ -24,6 +50,46 @@ type Session[T any] struct {
 	stopChan   chan struct{}
 	asyncChan  chan *asyncInfo[T]
 	waiter     sync.WaitGroup
+	// 观察性计数器, atomic 读写.
+	asyncTimeouts   atomic.Uint64
+	handchanWaitNS  atomic.Uint64
+	handchanWarnCnt atomic.Uint64
+	writeErrors     atomic.Uint64
+	// lastWriteError: BUG-3 修复. asyncGo (单写) + Stats (多读) 真实并发,
+	// atomic.Pointer 是单字段无锁方案; 不引入 mutex (更重, 且 Stats 不需要
+	// 与其它字段同瞬一致).
+	lastWriteError atomic.Pointer[error]
+}
+
+// Stats 拍 session 当前队列占用 + 观察性计数器. 不持锁 — Len/Cap 是 chan
+// builtin, atomic.Uint64.Load 也无锁; 单条调用返回的几个字段不严格一致,
+// 但用作监控足够.
+func (s *Session[T]) Stats() SessionStats {
+	if s == nil {
+		return SessionStats{}
+	}
+	s.locker.RLock()
+	asyncChan := s.asyncChan
+	handchan := s.handchan
+	s.locker.RUnlock()
+	stats := SessionStats{
+		AsyncTimeouts:   s.asyncTimeouts.Load(),
+		HandchanWaitNS:  s.handchanWaitNS.Load(),
+		HandchanWarnCnt: s.handchanWarnCnt.Load(),
+		WriteErrors:     s.writeErrors.Load(),
+	}
+	if asyncChan != nil {
+		stats.AsyncChanLen = len(asyncChan)
+		stats.AsyncChanCap = cap(asyncChan)
+	}
+	if handchan != nil {
+		stats.HandchanLen = len(handchan)
+		stats.HandchanCap = cap(handchan)
+	}
+	if errp := s.lastWriteError.Load(); errp != nil {
+		stats.LastWriteError = *errp
+	}
+	return stats
 }
 
 // GUID 返回标识
@@ -48,8 +114,8 @@ func createSessionWithBuffer[T any](guid string, bufferSize int) *Session[T] {
 		stopChan:   make(chan struct{}),
 	}
 	s.asyncChan = make(chan *asyncInfo[T], bufferSize)
-	s.waiter.Add(1)
-	go s.asyncGo(&s.waiter, s.asyncChan, s.handchan, s.stopChan)
+	// Go 1.25 WaitGroup.Go 自动 Add(1)/Done, 比显式 Add+defer Done 少一个易错点.
+	s.waiter.Go(func() { s.asyncGo(s.asyncChan, s.handchan, s.stopChan) })
 	return s
 }
 
@@ -85,8 +151,7 @@ func (info *asyncInfo[T]) Response(msg *Message[T], err error) {
 	}
 }
 
-func (s *Session[T]) handleMessageGo(waiter *sync.WaitGroup, handchan chan *Packet[T], msgchan <-chan *messagechannel[T], stopChan chan struct{}) {
-	defer waiter.Done()
+func (s *Session[T]) handleMessageGo(handchan chan *Packet[T], msgchan <-chan *messagechannel[T], stopChan chan struct{}) {
 	running := true
 	for running {
 		select {
@@ -97,18 +162,50 @@ func (s *Session[T]) handleMessageGo(waiter *sync.WaitGroup, handchan chan *Pack
 				running = false
 			} else {
 				packet := msg.ToPacket()
+				// 快路径: handchan 有空位立即写入.
 				select {
 				case handchan <- packet:
+					continue
 				case <-stopChan:
 					running = false
+					continue
+				default:
 				}
+				// 慢路径: handchan 满, 上层 consume goroutine 没及时 read.
+				// 加观察性计数 + 阻塞写; 不丢帧 (协议帧丢一条可能让 wire 状态
+				// 不一致). 超过阈值 log warn 提示运维: 要么上层 consume 卡了,
+				// 要么 bufferSize 配小了.
+				start := time.Now()
+				warnTimer := time.NewTimer(HandchanBlockWarnThreshold)
+				warned := false
+			blockLoop:
+				for {
+					select {
+					case handchan <- packet:
+						break blockLoop
+					case <-stopChan:
+						running = false
+						break blockLoop
+					case <-warnTimer.C:
+						if !warned {
+							warned = true
+							s.handchanWarnCnt.Add(1)
+							slog.Warn("wsc handchan blocked; upstream consume slow",
+								slog.String("guid", s.guid),
+								slog.Duration("waited", time.Since(start)),
+								slog.Int("cap", cap(handchan)))
+						}
+						warnTimer.Reset(HandchanBlockWarnThreshold)
+					}
+				}
+				warnTimer.Stop()
+				s.handchanWaitNS.Add(uint64(time.Since(start)))
 			}
 		}
 	}
 }
 
-func (s *Session[T]) asyncGo(waiter *sync.WaitGroup, asyncChan <-chan *asyncInfo[T], handchan chan *Packet[T], stopChan chan struct{}) {
-	defer waiter.Done()
+func (s *Session[T]) asyncGo(asyncChan <-chan *asyncInfo[T], handchan chan *Packet[T], stopChan chan struct{}) {
 	rawconn := net.NewClient[*Message[T], *wsconnection[T]]()
 	rawconn.SetBufferSize(s.bufferSize)
 	var recvWaiter sync.WaitGroup
@@ -117,13 +214,27 @@ func (s *Session[T]) asyncGo(waiter *sync.WaitGroup, asyncChan <-chan *asyncInfo
 		case asyncCommandConn: // 设置连接
 			// wsConn 所有权转移到 rawconn, rawconn.Close 时会关闭连接
 			wsConn := createWSConnection[T](info.Conn, s.bufferSize)
-			recvWaiter.Add(1)
-			go s.handleMessageGo(&recvWaiter, handchan, wsConn.channel(), stopChan)
+			// Go 1.25 WaitGroup.Go.
+			recvWaiter.Go(func() { s.handleMessageGo(handchan, wsConn.channel(), stopChan) })
 			rawconn.ResetUnsafe(context.Background(), wsConn)
 		case asyncCommandWrite: // 发送通知
-			rawconn.WriteUnsafe(context.Background(), info.Request)
+			// BUG-3: 旧实现吞掉 err, 上层 Reply/Write 拿到 nil 误以为消息已上线.
+			// 现在保留 fire-and-forget 语义 (Reply/Write 早返回), 但把错误记到
+			// Session.lastWriteError + writeErrors 计数 + slog.Warn 提示一次,
+			// 让运维通过 Stats() 看到累计写失败.
+			if err := rawconn.WriteUnsafe(context.Background(), info.Request); err != nil {
+				s.writeErrors.Add(1)
+				s.lastWriteError.Store(&err)
+				slog.Warn("wsc Session async write failed",
+					slog.String("guid", s.guid), slog.Any("err", err))
+			}
 		case asyncCommandRequest: // 发送请求并等待响应; 断线由 info.Response 直接通知 caller, 不在此处重试
-			rawconn.RequestCallbackUnsafe(context.Background(), info.Request, info.Response)
+			// RequestCallbackUnsafe 内部 async() 失败时会同步通过 info.Response
+			// 通知 caller, 这里仍然记 lastWriteError 用作运维观察 (不重复通知 caller).
+			if err := rawconn.RequestCallbackUnsafe(context.Background(), info.Request, info.Response); err != nil {
+				s.writeErrors.Add(1)
+				s.lastWriteError.Store(&err)
+			}
 		}
 	}
 	rawconn.Close()
@@ -133,15 +244,24 @@ func (s *Session[T]) asyncGo(waiter *sync.WaitGroup, asyncChan <-chan *asyncInfo
 	close(handchan)
 }
 
-// resetUnsafe 设置连接并通知等待者
+// async 把 asyncInfo 投入 asyncChan 给 asyncGo 处理. asyncChan 满时阻塞写入.
+// caller 传 ctx 无 deadline 时自动加 DefaultAsyncTimeout 兜底 — 防止上层调
+// Reply/Write/Request 时使用 context.Background() (大量 sess.Reply 路径) +
+// 下游 consume 卡死 + asyncChan 满 = 永久阻塞.
 func (s *Session[T]) async(ctx context.Context, info *asyncInfo[T]) error {
 	if s.asyncChan == nil {
 		return ErrSessionClosed
+	}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, DefaultAsyncTimeout)
+		defer cancel()
 	}
 	select {
 	case s.asyncChan <- info:
 		return nil
 	case <-ctx.Done():
+		s.asyncTimeouts.Add(1)
 		return ctx.Err()
 	case <-s.stopChan:
 		return ErrSessionClosed
@@ -199,8 +319,18 @@ func (s *Session[T]) Reply(ctx context.Context, id string, data T) error {
 }
 
 // requestUnsafe 发送请求并等待响应（自动管理 ID，断线返回错误）
+// 注意: 调用方应确保 enqueue 阶段持锁, wait 阶段释放锁 — 否则 Request 与 Close
+// 会死锁 (Wlock 等不到 RLock 释放). 推荐通过 Request() 入口走分段路径.
 func (s *Session[T]) requestUnsafe(ctx context.Context, data T) (T, error) {
-	var zero T
+	request, err := s.enqueueRequest(ctx, data)
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+	return s.waitRequest(ctx, request)
+}
+
+func (s *Session[T]) enqueueRequest(ctx context.Context, data T) (*asyncInfo[T], error) {
 	request := &asyncInfo[T]{
 		Command:  asyncCommandRequest,
 		Request:  &Message[T]{ID: uuid.New().String(), Data: data},
@@ -208,8 +338,13 @@ func (s *Session[T]) requestUnsafe(ctx context.Context, data T) (T, error) {
 	}
 	if err := s.async(ctx, request); err != nil {
 		close(request.response)
-		return zero, err
+		return nil, err
 	}
+	return request, nil
+}
+
+func (s *Session[T]) waitRequest(ctx context.Context, request *asyncInfo[T]) (T, error) {
+	var zero T
 	select {
 	case resp, ok := <-request.response:
 		if !ok {
@@ -230,10 +365,17 @@ func (s *Session[T]) requestUnsafe(ctx context.Context, data T) (T, error) {
 	}
 }
 
+// Request 入队阶段持 RLock (保证 asyncChan 不被并发 close), wait 阶段不持锁
+// (避免 Close 拿 Wlock 时 RLock 永远不释放 → 死锁).
 func (s *Session[T]) Request(ctx context.Context, data T) (T, error) {
 	s.locker.RLock()
-	defer s.locker.RUnlock()
-	return s.requestUnsafe(ctx, data)
+	request, err := s.enqueueRequest(ctx, data)
+	s.locker.RUnlock()
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+	return s.waitRequest(ctx, request)
 }
 
 // closeUnsafe 关闭
