@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/zdypro888/net"
 )
 
 type testPayload struct {
@@ -172,6 +173,97 @@ func TestRequestTimeoutAndCloseDoNotBlock(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatalf("Close blocked after request timeout")
+	}
+}
+
+func TestClientCloseDoesNotWaitForPendingRequestContext(t *testing.T) {
+	server := NewServerWithBuffer[testPayload](64)
+	upgrader := websocket.Upgrader{}
+	sessionCh := make(chan *Session[testPayload], 1)
+	errCh := make(chan error, 1)
+
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		session, err := server.OnConnection(conn, nil)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		sessionCh <- session
+	}))
+	defer httpServer.Close()
+	defer server.Close()
+
+	client := NewClientWithBuffer[testPayload]("ws"+httpServer.URL[len("http"):], 64)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+
+	var session *Session[testPayload]
+	select {
+	case session = <-sessionCh:
+	case err := <-errCh:
+		t.Fatalf("server connection failed: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for session: %v", ctx.Err())
+	}
+
+	received := make(chan struct{})
+	go func() {
+		packet := <-session.Handle()
+		if packet.ID == "" {
+			t.Errorf("request missing id")
+		}
+		close(received)
+		// Keep the request pending until client.Close tears the session down.
+	}()
+
+	requestDone := make(chan error, 1)
+	go func() {
+		reqCtx, reqCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer reqCancel()
+		_, err := client.Request(reqCtx, testPayload{Kind: "request", Value: 100})
+		requestDone <- err
+	}()
+
+	select {
+	case <-received:
+	case <-time.After(time.Second):
+		t.Fatalf("server did not receive pending request")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- client.Close()
+	}()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("Close blocked behind pending Request")
+	}
+
+	select {
+	case err := <-requestDone:
+		// Close 通过 rawconn.asyncGo 退出尾段, 给所有 asyncNotifys 填 net.ErrConnectionClosed;
+		// 也可能从 wsc.Session.waitRequest 的 stopChan 分支 (ErrSessionClosed) 或 reqCtx.Done
+		// (context.Canceled) 走出.
+		if !errors.Is(err, ErrSessionClosed) &&
+			!errors.Is(err, context.Canceled) &&
+			!errors.Is(err, net.ErrConnectionClosed) {
+			t.Fatalf("Request error = %v, want session closed / context canceled / connection closed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("pending Request did not unblock after Close")
 	}
 }
 

@@ -140,27 +140,19 @@ func (c *Client[T]) Connect(ctx context.Context) error {
 }
 
 func (c *Client[T]) Write(ctx context.Context, data T) error {
-	c.session.locker.RLock()
-	defer c.session.locker.RUnlock()
-	return c.session.writeUnsafe(ctx, data)
+	return c.session.Write(ctx, data)
 }
 
 func (c *Client[T]) Request(ctx context.Context, data T) (T, error) {
-	c.session.locker.RLock()
-	defer c.session.locker.RUnlock()
-	return c.session.requestUnsafe(ctx, data)
+	return c.session.Request(ctx, data)
 }
 
 // Reply 回复服务端请求（用于双向通信场景）
 func (c *Client[T]) Reply(ctx context.Context, id string, data T) error {
-	c.session.locker.RLock()
-	defer c.session.locker.RUnlock()
-	return c.session.replyUnsafe(ctx, id, data)
+	return c.session.Reply(ctx, id, data)
 }
 
 // Close 关闭连接
 func (c *Client[T]) Close() error {
-	c.session.locker.Lock()
-	defer c.session.locker.Unlock()
-	return c.session.closeUnsafe()
+	return c.session.Close()
 }

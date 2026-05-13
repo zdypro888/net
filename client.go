@@ -411,13 +411,14 @@ drainLoop:
 			asyncRequest.Response(zeroM, lastErr)
 		}
 	}
+	notifyRemaining := len(asyncNotifys)
 	asyncNotifys = nil
 
 	// 通知 Write/Request 连接已关闭. signalStop 用 sync.Once, 与 CloseUnsafe 已经
 	// signalStop 过的场景幂等. OPS-2: 记一行 warn 让运维知道 client 因什么退出.
 	slog.Warn("net.Client closed",
 		slog.Any("lastError", lastErr),
-		slog.Int("notifyRemaining", len(asyncNotifys)))
+		slog.Int("notifyRemaining", notifyRemaining))
 	client.signalStop()
 }
 
