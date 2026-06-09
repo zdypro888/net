@@ -38,6 +38,29 @@ func TestProxyDialContextUsesTLSForHTTPSProxy(t *testing.T) {
 	}
 }
 
+func TestProxyDialContextBasicAuthUsesDecodedUserinfo(t *testing.T) {
+	requests := make(chan *http.Request, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	proxy := &Proxy{
+		Address: "http://user:p%40ss@" + server.Listener.Addr().String(),
+	}
+	conn, err := proxy.DialContext(context.Background(), "tcp", "example.com:443")
+	if err != nil {
+		t.Fatalf("DialContext failed: %v", err)
+	}
+	checkClose(t, "proxy conn", conn.Close)
+
+	req := <-requests
+	if got := req.Header.Get("Proxy-Authorization"); got != "Basic dXNlcjpwQHNz" {
+		t.Fatalf("Proxy-Authorization = %q, want decoded userinfo", got)
+	}
+}
+
 func TestProxyDialContextHTTPSProxyStrictRejectsSelfSigned(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

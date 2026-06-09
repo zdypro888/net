@@ -14,6 +14,7 @@ const (
 
 	HandshakeTimeout = 10 * time.Second
 	WriteTimeout     = 10 * time.Second
+	MaxMessageSize   = 32 << 20
 
 	// ReadIdleTimeout 读端静默上限. 这段时间内若没收到对方任何消息 (含心跳)
 	// 视为对端僵死, ReadMessage 立即返 net.ErrDeadlineExceeded → 上层关连接 + 重连.

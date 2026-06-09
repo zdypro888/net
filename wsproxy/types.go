@@ -3,6 +3,7 @@ package wsproxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+const MaxMessageSize = 32 << 20
 
 type MethodType int
 
@@ -61,27 +64,33 @@ func (p *pump) copyLoop(ctx context.Context, wsConn *websocket.Conn, conn net.Co
 
 	// Go 1.25 WaitGroup.Go 自动 Add(1)/Done, 配套替换显式 Add(2)+defer Done.
 	var waiter sync.WaitGroup
+	errCh := make(chan error, 2)
 	waiter.Go(func() {
-		p.logCopyError("ws_to_conn", p.wsCopyToConn(closeBoth, wsConn, conn))
+		errCh <- p.normalizeCopyError("ws_to_conn", p.wsCopyToConn(closeBoth, wsConn, conn))
 	})
 	waiter.Go(func() {
-		p.logCopyError("conn_to_ws", p.connCopyToWs(closeBoth, conn, wsConn))
+		errCh <- p.normalizeCopyError("conn_to_ws", p.connCopyToWs(closeBoth, conn, wsConn))
 	})
 	waiter.Wait()
 	close(done)
-	return nil
+	close(errCh)
+
+	var err error
+	for copyErr := range errCh {
+		err = errors.Join(err, copyErr)
+	}
+	return err
 }
 
-func (p *pump) logCopyError(direction string, err error) {
+func (p *pump) normalizeCopyError(direction string, err error) error {
 	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
-		return
+		return nil
 	}
 	var closeErr *websocket.CloseError
 	if errors.As(err, &closeErr) {
-		return
+		return nil
 	}
-	slog.Warn("wsproxy pump copy failed",
-		slog.String("direction", direction), slog.Any("err", err))
+	return fmt.Errorf("%s: %w", direction, err)
 }
 
 func (p *pump) wsCopyToConn(closeBoth func(), wsConn *websocket.Conn, conn net.Conn) error {

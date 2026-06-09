@@ -274,6 +274,94 @@ func TestClientCloseDoesNotWaitForPendingRequestContext(t *testing.T) {
 	}
 }
 
+func TestClientConnectAfterCloseCreatesFreshSession(t *testing.T) {
+	server := NewServerWithBuffer[testPayload](64)
+	upgrader := websocket.Upgrader{}
+	sessionCh := make(chan *Session[testPayload], 2)
+	errCh := make(chan error, 1)
+
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		session, err := server.OnConnection(conn, nil)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		sessionCh <- session
+	}))
+	defer httpServer.Close()
+	defer checkClose(t, "server", server.Close)
+
+	client := NewClientWithBuffer[testPayload]("ws"+httpServer.URL[len("http"):], 64)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("first Connect failed: %v", err)
+	}
+	select {
+	case <-sessionCh:
+	case err := <-errCh:
+		t.Fatalf("first server connection failed: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for first session: %v", ctx.Err())
+	}
+	oldHandle := client.Handle()
+	checkClose(t, "client first session", client.Close)
+	for {
+		select {
+		case packet, ok := <-oldHandle:
+			if !ok {
+				goto oldHandleClosed
+			}
+			if !packet.Closed {
+				t.Fatalf("old Handle channel produced non-close data: %#v", packet)
+			}
+		case <-ctx.Done():
+			t.Fatalf("old Handle channel did not close: %v", ctx.Err())
+		}
+	}
+oldHandleClosed:
+
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("second Connect failed: %v", err)
+	}
+	defer checkClose(t, "client second session", client.Close)
+	newHandle := client.Handle()
+	if newHandle == oldHandle {
+		t.Fatalf("Handle channel was reused after Close")
+	}
+	var session *Session[testPayload]
+	select {
+	case session = <-sessionCh:
+	case err := <-errCh:
+		t.Fatalf("second server connection failed: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for second session: %v", ctx.Err())
+	}
+	if err := client.Write(ctx, testPayload{Kind: "second", Value: 2}); err != nil {
+		t.Fatalf("Write after reconnect failed: %v", err)
+	}
+	for {
+		select {
+		case packet := <-session.Handle():
+			if packet.Closed {
+				continue
+			}
+			if packet.Data.Kind != "second" || packet.Data.Value != 2 {
+				t.Fatalf("unexpected payload after reconnect: %#v", packet.Data)
+			}
+			return
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for reconnect payload: %v", ctx.Err())
+		}
+	}
+}
+
 func TestWSConnectionCloseDoesNotBlockWhenMessageChannelIsFull(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

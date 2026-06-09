@@ -57,6 +57,7 @@ func NewServer() *Server {
 
 // OnConnection 处理新连接
 func (server *Server) OnConnection(conn *websocket.Conn) {
+	conn.SetReadLimit(MaxMessageSize)
 	if server.closed.Load() {
 		// CloseAll 已调用, 不接新连接.
 		if err := conn.Close(); err != nil {

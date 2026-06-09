@@ -13,10 +13,11 @@ import (
 
 // Server 管理多个 Session
 type Server[T any] struct {
-	locker     sync.Mutex
-	sessions   map[string]*Session[T]
-	bufferSize int
-	codecs     *codecSet
+	locker         sync.Mutex
+	sessions       map[string]*Session[T]
+	bufferSize     int
+	codecs         *codecSet
+	maxMessageSize int64
 }
 
 // NewServer 创建服务器。可选 WithCodecs 配置支持的编码 (默认仅 JSON)。
@@ -34,9 +35,10 @@ func NewServerWithBuffer[T any](bufferSize int, opts ...Option) *Server[T] {
 		opt(&o)
 	}
 	return &Server[T]{
-		sessions:   make(map[string]*Session[T]),
-		bufferSize: bufferSize,
-		codecs:     newCodecSet(o.codecs),
+		sessions:       make(map[string]*Session[T]),
+		bufferSize:     bufferSize,
+		codecs:         newCodecSet(o.codecs),
+		maxMessageSize: o.resolvedMaxMessageSize(),
 	}
 }
 
@@ -44,6 +46,7 @@ func NewServerWithBuffer[T any](bufferSize int, opts ...Option) *Server[T] {
 // args 是可选的额外参数
 // 返回 Session，通过 session.Handle() 获取消息通道
 func (server *Server[T]) OnConnection(conn *websocket.Conn, args any) (*Session[T], error) {
+	conn.SetReadLimit(server.maxMessageSize)
 	if err := conn.SetReadDeadline(time.Now().Add(HandshakeTimeout)); err != nil {
 		return nil, errors.Join(err, conn.Close())
 	}

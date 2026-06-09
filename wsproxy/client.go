@@ -30,6 +30,7 @@ func (client *Client) Dial(ctx context.Context, network, address string) (net.Co
 	if err != nil {
 		return nil, err
 	}
+	wsConn.SetReadLimit(MaxMessageSize)
 	deadline := time.Now().Add(dialHandshakeTimeout)
 	if ctxDeadline, ok := ctx.Deadline(); ok {
 		deadline = ctxDeadline

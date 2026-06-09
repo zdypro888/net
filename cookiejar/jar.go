@@ -84,12 +84,25 @@ func New(o *Options) (*Jar, error) {
 	return jar, nil
 }
 
-// SetPublicSuffixList 设置 jar 的 PublicSuffixList.
+// Restore 在从存储反序列化得到 Jar 后恢复不参与序列化的瞬态字段: psList(从不序列化)
+// 与惰性 Entries(空 jar 持久化后可能为 nil)。setCookies 已对 nil Entries 自愈, 故
+// Entries 初始化非必需, Restore 只是让反序列化后的 jar 立即处于完整可用状态。
+// 仅需恢复 PublicSuffixList 时用 SetPublicSuffixList。
+func (j *Jar) Restore(psl PublicSuffixList) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.Entries == nil {
+		j.Entries = make(map[string]map[string]Entry)
+	}
+	j.psList = psl
+}
+
+// SetPublicSuffixList 仅设置 jar 的 PublicSuffixList。
 // psList 字段不参与 bson/json 序列化, 因此反序列化得到的 jar 必定 psList==nil,
 // 此时 jarKey/domainAndType 退化到"最后一个点之前"的算法, 与持久化前不一致.
-// caller 应在反序列化后立即调用本方法恢复. 必须加锁: psList 在 Cookies/SetCookies
-// 的 hot path 内被读 (j.psList.PublicSuffix(domain)), 与本 setter 真实并发.
-// 复用现有 j.mu (零成本, 不引入新锁).
+// caller 应在反序列化后恢复(需连带初始化 Entries 时用 Restore)。必须加锁: psList 在
+// Cookies/SetCookies 的 hot path 内被读 (j.psList.PublicSuffix(domain)), 与本 setter
+// 真实并发。复用现有 j.mu (零成本, 不引入新锁)。
 func (j *Jar) SetPublicSuffixList(psl PublicSuffixList) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -176,11 +189,10 @@ func (j *Jar) cookies(u *url.URL, now time.Time) (cookies []*http.Cookie) {
 	if err != nil {
 		return cookies
 	}
-	key := jarKey(host, j.psList)
-
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
+	key := jarKey(host, j.psList)
 	submap := j.Entries[key]
 	if submap == nil {
 		return cookies
@@ -254,12 +266,15 @@ func (j *Jar) setCookies(u *url.URL, cookies []*http.Cookie, now time.Time) {
 	if err != nil {
 		return
 	}
-	key := jarKey(host, j.psList)
 	defPath := defaultPath(u.Path)
 
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
+	if j.Entries == nil {
+		j.Entries = make(map[string]map[string]Entry)
+	}
+	key := jarKey(host, j.psList)
 	submap := j.Entries[key]
 
 	modified := false

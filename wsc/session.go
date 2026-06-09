@@ -2,6 +2,7 @@ package wsc
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -59,6 +60,7 @@ type Session[T any] struct {
 	// atomic.Pointer 是单字段无锁方案; 不引入 mutex (更重, 且 Stats 不需要
 	// 与其它字段同瞬一致).
 	lastWriteError atomic.Pointer[error]
+	wsconn         atomic.Pointer[wsconnection[T]]
 }
 
 // Stats 拍 session 当前队列占用 + 观察性计数器. 不持锁 — Len/Cap 是 chan
@@ -103,6 +105,12 @@ func (s *Session[T]) Handle() <-chan *Packet[T] {
 	return s.handchan
 }
 
+func (s *Session[T]) closed() bool {
+	s.locker.RLock()
+	defer s.locker.RUnlock()
+	return s.asyncChan == nil
+}
+
 func createSessionWithBuffer[T any](guid string, bufferSize int) *Session[T] {
 	if bufferSize <= 0 {
 		bufferSize = DefaultBufferSize
@@ -139,6 +147,7 @@ type asyncInfo[T any] struct {
 	Request *Message[T]
 
 	response chan *asyncMsgErr[T]
+	ready    chan error
 }
 
 // Response 处理响应数据或错误
@@ -215,9 +224,14 @@ func (s *Session[T]) asyncGo(asyncChan <-chan *asyncInfo[T], handchan chan *Pack
 		case asyncCommandConn: // 设置连接
 			// wsConn 所有权转移到 rawconn, rawconn.Close 时会关闭连接
 			wsConn := createWSConnection[T](info.Conn, s.bufferSize, info.Codec)
+			s.wsconn.Store(wsConn)
 			// Go 1.25 WaitGroup.Go.
 			recvWaiter.Go(func() { s.handleMessageGo(handchan, wsConn.channel(), stopChan) })
 			rawconn.ResetUnsafe(context.Background(), wsConn)
+			if info.ready != nil {
+				info.ready <- nil
+				close(info.ready)
+			}
 		case asyncCommandWrite: // 发送通知
 			// BUG-3: 旧实现吞掉 err, 上层 Reply/Write 拿到 nil 误以为消息已上线.
 			// 现在保留 fire-and-forget 语义 (Reply/Write 早返回), 但把错误记到
@@ -239,9 +253,12 @@ func (s *Session[T]) asyncGo(asyncChan <-chan *asyncInfo[T], handchan chan *Pack
 		}
 	}
 	if err := rawconn.Close(); err != nil {
-		slog.Warn("wsc Session async raw connection close failed",
-			slog.String("guid", s.guid), slog.Any("err", err))
+		if !errors.Is(err, net.ErrConnectionClosed) {
+			slog.Warn("wsc Session async raw connection close failed",
+				slog.String("guid", s.guid), slog.Any("err", err))
+		}
 	}
+	s.wsconn.Store(nil)
 	// stopChan 关闭（特意设计,其它地方不会关闭 stopChan）
 	close(stopChan)
 	recvWaiter.Wait()
@@ -276,17 +293,37 @@ func (s *Session[T]) async(ctx context.Context, info *asyncInfo[T]) error {
 // 由 asyncGo 处理. 持 WLock 是为了让连接切换命令先于后续 Write/Reply/Request
 // 入队; 否则并发调用可能把业务消息排到 reset 前面, 导致写到旧连接或未连接状态.
 func (s *Session[T]) reset(ctx context.Context, conn *websocket.Conn, codec Codec) error {
-	s.locker.Lock()
-	defer s.locker.Unlock()
-	return s.async(ctx, &asyncInfo[T]{
+	info := &asyncInfo[T]{
 		Command: asyncCommandConn,
 		Conn:    conn,
 		Codec:   codec,
-	})
+		ready:   make(chan error, 1),
+	}
+	// 仅入队阶段持锁: 保证 conn 切换命令先于后续并发 Write/Reply/Request 入队。随后
+	// 释放锁再等 ready —— asyncGo 处理本命令期间(可能被卡死的旧连接写拖到 WriteTimeout)
+	// 不应阻塞其它操作。ready 缓冲为 1 故 asyncGo 发送不阻塞; stopChan 创建后不变, 锁外读安全。
+	s.locker.Lock()
+	err := s.async(ctx, info)
+	s.locker.Unlock()
+	if err != nil {
+		return err
+	}
+	select {
+	case err := <-info.ready:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.stopChan:
+		return ErrSessionClosed
+	}
 }
 
 // Reset 切换 session 底层 ws 连接, 使用默认 JSON codec。保留旧签名以兼容直接管理
 // websocket.Conn 的调用方; 握手协商路径内部使用 reset 传入选定 codec。
+//
+// 注意: 标准入口 (Client.Connect / Server.OnConnection) 会在握手前对 conn 调用
+// SetReadLimit(读上限持久生效于该 conn 全生命周期)。直接调用本方法的高级调用方若需
+// 限制入站消息大小防 OOM, 应自行在传入的 conn 上调用 SetReadLimit。
 func (s *Session[T]) Reset(ctx context.Context, conn *websocket.Conn) error {
 	return s.reset(ctx, conn, defaultCodec)
 }
@@ -373,6 +410,12 @@ func (s *Session[T]) Close() error {
 	if s.asyncChan != nil {
 		close(s.asyncChan)
 		s.asyncChan = nil
+	}
+	if wsConn := s.wsconn.Load(); wsConn != nil {
+		if err := wsConn.Close(context.Background()); err != nil && !errors.Is(err, net.ErrConnectionClosed) {
+			slog.Warn("wsc Session close websocket failed",
+				slog.String("guid", s.guid), slog.Any("err", err))
+		}
 	}
 	s.waiter.Wait()
 	return nil

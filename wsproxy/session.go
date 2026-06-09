@@ -2,6 +2,7 @@ package wsproxy
 
 import (
 	"net"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -12,9 +13,13 @@ type Session struct {
 	Id     string
 	Conn   *websocket.Conn
 	buffer []byte // 缓存未读完的数据
+	readMu sync.Mutex
 }
 
 func (s *Session) Read(b []byte) (n int, err error) {
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
+
 	// 如果缓存中有数据，先返回缓存的数据
 	if len(s.buffer) > 0 {
 		n = copy(b, s.buffer)

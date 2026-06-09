@@ -108,7 +108,10 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 			Header: make(http.Header),
 		}).WithContext(ctx)
 		if proxyURL.User != nil {
-			auth := proxyURL.User.String()
+			auth := proxyURL.User.Username() + ":"
+			if password, ok := proxyURL.User.Password(); ok {
+				auth += password
+			}
 			connectReq.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(auth)))
 		}
 		if err = connectReq.Write(conn); err != nil {

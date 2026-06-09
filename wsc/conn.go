@@ -47,6 +47,8 @@ func createWSConnection[T any](conn *websocket.Conn, bufferSize int, codec Codec
 	if codec == nil {
 		codec = defaultCodec
 	}
+	// 读上限已由 Client.dial / Server.OnConnection 按各自配置在握手前设于同一 conn,
+	// 此处不再重复 SetReadLimit, 以免用 const 覆盖掉调用方配置的 WithMaxMessageSize。
 	return &wsconnection[T]{
 		conn:    conn,
 		msgchan: make(chan *messagechannel[T], bufferSize),

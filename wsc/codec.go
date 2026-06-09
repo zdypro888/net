@@ -51,7 +51,16 @@ var defaultCodec Codec = JSONCodec{}
 type Option func(*options)
 
 type options struct {
-	codecs []Codec
+	codecs         []Codec
+	maxMessageSize int64
+}
+
+// resolvedMaxMessageSize 返回配置的入站消息上限, 未配置(<=0)时回退默认 MaxMessageSize。
+func (o options) resolvedMaxMessageSize() int64 {
+	if o.maxMessageSize > 0 {
+		return o.maxMessageSize
+	}
+	return MaxMessageSize
 }
 
 // WithCodecs 设置 Client 提供 / Server 支持的 codec, 按优先级从高到低排列。
@@ -59,6 +68,12 @@ type options struct {
 // 同时支持两者可传 WithCodecs(wsc.JSONCodec{}, protocodec.New())。
 func WithCodecs(codecs ...Codec) Option {
 	return func(o *options) { o.codecs = append(o.codecs, codecs...) }
+}
+
+// WithMaxMessageSize 设置单条入站消息的最大字节数, 防恶意/异常超大帧 OOM。
+// <=0 使用默认 MaxMessageSize。Client 生效于拨号建立的连接, Server 生效于接受的连接。
+func WithMaxMessageSize(n int64) Option {
+	return func(o *options) { o.maxMessageSize = n }
 }
 
 // codecSet 按优先级保存已配置的 codec, 并提供按名查找与协商。

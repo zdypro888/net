@@ -58,6 +58,7 @@ func (slaver *Slaver) Run(ctx context.Context, addr string) error {
 			}
 			continue
 		}
+		wsConn.SetReadLimit(MaxMessageSize)
 		incoming := &connPacket{
 			Id:     slaver.Id,
 			Method: MethodRegisterSlaver, // 注册连接

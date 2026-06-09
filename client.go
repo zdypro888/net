@@ -155,12 +155,14 @@ func (client *Client[M, T]) ResetUnsafe(ctx context.Context, conn T) {
 	client.setLastError(nil)
 
 	// 创建新的通道
-	client.stopChan = make(chan struct{})
+	stopChan := make(chan struct{})
+	client.stopChan = stopChan
 	bufSize := client.bufferSize
 	if bufSize <= 0 {
 		bufSize = DefaultBufferSize
 	}
-	client.asynchan = make(chan *asynRequest[M, T], bufSize)
+	asynchan := make(chan *asynRequest[M, T], bufSize)
+	client.asynchan = asynchan
 	recvchan := make(chan M, bufSize)
 	cctx, cancel := context.WithCancel(ctx)
 	// handleCtx 是 cctx 的子 ctx, 仅用于 conn.Handle (D-P1-1). CloseUnsafe cancel 它
@@ -182,7 +184,7 @@ func (client *Client[M, T]) ResetUnsafe(ctx context.Context, conn T) {
 	// 启动工作协程. 用 Go 1.25 WaitGroup.Go 自动 Add(1)/Done, 避免显式
 	// Add/Done 配对错位的经典坑.
 	client.waiter.Go(func() {
-		client.asyncGo(cctx, handleCtx, cancel, handleCancel, conn, client.asynchan, recvchan, client.stopChan)
+		client.asyncGo(cctx, handleCtx, cancel, handleCancel, conn, asynchan, recvchan, stopChan)
 	})
 	client.waiter.Go(func() { client.receiveGo(cctx, conn, recvchan) })
 }
