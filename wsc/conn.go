@@ -34,16 +34,23 @@ type wsconnection[T any] struct {
 	// 跨 goroutine 访问同一字段, 不加同步会 race; 单字段 atomic.Bool 是最轻方案.
 	closed   atomic.Bool
 	closeMux sync.Once
+	// codec 决定信封的 wire 编码 (JSON 文本帧 / proto 二进制帧), 握手协商得到。
+	codec Codec
 }
 
-// createWSConnection 创建 WebSocket 连接封装, msgchan 由 Conn 管理
-func createWSConnection[T any](conn *websocket.Conn, bufferSize int) *wsconnection[T] {
+// createWSConnection 创建 WebSocket 连接封装, msgchan 由 Conn 管理。codec 为 nil 时
+// 回退到默认 JSON codec。
+func createWSConnection[T any](conn *websocket.Conn, bufferSize int, codec Codec) *wsconnection[T] {
 	if bufferSize <= 0 {
 		bufferSize = DefaultBufferSize
+	}
+	if codec == nil {
+		codec = defaultCodec
 	}
 	return &wsconnection[T]{
 		conn:    conn,
 		msgchan: make(chan *messagechannel[T], bufferSize),
+		codec:   codec,
 	}
 }
 
@@ -79,8 +86,12 @@ func (c *wsconnection[T]) Close(ctx context.Context) error {
 // 容忍单次心跳抖动 + 时序漂移. 详见 ReadIdleTimeout 注释.
 func (c *wsconnection[T]) Read(ctx context.Context) (*Message[T], error) {
 	c.conn.SetReadDeadline(time.Now().Add(ReadIdleTimeout))
+	messageType, data, err := c.conn.ReadMessage()
+	if err != nil {
+		return nil, err
+	}
 	var msg Message[T]
-	if err := c.conn.ReadJSON(&msg); err != nil {
+	if err := c.codec.Decode(messageType, data, &msg); err != nil {
 		return nil, err
 	}
 	return &msg, nil
@@ -88,8 +99,12 @@ func (c *wsconnection[T]) Read(ctx context.Context) (*Message[T], error) {
 
 // Write 写入消息(实现 net.Conn 接口, 不可以外部调用)
 func (c *wsconnection[T]) Write(ctx context.Context, data *Message[T]) error {
+	messageType, payload, err := c.codec.Encode(data)
+	if err != nil {
+		return err
+	}
 	c.conn.SetWriteDeadline(time.Now().Add(WriteTimeout))
-	err := c.conn.WriteJSON(data)
+	err = c.conn.WriteMessage(messageType, payload)
 	c.conn.SetWriteDeadline(time.Time{})
 	return err
 }

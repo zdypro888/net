@@ -135,6 +135,7 @@ type asyncMsgErr[T any] struct {
 type asyncInfo[T any] struct {
 	Command asyncCommand
 	Conn    *websocket.Conn
+	Codec   Codec // 仅 asyncCommandConn 使用: 本次连接握手协商出的 codec
 	Request *Message[T]
 
 	response chan *asyncMsgErr[T]
@@ -213,7 +214,7 @@ func (s *Session[T]) asyncGo(asyncChan <-chan *asyncInfo[T], handchan chan *Pack
 		switch info.Command {
 		case asyncCommandConn: // 设置连接
 			// wsConn 所有权转移到 rawconn, rawconn.Close 时会关闭连接
-			wsConn := createWSConnection[T](info.Conn, s.bufferSize)
+			wsConn := createWSConnection[T](info.Conn, s.bufferSize, info.Codec)
 			// Go 1.25 WaitGroup.Go.
 			recvWaiter.Go(func() { s.handleMessageGo(handchan, wsConn.channel(), stopChan) })
 			rawconn.ResetUnsafe(context.Background(), wsConn)
@@ -268,16 +269,23 @@ func (s *Session[T]) async(ctx context.Context, info *asyncInfo[T]) error {
 	}
 }
 
-// Reset 切换 session 底层 ws 连接 (典型场景: client 断线重连). 入队 asyncCommandConn,
+// reset 切换 session 底层 ws 连接 (典型场景: client 断线重连). 入队 asyncCommandConn,
 // 由 asyncGo 处理. 持 WLock 是为了让连接切换命令先于后续 Write/Reply/Request
 // 入队; 否则并发调用可能把业务消息排到 reset 前面, 导致写到旧连接或未连接状态.
-func (s *Session[T]) Reset(ctx context.Context, conn *websocket.Conn) error {
+func (s *Session[T]) reset(ctx context.Context, conn *websocket.Conn, codec Codec) error {
 	s.locker.Lock()
 	defer s.locker.Unlock()
 	return s.async(ctx, &asyncInfo[T]{
 		Command: asyncCommandConn,
 		Conn:    conn,
+		Codec:   codec,
 	})
+}
+
+// Reset 切换 session 底层 ws 连接, 使用默认 JSON codec。保留旧签名以兼容直接管理
+// websocket.Conn 的调用方; 握手协商路径内部使用 reset 传入选定 codec。
+func (s *Session[T]) Reset(ctx context.Context, conn *websocket.Conn) error {
+	return s.reset(ctx, conn, defaultCodec)
 }
 
 // enqueueWrite 发送通知, id 非空表示是对请求的 Reply. Write / Reply 共用底层

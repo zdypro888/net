@@ -9,6 +9,7 @@ require (
 	github.com/quic-go/quic-go v0.59.0
 	github.com/zdypro888/utils v0.0.0-20260509170909-31773e315302
 	golang.org/x/net v0.54.0
+	google.golang.org/protobuf v1.36.11
 )
 
 require (

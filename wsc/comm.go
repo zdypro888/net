@@ -2,6 +2,7 @@ package wsc
 
 import (
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -26,23 +27,24 @@ const (
 )
 
 // 错误定义
-var (
-	ErrSessionClosed = errors.New("session closed")
-
-// ErrNotConnected    = errors.New("not connected")
-// ErrReconnectDenied = errors.New("reconnect denied")
-)
+var ErrSessionClosed = errors.New("session closed")
 
 // HandshakeRequest 握手请求
 type HandshakeRequest struct {
 	GUID    string `json:"guid"`
 	Version string `json:"version"`
+	// Codecs 客户端支持的 codec 名字, 按优先级从高到低排列. 旧客户端不带此字段,
+	// 服务端按 JSON 处理 (向后兼容). 协商逻辑见 codec.go。
+	Codecs []string `json:"codecs,omitempty"`
 }
 
 // HandshakeResponse 握手响应
 type HandshakeResponse struct {
 	Status  int    `json:"status"`
 	Message string `json:"message,omitempty"`
+	// Codec 服务端最终选定的 codec 名字. 为空表示对端是旧服务端 (不支持协商),
+	// 客户端回退到 JSON。
+	Codec string `json:"codec,omitempty"`
 }
 
 // Message 内部消息格式
@@ -58,4 +60,34 @@ func (m *Message[T]) Id() (any, bool) {
 		return m.ID, true
 	}
 	return nil, false
+}
+
+// Envelope 把消息信封以非泛型形式暴露给 Codec, 使二进制 codec (如 protocodec)
+// 能在不知道具体载荷类型 T 的情况下读写信封字段。*Message[T] 实现该接口。
+// JSON codec 直接序列化整个结构体, 不经过本接口。
+type Envelope interface {
+	EnvelopeID() string
+	EnvelopeHeart() bool
+	// EnvelopePayload 返回载荷值 (类型 T)。对零值 Message 调用可得到类型模板
+	// (指针类型为 typed-nil), 供 codec 反射分配同类型实例用于解码。
+	EnvelopePayload() any
+	SetEnvelopeID(id string)
+	SetEnvelopeHeart(heart bool)
+	// SetEnvelopePayload 把 payload 赋给 Data, 类型不匹配返回错误。
+	SetEnvelopePayload(payload any) error
+}
+
+func (m *Message[T]) EnvelopeID() string          { return m.ID }
+func (m *Message[T]) EnvelopeHeart() bool         { return m.IsHeart }
+func (m *Message[T]) EnvelopePayload() any        { return m.Data }
+func (m *Message[T]) SetEnvelopeID(id string)     { m.ID = id }
+func (m *Message[T]) SetEnvelopeHeart(heart bool) { m.IsHeart = heart }
+
+func (m *Message[T]) SetEnvelopePayload(payload any) error {
+	data, ok := payload.(T)
+	if !ok {
+		return fmt.Errorf("wsc: payload type %T not assignable to %T", payload, m.Data)
+	}
+	m.Data = data
+	return nil
 }

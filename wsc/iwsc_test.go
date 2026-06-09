@@ -286,7 +286,7 @@ func TestWSConnectionCloseDoesNotBlockWhenMessageChannelIsFull(t *testing.T) {
 		t.Fatalf("Dial failed: %v", err)
 	}
 
-	wsConn := createWSConnection[testPayload](conn, 1)
+	wsConn := createWSConnection[testPayload](conn, 1, defaultCodec)
 	wsConn.msgchan <- &messagechannel[testPayload]{Message: &Message[testPayload]{Data: testPayload{Kind: "queued"}}}
 
 	done := make(chan error, 1)

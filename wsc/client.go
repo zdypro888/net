@@ -15,20 +15,25 @@ type Client[T any] struct {
 	serverURL  string
 	session    *Session[T]
 	handleChan chan *Packet[T]
+	codecs     *codecSet
 }
 
-// NewClient 创建客户端
-func NewClient[T any](serverURL string) *Client[T] {
-	return NewClientWithBuffer[T](serverURL, DefaultBufferSize)
+// NewClient 创建客户端。可选 WithCodecs 配置支持的编码 (默认仅 JSON)。
+func NewClient[T any](serverURL string, opts ...Option) *Client[T] {
+	return NewClientWithBuffer[T](serverURL, DefaultBufferSize, opts...)
 }
 
 // NewClientWithBuffer 创建客户端并设置内部队列容量.
 // 高吞吐通知流可按调用场景调大 bufferSize.
-func NewClientWithBuffer[T any](serverURL string, bufferSize int) *Client[T] {
+func NewClientWithBuffer[T any](serverURL string, bufferSize int, opts ...Option) *Client[T] {
 	if bufferSize <= 0 {
 		bufferSize = DefaultBufferSize
 	}
-	client := &Client[T]{serverURL: serverURL}
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
+	client := &Client[T]{serverURL: serverURL, codecs: newCodecSet(o.codecs)}
 	client.session = createSessionWithBuffer[T](uuid.New().String(), bufferSize)
 	client.handleChan = make(chan *Packet[T], bufferSize)
 	// 启动消息处理协程
@@ -40,34 +45,48 @@ func (c *Client[T]) Handle() <-chan *Packet[T] {
 	return c.handleChan
 }
 
-func (c *Client[T]) dial(ctx context.Context) (*websocket.Conn, error) {
+// dial 建连并完成握手, 返回连接与本次协商出的 codec。握手始终走 JSON (一次性,
+// 且需在 codec 确定前完成), 客户端把支持的 codec 名字按优先级带给服务端, 服务端在
+// 响应里回选定的 codec。响应不带 codec (旧服务端) 时回退到默认 JSON。
+func (c *Client[T]) dial(ctx context.Context) (*websocket.Conn, Codec, error) {
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, c.serverURL, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// 握手
 	conn.SetWriteDeadline(time.Now().Add(HandshakeTimeout))
 	if err := conn.WriteJSON(HandshakeRequest{
 		GUID:    c.session.guid,
 		Version: ProtocolVersion,
+		Codecs:  c.codecs.names(),
 	}); err != nil {
 		conn.Close()
-		return nil, err
+		return nil, nil, err
 	}
 	conn.SetReadDeadline(time.Now().Add(HandshakeTimeout))
 	var resp HandshakeResponse
 	if err := conn.ReadJSON(&resp); err != nil {
 		conn.Close()
-		return nil, err
+		return nil, nil, err
 	}
 	if resp.Status != 200 {
 		conn.Close()
-		return nil, fmt.Errorf("dial failed: %s", resp.Message)
+		return nil, nil, fmt.Errorf("dial failed: %s", resp.Message)
+	}
+	// 解析协商结果: 空 = 旧服务端, 回退默认 JSON; 非空必须是本端支持的 codec。
+	codec := defaultCodec
+	if resp.Codec != "" {
+		selected, ok := c.codecs.get(resp.Codec)
+		if !ok {
+			conn.Close()
+			return nil, nil, fmt.Errorf("dial failed: server selected unsupported codec %q", resp.Codec)
+		}
+		codec = selected
 	}
 	// 清除 deadline
 	conn.SetReadDeadline(time.Time{})
 	conn.SetWriteDeadline(time.Time{})
-	return conn, nil
+	return conn, codec, nil
 }
 
 func (c *Client[T]) handleMessageGo(msgchan <-chan *Packet[T], stopChan <-chan struct{}) {
@@ -91,7 +110,7 @@ func (c *Client[T]) handleMessageGo(msgchan <-chan *Packet[T], stopChan <-chan s
 				case c.handleChan <- msg:
 				}
 				for running {
-					conn, err := c.dial(dialCtx)
+					conn, codec, err := c.dial(dialCtx)
 					if err != nil {
 						select {
 						case <-stopChan:
@@ -102,7 +121,7 @@ func (c *Client[T]) handleMessageGo(msgchan <-chan *Packet[T], stopChan <-chan s
 					}
 					// 重置连接. 用 Session.Reset 封装连接切换串行化, 不越界调用
 					// 内部 helper 或操作 session.locker.
-					if err := c.session.Reset(context.Background(), conn); err != nil {
+					if err := c.session.reset(context.Background(), conn, codec); err != nil {
 						conn.Close()
 						running = false
 					}
@@ -124,12 +143,12 @@ func (c *Client[T]) handleMessageGo(msgchan <-chan *Packet[T], stopChan <-chan s
 
 // Connect 执行连接
 func (c *Client[T]) Connect(ctx context.Context) error {
-	conn, err := c.dial(ctx)
+	conn, codec, err := c.dial(ctx)
 	if err != nil {
 		return err
 	}
 	// 用 Session.Reset 而非越界拿 session.locker; Reset 内部负责连接切换串行化.
-	if err := c.session.Reset(ctx, conn); err != nil {
+	if err := c.session.reset(ctx, conn, codec); err != nil {
 		conn.Close()
 		return err
 	}

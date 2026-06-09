@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package wsc;
+
+option go_package = "github.com/zdypro888/net/wsc/protocodec";
+
+// Frame 是 protobuf codec 使用的二进制 wire 信封, 与 JSON 的 Message 信封一一对应:
+// id 用于请求/响应匹配, heart 是心跳标志, data 承载序列化后的载荷 (载荷本身也是
+// 一个 proto.Message), has_data 区分 nil payload 与序列化后为空字节的合法 payload。
+message Frame {
+  string id = 1;
+  bytes data = 2;
+  bool heart = 3;
+  bool has_data = 4;
+}

@@ -14,22 +14,27 @@ type Server[T any] struct {
 	locker     sync.Mutex
 	sessions   map[string]*Session[T]
 	bufferSize int
+	codecs     *codecSet
 }
 
-// NewServer 创建服务器
-// onSession 回调在新会话建立时调用，返回 handler 用于处理消息
-func NewServer[T any]() *Server[T] {
-	return NewServerWithBuffer[T](DefaultBufferSize)
+// NewServer 创建服务器。可选 WithCodecs 配置支持的编码 (默认仅 JSON)。
+func NewServer[T any](opts ...Option) *Server[T] {
+	return NewServerWithBuffer[T](DefaultBufferSize, opts...)
 }
 
 // NewServerWithBuffer 创建服务器并设置每个 Session 的内部队列容量.
-func NewServerWithBuffer[T any](bufferSize int) *Server[T] {
+func NewServerWithBuffer[T any](bufferSize int, opts ...Option) *Server[T] {
 	if bufferSize <= 0 {
 		bufferSize = DefaultBufferSize
+	}
+	var o options
+	for _, opt := range opts {
+		opt(&o)
 	}
 	return &Server[T]{
 		sessions:   make(map[string]*Session[T]),
 		bufferSize: bufferSize,
+		codecs:     newCodecSet(o.codecs),
 	}
 }
 
@@ -50,9 +55,17 @@ func (server *Server[T]) OnConnection(conn *websocket.Conn, args any) (*Session[
 		conn.Close()
 		return nil, fmt.Errorf("client[%s] handshake failed. version=%s", req.GUID, req.Version)
 	}
+	// 协商 codec: 取客户端偏好里服务端也支持的第一个; 客户端未带偏好 (旧客户端) 回退 JSON。
+	codec, ok := server.codecs.negotiate(req.Codecs)
+	if !ok {
+		conn.SetWriteDeadline(time.Now().Add(HandshakeTimeout))
+		conn.WriteJSON(HandshakeResponse{Status: 500, Message: "no common codec"})
+		conn.Close()
+		return nil, fmt.Errorf("client[%s] handshake failed: no common codec, client offered %v", req.GUID, req.Codecs)
+	}
 	conn.SetReadDeadline(time.Time{})
 	conn.SetWriteDeadline(time.Now().Add(HandshakeTimeout))
-	if err := conn.WriteJSON(HandshakeResponse{Status: 200}); err != nil {
+	if err := conn.WriteJSON(HandshakeResponse{Status: 200, Codec: codec.Name()}); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -68,7 +81,7 @@ func (server *Server[T]) OnConnection(conn *websocket.Conn, args any) (*Session[
 		created = true
 	}
 	server.locker.Unlock()
-	if err := session.Reset(context.Background(), conn); err != nil {
+	if err := session.reset(context.Background(), conn, codec); err != nil {
 		conn.Close()
 		if created {
 			server.locker.Lock()
