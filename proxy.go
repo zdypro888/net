@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -77,6 +78,24 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 		if err != nil {
 			return nil, err
 		}
+		// rawConn 固定指向底层 TCP 连接。下面 https 分支会把 conn 重新指向 tlsConn,
+		// 而本 watcher 在另一 goroutine 读取被捕获的连接; 若直接捕获 conn 变量, ctx 在
+		// 握手成功后瞬间取消时, watcher 读 conn 会与主 goroutine 的 `conn = tlsConn` 写
+		// 并发 → net.Conn 接口值(双字)撕裂读。关闭底层 TCP 已足以中断 TLS 握手/CONNECT。
+		rawConn := conn
+		stopContextClose := context.AfterFunc(ctx, func() {
+			if err := rawConn.Close(); err != nil {
+				slog.Debug("net.Proxy context close connection failed", slog.Any("err", err))
+			}
+		})
+		defer stopContextClose()
+		closeWithContextError := func(err error) error {
+			closeErr := conn.Close()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return errors.Join(ctxErr, closeErr)
+			}
+			return errors.Join(err, closeErr)
+		}
 		if proxyURL.Scheme == "https" {
 			host := proxyURL.Hostname()
 			tlsCfg := proxy.TLSConfig
@@ -90,7 +109,7 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 			}
 			tlsConn := tls.Client(conn, tlsCfg)
 			if err := tlsConn.HandshakeContext(ctx); err != nil {
-				return nil, errors.Join(err, conn.Close())
+				return nil, closeWithContextError(err)
 			}
 			conn = tlsConn
 		}
@@ -99,7 +118,7 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 			deadline = ctxDeadline
 		}
 		if err := conn.SetDeadline(deadline); err != nil {
-			return nil, errors.Join(err, conn.Close())
+			return nil, closeWithContextError(err)
 		}
 		connectReq := (&http.Request{
 			Method: "CONNECT",
@@ -115,18 +134,26 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 			connectReq.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(auth)))
 		}
 		if err = connectReq.Write(conn); err != nil {
-			return nil, errors.Join(err, conn.Close())
+			return nil, closeWithContextError(err)
 		}
 		br := bufio.NewReader(conn)
 		var response *http.Response
 		if response, err = http.ReadResponse(br, connectReq); err != nil {
-			return nil, errors.Join(err, conn.Close())
+			return nil, closeWithContextError(err)
 		}
 		if response.StatusCode != 200 {
-			return nil, errors.Join(fmt.Errorf("connect http tunnel faild: %d", response.StatusCode), conn.Close())
+			return nil, closeWithContextError(fmt.Errorf("connect http tunnel faild: %d", response.StatusCode))
 		}
 		if err := conn.SetDeadline(time.Time{}); err != nil {
-			return nil, errors.Join(err, conn.Close())
+			return nil, closeWithContextError(err)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, errors.Join(ctxErr, conn.Close())
+		}
+		if !stopContextClose() {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, errors.Join(ctxErr, conn.Close())
+			}
 		}
 		return conn, nil
 	case "ws", "wss":

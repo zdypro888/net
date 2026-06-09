@@ -41,6 +41,33 @@ type connPacket struct {
 type pump struct {
 }
 
+func closeWebSocketOnContextDone(ctx context.Context, conn *websocket.Conn) func() {
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	var once sync.Once
+	go func() {
+		defer close(stopped)
+		select {
+		case <-ctx.Done():
+			select {
+			case <-done:
+				return
+			default:
+				if err := conn.Close(); err != nil {
+					slog.Debug("wsproxy context close websocket failed", slog.Any("err", err))
+				}
+			}
+		case <-done:
+		}
+	}()
+	return func() {
+		once.Do(func() {
+			close(done)
+		})
+		<-stopped
+	}
+}
+
 func (p *pump) copyLoop(ctx context.Context, wsConn *websocket.Conn, conn net.Conn) error {
 	var closeOnce sync.Once
 	closeBoth := func() {

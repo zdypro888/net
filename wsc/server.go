@@ -55,19 +55,22 @@ func NewServerWithBuffer[T any](bufferSize int, opts ...Option) *Server[T] {
 	}
 }
 
-func (server *Server[T]) cancelSessionCleanupLocked(guid string) {
+func (server *Server[T]) cancelSessionCleanupLocked(guid string) bool {
 	if cleanup, ok := server.cleanupTimers[guid]; ok {
 		delete(server.cleanupTimers, guid)
-		// Stop 对已触发的 timer 返回 false 也无妨: expireSession 内部还会按
-		// generation/cur 复查, 已触发的回调会因不匹配而成为 no-op。
+		// Stop 对已触发的 timer 返回 false 也无妨: 本函数已先删掉表项,
+		// 已触发但稍后才执行的回调会在 expireSession 的表项门控处 no-op。
 		cleanup.timer.Stop()
+		return true
 	}
+	return false
 }
 
-func (server *Server[T]) cancelSessionCleanup(guid string) {
+func (server *Server[T]) cancelSessionCleanup(guid string) bool {
 	server.locker.Lock()
-	server.cancelSessionCleanupLocked(guid)
+	canceled := server.cancelSessionCleanupLocked(guid)
 	server.locker.Unlock()
+	return canceled
 }
 
 // scheduleSessionCleanup 用运行时定时器堆 (time.AfterFunc) 挂一个到期回调, 等待期间
@@ -89,16 +92,20 @@ func (server *Server[T]) scheduleSessionCleanup(session *Session[T], generation 
 	server.cleanupTimers[session.guid] = cleanupTimer{generation: generation, timer: timer}
 }
 
-// expireSession 在空闲定时器到期时执行: 仅当会话仍是同一代且未被替换/移除时删除并关闭。
+// expireSession 在空闲定时器到期时执行: 仅当本 guid 的 cleanup timer 仍在表内 (未被
+// cancelSessionCleanup 取消) 且代号匹配时, 才删除并关闭会话。把会话删除嵌套进 timer 存在性
+// 判断内, 使 cancel 成为权威 —— 一个"已触发但回调尚未执行"的旧 timer 在重连取消后跑到这里
+// 会因找不到自己而成为 no-op, 无需靠预推进 connGeneration 去作废它。内层的 generation 复查
+// 仍保留: 它作废"重连成功(asyncGo 已推进代号)后才跑到的、按旧代排的 cleanup"。
 func (server *Server[T]) expireSession(session *Session[T], generation uint64) {
 	var expired *Session[T]
 	server.locker.Lock()
 	if cleanup, ok := server.cleanupTimers[session.guid]; ok && cleanup.generation == generation {
 		delete(server.cleanupTimers, session.guid)
-	}
-	if cur := server.sessions[session.guid]; cur == session && session.generation() == generation {
-		delete(server.sessions, session.guid)
-		expired = session
+		if cur := server.sessions[session.guid]; cur == session && session.generation() == generation {
+			delete(server.sessions, session.guid)
+			expired = session
+		}
 	}
 	server.locker.Unlock()
 	if expired != nil {
@@ -158,14 +165,13 @@ func (server *Server[T]) OnConnection(conn *websocket.Conn, args any) (*Session[
 	}
 	var session *Session[T]
 	var created bool
-	server.cancelSessionCleanup(req.GUID)
+	hadIdleCleanup := server.cancelSessionCleanup(req.GUID)
 	server.locker.Lock()
 	if existing, exists := server.sessions[req.GUID]; exists {
+		// 复用同 GUID 的已存在 session 重连。真正的 generation 推进只发生在 reset 成功后的
+		// asyncGo 里, 这里不预推进 —— 已触发但尚未执行的旧 idle-cleanup 回调由 expireSession
+		// 的 timer 存在性门控作废 (上面 cancelSessionCleanup 已把 timer 从表中删除)。
 		session = existing
-		// 同 GUID 重连已开始: 先推进 generation, 让任何已触发但尚未执行的
-		// 旧 idle-cleanup 回调失效。真正 reset 成功后 asyncGo 会再推进到
-		// 本次新连接的 generation。
-		session.advanceGeneration()
 		session.setOnDisconnect(server.scheduleSessionCleanup)
 	} else {
 		session = createSessionWithBuffer[T](req.GUID, server.bufferSize)
@@ -185,7 +191,12 @@ func (server *Server[T]) OnConnection(conn *websocket.Conn, args any) (*Session[
 			server.locker.Unlock()
 			return nil, errors.Join(err, closeErr, session.Close())
 		}
-		server.scheduleSessionCleanup(session, session.generation())
+		// 复用 session 的重连失败: 老连接(若仍存活)断开时其 handleMessageGo 会自行重排 cleanup;
+		// 但若重连前 session 已空闲待清理(hadIdleCleanup), 上面取消掉的那个 cleanup 必须补回,
+		// 否则这个没有活动连接的 session 永不回收。generation 未被预推进, 故按当前代补排即可。
+		if hadIdleCleanup {
+			server.scheduleSessionCleanup(session, session.generation())
+		}
 		return nil, errors.Join(err, closeErr)
 	}
 	return session, nil

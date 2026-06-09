@@ -454,6 +454,108 @@ func TestServerIdleCleanupDoesNotRemoveAdvancedGeneration(t *testing.T) {
 	}
 }
 
+// 取消 idle cleanup 即权威: 一个"已触发但回调尚未执行"的旧 cleanup 在取消之后才跑到
+// expireSession, 必须 no-op, 不能误删 session (此前由预推进 connGeneration 保证, 现由
+// expireSession 的 timer 存在性门控保证)。
+func TestServerCanceledCleanupDoesNotExpireSession(t *testing.T) {
+	server := NewServerWithBuffer[testPayload](64, WithSessionIdleTimeout(time.Hour))
+	defer checkClose(t, "server", server.Close)
+
+	session := createSessionWithBuffer[testPayload]("canceled-cleanup-guid", 64)
+	session.setOnDisconnect(server.scheduleSessionCleanup)
+	server.locker.Lock()
+	server.sessions[session.guid] = session
+	server.locker.Unlock()
+
+	generation := session.generation()
+	server.scheduleSessionCleanup(session, generation)
+	if !server.cancelSessionCleanup(session.guid) {
+		t.Fatalf("expected pending cleanup to be canceled")
+	}
+	// 模拟已触发的旧 timer 在取消之后才执行回调:
+	server.expireSession(session, generation)
+	if server.GetSession(session.guid) == nil {
+		t.Fatalf("canceled cleanup wrongly expired session")
+	}
+}
+
+// 复用 session 的重连若在空闲待清理状态下失败, 取消掉的 idle cleanup 必须被补回, 否则该
+// session 永不回收。覆盖 OnConnection 失败路径里 hadIdleCleanup 分支的不泄漏保证。
+func TestServerReconnectFailureReschedulesIdleCleanup(t *testing.T) {
+	// idleTimeout 取 200ms 而非 20ms: 初始 idle timer 若在客户端握手往返(loopback +
+	// JSON 上下行)期间就到期, 会抢在 OnConnection 取消它之前删掉 stale session, 使
+	// OnConnection 走 created 分支并返回 nil, 令断言 ErrSessionClosed 误判失败。200ms
+	// 远大于 loopback 握手耗时, 又仍落在结尾 1s 轮询窗口内, 保留 hadIdleCleanup 补排路径。
+	server := NewServerWithBuffer[testPayload](64, WithSessionIdleTimeout(200*time.Millisecond))
+	defer checkClose(t, "server", server.Close)
+
+	upgrader := websocket.Upgrader{}
+	session := createSessionWithBuffer[testPayload]("failed-reconnect-guid", 64)
+	session.setOnDisconnect(server.scheduleSessionCleanup)
+	server.locker.Lock()
+	server.sessions[session.guid] = session
+	server.locker.Unlock()
+
+	// session 已空闲挂着 idle cleanup; 重连到来会先取消它。
+	server.scheduleSessionCleanup(session, session.generation())
+	checkClose(t, "stale session", session.Close)
+
+	onConnectionErr := make(chan error, 1)
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			onConnectionErr <- err
+			return
+		}
+		_, err = server.OnConnection(conn, nil)
+		onConnectionErr <- err
+	}))
+	defer httpServer.Close()
+
+	wsConn, _, err := websocket.DefaultDialer.Dial("ws"+httpServer.URL[len("http"):], nil)
+	if err != nil {
+		t.Fatalf("Dial failed: %v", err)
+	}
+	defer checkClose(t, "client websocket", wsConn.Close)
+	if err := wsConn.WriteJSON(HandshakeRequest{
+		GUID:    session.guid,
+		Version: ProtocolVersion,
+		Codecs:  []string{CodecJSON},
+	}); err != nil {
+		t.Fatalf("WriteJSON handshake failed: %v", err)
+	}
+	var resp HandshakeResponse
+	if err := wsConn.ReadJSON(&resp); err != nil {
+		t.Fatalf("ReadJSON handshake response failed: %v", err)
+	}
+	if resp.Status != 200 {
+		t.Fatalf("handshake status = %d, want 200", resp.Status)
+	}
+	select {
+	case err := <-onConnectionErr:
+		if !errors.Is(err, ErrSessionClosed) {
+			t.Fatalf("OnConnection error = %v, want ErrSessionClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("OnConnection did not return after reset failure")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if server.GetSession(session.guid) == nil {
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			t.Fatalf("reused session was not cleaned after failed reconnect: %v", ctx.Err())
+		}
+	}
+}
+
 func TestWSConnectionCloseDoesNotBlockWhenMessageChannelIsFull(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -166,6 +166,15 @@ func (server *Server) DialContext(ctx context.Context, network, address string) 
 	if session == nil {
 		return nil, ErrNoConnection
 	}
+	stopContextClose := closeWebSocketOnContextDone(ctx, session.Conn)
+	defer stopContextClose()
+	closeWithContextError := func(err error) error {
+		closeErr := session.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return errors.Join(ctxErr, closeErr)
+		}
+		return errors.Join(err, closeErr)
+	}
 
 	// 设置超时，防止阻塞。与 client.Dial 一致直接用 deadline，不经 now+Until —
 	// 否则 ctx 即将到期时算出的负 timeout 会把可用连接的 deadline 设成过去 → 立即超时。
@@ -174,10 +183,10 @@ func (server *Server) DialContext(ctx context.Context, network, address string) 
 		deadline = d
 	}
 	if err := session.Conn.SetWriteDeadline(deadline); err != nil {
-		return nil, errors.Join(err, session.Close())
+		return nil, closeWithContextError(err)
 	}
 	if err := session.Conn.SetReadDeadline(deadline); err != nil {
-		return nil, errors.Join(err, session.Close())
+		return nil, closeWithContextError(err)
 	}
 
 	outgoing := &connPacket{
@@ -188,19 +197,19 @@ func (server *Server) DialContext(ctx context.Context, network, address string) 
 		Token:   server.Token,
 	}
 	if err := session.Conn.WriteJSON(outgoing); err != nil {
-		return nil, errors.Join(err, session.Close())
+		return nil, closeWithContextError(err)
 	}
 	var incoming connPacket
 	if err := session.Conn.ReadJSON(&incoming); err != nil {
-		return nil, errors.Join(err, session.Close())
+		return nil, closeWithContextError(err)
 	}
 
 	// 清除超时，后续由 copyLoop 管理
 	if err := session.Conn.SetWriteDeadline(time.Time{}); err != nil {
-		return nil, errors.Join(err, session.Close())
+		return nil, closeWithContextError(err)
 	}
 	if err := session.Conn.SetReadDeadline(time.Time{}); err != nil {
-		return nil, errors.Join(err, session.Close())
+		return nil, closeWithContextError(err)
 	}
 
 	if incoming.Method != MethodSlaverDialoutSuccess {
@@ -209,6 +218,14 @@ func (server *Server) DialContext(ctx context.Context, network, address string) 
 			return nil, errors.Join(errors.New(incoming.Error), closeErr)
 		}
 		return nil, errors.Join(errors.New("dial failed"), closeErr)
+	}
+	// 先停掉 ctx watcher 并 join(stopContextClose 内部 <-stopped 会等 watcher 退出),
+	// 再复查 ctx。否则 watcher 可能在本函数把 session 交还给调用方之后才触发 Close,
+	// 迟到关闭已返回的连接, 让调用方拿到 (已关闭conn, nil)。与 proxy.go 目的相同但机制不同:
+	// proxy.go 用 context.AfterFunc(stop 不 join) 故靠末尾复查 ctx 兜底, 此处 helper 自带 join。
+	stopContextClose()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, errors.Join(ctxErr, session.Close())
 	}
 
 	return session, nil

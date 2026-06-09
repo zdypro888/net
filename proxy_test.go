@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestProxyDialContextUsesTLSForHTTPSProxy(t *testing.T) {
@@ -58,6 +59,42 @@ func TestProxyDialContextBasicAuthUsesDecodedUserinfo(t *testing.T) {
 	req := <-requests
 	if got := req.Header.Get("Proxy-Authorization"); got != "Basic dXNlcjpwQHNz" {
 		t.Fatalf("Proxy-Authorization = %q, want decoded userinfo", got)
+	}
+}
+
+func TestProxyDialContextCancelWhileWaitingForConnectResponse(t *testing.T) {
+	requestReceived := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(requestReceived)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	proxy := &Proxy{Address: "http://" + server.Listener.Addr().String()}
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := proxy.DialContext(ctx, "tcp", "example.com:443")
+		if conn != nil {
+			checkClose(t, "proxy conn", conn.Close)
+		}
+		errCh <- err
+	}()
+
+	select {
+	case <-requestReceived:
+	case <-time.After(time.Second):
+		t.Fatal("proxy did not receive CONNECT request")
+	}
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("DialContext error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DialContext did not return after context cancellation")
 	}
 }
 

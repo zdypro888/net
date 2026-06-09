@@ -58,6 +58,7 @@ func (slaver *Slaver) Run(ctx context.Context, addr string) error {
 			}
 			continue
 		}
+		stopContextClose := closeWebSocketOnContextDone(ctx, wsConn)
 		wsConn.SetReadLimit(MaxMessageSize)
 		incoming := &connPacket{
 			Id:     slaver.Id,
@@ -65,6 +66,16 @@ func (slaver *Slaver) Run(ctx context.Context, addr string) error {
 			Token:  slaver.Token,
 		}
 		if err := wsConn.WriteJSON(incoming); err != nil {
+			// stopContextClose() 可能抢在 watcher 关连接前关掉 done, 使 watcher 走
+			// <-done 分支直接退出而不 Close; 故此处确定要返回时补一次 best-effort
+			// Close, 防 wsConn 两边都不关的极窄泄漏 (Close 幂等, 与 watcher 双关无害)。
+			stopContextClose()
+			if ctx.Err() != nil {
+				if closeErr := wsConn.Close(); closeErr != nil {
+					slog.Debug("wsproxy slaver close after context cancellation failed", slog.Any("err", closeErr))
+				}
+				return ctx.Err()
+			}
 			slog.Warn("wsproxy slaver register write failed",
 				slog.String("addr", addr), slog.Any("err", err))
 			if closeErr := wsConn.Close(); closeErr != nil {
@@ -78,6 +89,14 @@ func (slaver *Slaver) Run(ctx context.Context, addr string) error {
 		}
 		var outgoing connPacket
 		if err := wsConn.ReadJSON(&outgoing); err != nil {
+			// 同上: stopContextClose 抢先关 done 后 watcher 可能不 Close, 补 best-effort Close。
+			stopContextClose()
+			if ctx.Err() != nil {
+				if closeErr := wsConn.Close(); closeErr != nil {
+					slog.Debug("wsproxy slaver close after context cancellation failed", slog.Any("err", closeErr))
+				}
+				return ctx.Err()
+			}
 			slog.Warn("wsproxy slaver read dial-request failed",
 				slog.String("addr", addr), slog.Any("err", err))
 			if closeErr := wsConn.Close(); closeErr != nil {
@@ -90,6 +109,7 @@ func (slaver *Slaver) Run(ctx context.Context, addr string) error {
 			continue
 		}
 		if outgoing.Method != MethodSlaverDialout {
+			stopContextClose()
 			slog.Warn("wsproxy slaver unexpected method from server",
 				slog.String("addr", addr), slog.Int("method", int(outgoing.Method)))
 			if closeErr := wsConn.Close(); closeErr != nil {
@@ -101,14 +121,30 @@ func (slaver *Slaver) Run(ctx context.Context, addr string) error {
 			}
 			continue
 		}
+		if ctx.Err() != nil {
+			stopContextClose()
+			if closeErr := wsConn.Close(); closeErr != nil {
+				slog.Warn("wsproxy slaver close after context cancellation failed", slog.Any("err", closeErr))
+			}
+			return ctx.Err()
+		}
+		stopContextClose()
 		go slaver.dialContext(ctx, wsConn, outgoing.Network, outgoing.Address)
 	}
 }
 
 func (slaver *Slaver) dialContext(ctx context.Context, wsConn *websocket.Conn, network, address string) {
+	stopContextClose := closeWebSocketOnContextDone(ctx, wsConn)
+	defer stopContextClose()
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, network, address)
 	if err != nil {
+		if ctx.Err() != nil {
+			if closeErr := wsConn.Close(); closeErr != nil {
+				slog.Warn("wsproxy slaver close after context cancellation failed", slog.Any("err", closeErr))
+			}
+			return
+		}
 		if writeErr := wsConn.WriteJSON(&connPacket{
 			Id:     slaver.Id,
 			Method: MethodSlaverDialoutError, // 连接错误
@@ -135,6 +171,13 @@ func (slaver *Slaver) dialContext(ctx context.Context, wsConn *websocket.Conn, n
 		}
 		return
 	}
+	if ctx.Err() != nil {
+		if closeErr := errors.Join(wsConn.Close(), conn.Close()); closeErr != nil {
+			slog.Warn("wsproxy slaver close after context cancellation failed", slog.Any("err", closeErr))
+		}
+		return
+	}
+	stopContextClose()
 	p := &pump{}
 	if err := p.copyLoop(ctx, wsConn, conn); err != nil {
 		slog.Warn("wsproxy slaver copy loop failed", slog.Any("err", err))

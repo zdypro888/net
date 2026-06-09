@@ -182,6 +182,108 @@ func TestServerCloseAllCancelsInflightDialout(t *testing.T) {
 	}
 }
 
+func TestServerDialContextCancelWhileWaitingForSlaverReply(t *testing.T) {
+	proxyServer := NewServer()
+	upgrader := websocket.Upgrader{}
+	slaverRequest := make(chan struct{})
+
+	slaverServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer checkClose(t, "slaver server websocket", conn.Close)
+		var req connPacket
+		if err := conn.ReadJSON(&req); err != nil {
+			return
+		}
+		close(slaverRequest)
+		messageType, message, err := conn.ReadMessage()
+		if err == nil {
+			t.Logf("slaver server read unexpected message before close: type=%d bytes=%d", messageType, len(message))
+		}
+	}))
+	defer slaverServer.Close()
+
+	slaverConn, _, err := websocket.DefaultDialer.Dial("ws"+slaverServer.URL[len("http"):], nil)
+	if err != nil {
+		t.Fatalf("slaver dial failed: %v", err)
+	}
+	proxyServer.locker.Lock()
+	proxyServer.sessions.PushBack(&Session{Id: "slaver-cancel", Conn: slaverConn})
+	proxyServer.locker.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := proxyServer.DialContext(ctx, "tcp", "example.com:443")
+		if conn != nil {
+			checkClose(t, "unexpected dial conn", conn.Close)
+		}
+		errCh <- err
+	}()
+
+	select {
+	case <-slaverRequest:
+	case <-time.After(time.Second):
+		t.Fatal("server never sent slaver dial request")
+	}
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("DialContext error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DialContext did not return after context cancellation")
+	}
+}
+
+func TestSlaverRunReturnsOnContextCancelWhileWaitingForDialRequest(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	registered := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer checkClose(t, "server websocket", conn.Close)
+		var req connPacket
+		if err := conn.ReadJSON(&req); err != nil {
+			return
+		}
+		close(registered)
+		messageType, message, err := conn.ReadMessage()
+		if err == nil {
+			t.Logf("server read unexpected message before close: type=%d bytes=%d", messageType, len(message))
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- NewSlaver().Run(ctx, "ws"+server.URL[len("http"):])
+	}()
+
+	select {
+	case <-registered:
+	case <-time.After(time.Second):
+		t.Fatal("slaver did not register")
+	}
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Slaver.Run did not return after context cancellation")
+	}
+}
+
 func TestServerTokenRequiredForRegistration(t *testing.T) {
 	proxyServer := NewServer()
 	proxyServer.Token = "secret"

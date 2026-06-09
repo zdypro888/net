@@ -1,6 +1,7 @@
 package cookiejar
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/url"
 	"strings"
@@ -57,5 +58,55 @@ func TestZeroValueJarSetCookiesNilEntries(t *testing.T) {
 	}})
 	if got := jar.Cookies(foo); len(got) != 1 || got[0].Name != "host-only" {
 		t.Fatalf("nil-Entries jar did not store host-only cookie: got %v", got)
+	}
+}
+
+func TestJarSnapshotDeepCopiesPersistentFields(t *testing.T) {
+	jar, err := New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := mustParseURL(t, "https://example.com/")
+	jar.SetCookies(u, []*http.Cookie{{Name: "a", Value: "1"}})
+
+	snapshot := jar.Snapshot()
+	jar.SetCookies(u, []*http.Cookie{{Name: "b", Value: "2"}})
+	if snapshot.NextSeqNum != 1 {
+		t.Fatalf("snapshot NextSeqNum = %d, want 1", snapshot.NextSeqNum)
+	}
+	if len(snapshot.Entries) != 1 {
+		t.Fatalf("snapshot entries len = %d, want 1", len(snapshot.Entries))
+	}
+	for _, submap := range snapshot.Entries {
+		if len(submap) != 1 {
+			t.Fatalf("snapshot submap len = %d, want 1", len(submap))
+		}
+		for id, entry := range submap {
+			entry.Value = "mutated"
+			submap[id] = entry
+		}
+	}
+	if got := jar.Cookies(u); len(got) != 2 {
+		t.Fatalf("snapshot mutation affected jar or second cookie missing: got %v", got)
+	}
+}
+
+func TestJarMarshalJSONUsesLockedSnapshot(t *testing.T) {
+	jar, err := New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jar.SetCookies(mustParseURL(t, "https://example.com/"), []*http.Cookie{{Name: "a", Value: "1"}})
+
+	data, err := json.Marshal(jar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshot JarSnapshot
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.NextSeqNum != 1 || len(snapshot.Entries) != 1 {
+		t.Fatalf("unexpected JSON snapshot: seq=%d entries=%d raw=%s", snapshot.NextSeqNum, len(snapshot.Entries), data)
 	}
 }

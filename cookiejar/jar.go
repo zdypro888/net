@@ -6,8 +6,10 @@
 package cookiejar
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -72,6 +74,16 @@ type Jar struct {
 	NextSeqNum uint64 `bson:"seqnum" json:"seqnum" xorm:"seqnum int" plist:"seqnum"`
 }
 
+// JarSnapshot 是 Jar 持久化字段的加锁快照。Jar 常作为字段嵌入业务结构体被整体序列化:
+// json 与 gorm(serializer:json) 经 Jar.MarshalJSON 自动走加锁快照, 调用方无需介入; 但
+// bson / xorm 等编码器是直接反射读取 Jar.Entries, 不持锁 —— 若在业务流量并发读写 cookie
+// 期间用这些编码器持久化 jar, 调用方应改为序列化 Snapshot() 的返回值, 避免与 SetCookies/
+// Cookies 的内部写入产生 data race。
+type JarSnapshot struct {
+	Entries    map[string]map[string]Entry `bson:"entries" json:"entries" xorm:"entries text" plist:"entries"`
+	NextSeqNum uint64                      `bson:"seqnum" json:"seqnum" xorm:"seqnum int" plist:"seqnum"`
+}
+
 // New returns a new cookie jar. A nil *Options is equivalent to a zero
 // Options.
 func New(o *Options) (*Jar, error) {
@@ -82,6 +94,32 @@ func New(o *Options) (*Jar, error) {
 		jar.psList = o.PublicSuffixList
 	}
 	return jar, nil
+}
+
+// Snapshot 返回 Jar 可持久化字段的深拷贝。返回值与 Jar 后续变更互不影响。
+func (j *Jar) Snapshot() JarSnapshot {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	var entries map[string]map[string]Entry
+	if j.Entries != nil {
+		entries = make(map[string]map[string]Entry, len(j.Entries))
+		for key, submap := range j.Entries {
+			copied := make(map[string]Entry, len(submap))
+			maps.Copy(copied, submap)
+			entries[key] = copied
+		}
+	}
+	return JarSnapshot{
+		Entries:    entries,
+		NextSeqNum: j.NextSeqNum,
+	}
+}
+
+// MarshalJSON 让 json (以及 gorm serializer:json) 在序列化嵌入 Jar 的业务结构体时走加锁
+// 深拷贝, 使并发 cookie 流量下的持久化也无 data race。输出字节与直接反射 Jar 字段一致
+// (JarSnapshot 复用同名 json tag), 故反序列化仍走默认反射 + Restore, 无需自定义 UnmarshalJSON。
+func (j *Jar) MarshalJSON() ([]byte, error) {
+	return json.Marshal(j.Snapshot())
 }
 
 // Restore 在从存储反序列化得到 Jar 后恢复不参与序列化的瞬态字段: psList(从不序列化)
