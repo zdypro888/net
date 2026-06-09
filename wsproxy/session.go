@@ -9,7 +9,7 @@ import (
 
 // Session 表示一个代理会话, 需要实现 net.Conn 接口
 type Session struct {
-	Id     int64
+	Id     string
 	Conn   *websocket.Conn
 	buffer []byte // 缓存未读完的数据
 }

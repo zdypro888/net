@@ -6,17 +6,18 @@ import (
 	"net"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
 type Slaver struct {
-	Id    int64
+	Id    string
 	Token string
 }
 
 func NewSlaver() *Slaver {
 	return &Slaver{
-		Id: idCSeq.Add(1),
+		Id: uuid.New().String(),
 	}
 }
 

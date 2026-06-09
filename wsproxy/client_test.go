@@ -122,7 +122,7 @@ func TestServerCloseAllCancelsInflightDialout(t *testing.T) {
 	defer slaverConn.Close()
 	// 直接 push 到 sessions 池, 跳过 OnConnection 握手.
 	proxyServer.locker.Lock()
-	proxyServer.sessions.PushBack(&Session{Id: 99, Conn: slaverConn})
+	proxyServer.sessions.PushBack(&Session{Id: "slaver-99", Conn: slaverConn})
 	proxyServer.locker.Unlock()
 
 	// 起 OnConnection 入口 server.
@@ -142,7 +142,7 @@ func TestServerCloseAllCancelsInflightDialout(t *testing.T) {
 	}
 	defer clientWS.Close()
 	if err := clientWS.WriteJSON(&connPacket{
-		Id:      1,
+		Id:      "client-1",
 		Method:  MethodSlaverDialout,
 		Network: "tcp",
 		Address: "127.0.0.1:1", // 拨号会失败, 但 onClientDialout 在 DialContext 失败前
@@ -192,7 +192,7 @@ func TestServerTokenRequiredForRegistration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Dial failed: %v", err)
 		}
-		_ = conn.WriteJSON(&connPacket{Id: 1, Method: MethodRegisterSlaver, Token: token})
+		_ = conn.WriteJSON(&connPacket{Id: "slaver-1", Method: MethodRegisterSlaver, Token: token})
 		return conn
 	}
 	waitForCount := func(want int) bool {

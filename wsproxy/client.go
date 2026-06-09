@@ -6,20 +6,21 @@ import (
 	"net"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
 const dialHandshakeTimeout = 30 * time.Second
 
 type Client struct {
-	Id     int64
+	Id     string
 	WSAddr string
 	Token  string
 }
 
 func NewClient(wsAddr string) *Client {
 	return &Client{
-		Id:     idCSeq.Add(1),
+		Id:     uuid.New().String(),
 		WSAddr: wsAddr,
 	}
 }

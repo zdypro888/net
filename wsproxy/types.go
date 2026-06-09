@@ -4,12 +4,9 @@ import (
 	"context"
 	"net"
 	"sync"
-	"sync/atomic"
 
 	"github.com/gorilla/websocket"
 )
-
-var idCSeq atomic.Int64
 
 type MethodType int
 
@@ -24,7 +21,10 @@ const (
 )
 
 type connPacket struct {
-	Id      int64      `json:"i"`
+	// Id 全局唯一会话标识. 改为 string + UUID: 旧实现是进程内 atomic.Int64 自增,
+	// 多副本/多进程下会碰撞. 用 github.com/google/uuid 保证跨进程唯一 (wsc 同款,
+	// 不引入新依赖/不造轮子). wire tag "i" 不变, 仅类型 int64→string.
+	Id      string     `json:"i"`
 	Method  MethodType `json:"m"`
 	Network string     `json:"n,omitempty"`
 	Address string     `json:"a,omitempty"`

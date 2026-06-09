@@ -15,7 +15,6 @@ import (
 )
 
 var ErrNoConnection = errors.New("no available connection")
-var ErrServerClosed = errors.New("wsproxy server closed")
 
 // ServerStats 给 oncall 看 wsproxy 池健康度.
 type ServerStats struct {
@@ -133,19 +132,30 @@ func (server *Server) popSession() *Session {
 
 // DialContext 通过代理连接到目标地址
 func (server *Server) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	// 已过期的 ctx 不应消耗池中会话: popSession 取出的连接只用一次, 直接早返回。
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// popSession 已经从池中移除了会话，每个连接只用一次
 	session := server.popSession()
 	if session == nil {
 		return nil, ErrNoConnection
 	}
 
-	// 设置超时，防止阻塞
-	timeout := 30 * time.Second
-	if deadline, ok := ctx.Deadline(); ok {
-		timeout = time.Until(deadline)
+	// 设置超时，防止阻塞。与 client.Dial 一致直接用 deadline，不经 now+Until —
+	// 否则 ctx 即将到期时算出的负 timeout 会把可用连接的 deadline 设成过去 → 立即超时。
+	deadline := time.Now().Add(dialHandshakeTimeout)
+	if d, ok := ctx.Deadline(); ok {
+		deadline = d
 	}
-	session.Conn.SetWriteDeadline(time.Now().Add(timeout))
-	session.Conn.SetReadDeadline(time.Now().Add(timeout))
+	if err := session.Conn.SetWriteDeadline(deadline); err != nil {
+		session.Close()
+		return nil, err
+	}
+	if err := session.Conn.SetReadDeadline(deadline); err != nil {
+		session.Close()
+		return nil, err
+	}
 
 	outgoing := &connPacket{
 		Id:      session.Id,
