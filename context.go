@@ -31,16 +31,14 @@ func FromContext(ctx context.Context) *HTTP {
 
 func SetProxy(ctx context.Context, proxy func(*http.Request) (*url.URL, error), storeCache bool) error {
 	if h := FromContext(ctx); h != nil {
-		h.ConfigureProxy(proxy, storeCache)
-		return nil
+		return h.ConfigureProxy(proxy, storeCache)
 	}
 	return ErrHTTPNotInContext
 }
 
 func SetProxyDial(ctx context.Context, dialContext func(ctx context.Context, network, addr string) (net.Conn, error), storeCache bool) error {
 	if h := FromContext(ctx); h != nil {
-		h.ConfigureProxyDial(dialContext, storeCache)
-		return nil
+		return h.ConfigureProxyDial(dialContext, storeCache)
 	}
 	return ErrHTTPNotInContext
 }

@@ -291,7 +291,9 @@ func (h *HTTP) requestMethodDo(ctx context.Context, url string, method string, h
 }
 
 func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, headers http.Header, body io.Reader) (*Response, error) {
-	if h.AutoRetry == 0 {
+	// AutoRetry <= 0 表示不重试, 单发一次. 旧实现只判 ==0, 负值会落进下方
+	// for i:=total;i>0 循环体一次不执行, 返回 (nil,nil) 让 caller NPE; 这里收敛.
+	if h.AutoRetry <= 0 {
 		return h.requestMethodDo(ctx, url, method, headers, body)
 	}
 	var err error

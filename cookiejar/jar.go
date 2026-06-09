@@ -58,10 +58,10 @@ type Options struct {
 
 // Jar implements the http.CookieJar interface from the net/http package.
 type Jar struct {
-	psList PublicSuffixList `bson:"-" json:"-"`
+	psList PublicSuffixList
 
 	// mu locks the remaining fields.
-	mu sync.Mutex `bson:"-" json:"-"`
+	mu sync.Mutex
 
 	// Entries is a set of Entries, keyed by their eTLD+1 and subkeyed by
 	// their name/domain/path.

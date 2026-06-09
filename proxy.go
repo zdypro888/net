@@ -42,7 +42,7 @@ func (proxy *Proxy) resolve() (*url.URL, error) {
 	return url.Parse(address)
 }
 
-// GetProxyURL 取得代理地址
+// ProxyURL 取得代理地址 (实现 http.Transport.Proxy 的签名).
 func (proxy *Proxy) ProxyURL(req *http.Request) (*url.URL, error) {
 	return proxy.resolve()
 }
