@@ -16,6 +16,11 @@ const (
 	WriteTimeout     = 10 * time.Second
 	MaxMessageSize   = 32 << 20
 
+	// DefaultSessionIdleTimeout 是服务端 session 在底层连接断开后的默认保留窗口.
+	// 客户端自动重连会复用同一个 GUID/session; 不能一断线就删除, 否则会破坏重连语义.
+	// 但无限保留会让恶意/异常新 GUID 堆满 server.sessions, 因此默认给一个清理窗口.
+	DefaultSessionIdleTimeout = 5 * time.Minute
+
 	// ReadIdleTimeout 读端静默上限. 这段时间内若没收到对方任何消息 (含心跳)
 	// 视为对端僵死, ReadMessage 立即返 net.ErrDeadlineExceeded → 上层关连接 + 重连.
 	//
@@ -34,8 +39,9 @@ var ErrSessionClosed = errors.New("session closed")
 type HandshakeRequest struct {
 	GUID    string `json:"guid"`
 	Version string `json:"version"`
-	// Codecs 客户端支持的 codec 名字, 按优先级从高到低排列. 旧客户端不带此字段,
-	// 服务端按 JSON 处理 (向后兼容). 协商逻辑见 codec.go。
+	// Codecs 客户端支持的 codec 名字, 按优先级从高到低排列. 同协议版本客户端
+	// 未带此字段时服务端按 JSON 处理; 不同 ProtocolVersion 仍会被握手拒绝.
+	// 协商逻辑见 codec.go。
 	Codecs []string `json:"codecs,omitempty"`
 }
 
@@ -43,7 +49,7 @@ type HandshakeRequest struct {
 type HandshakeResponse struct {
 	Status  int    `json:"status"`
 	Message string `json:"message,omitempty"`
-	// Codec 服务端最终选定的 codec 名字. 为空表示对端是旧服务端 (不支持协商),
+	// Codec 服务端最终选定的 codec 名字. 为空表示对端未返回协商结果,
 	// 客户端回退到 JSON。
 	Codec string `json:"codec,omitempty"`
 }

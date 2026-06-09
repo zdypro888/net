@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/andybalholm/brotli"
@@ -95,6 +96,32 @@ func NewReader(data []byte) io.Reader {
 		return nil
 	}
 	return bytes.NewReader(data)
+}
+
+func safeURLForLog(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<invalid-url>"
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
+}
+
+func safeErrorForLog(requestURL string, err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	if requestURL != "" {
+		msg = strings.ReplaceAll(msg, requestURL, safeURLForLog(requestURL))
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.URL != "" {
+		msg = strings.ReplaceAll(msg, urlErr.URL, safeURLForLog(urlErr.URL))
+	}
+	return msg
 }
 
 type HTTP struct {
@@ -376,9 +403,9 @@ func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, hea
 		// OPS-2: retry 耗尽才 warn 一次, 避免 retry 中途风暴 log.
 		slog.Warn("net.HTTP RequestMethod exhausted retries",
 			slog.String("method", method),
-			slog.String("url", url),
+			slog.String("url", safeURLForLog(url)),
 			slog.Int("retries", total),
-			slog.Any("err", err))
+			slog.String("err", safeErrorForLog(url, err)))
 	}
 	return response, err
 }

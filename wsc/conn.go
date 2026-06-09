@@ -64,10 +64,10 @@ func (c *wsconnection[T]) channel() <-chan *messagechannel[T] {
 func (c *wsconnection[T]) Close(ctx context.Context) error {
 	var err error
 	c.closeMux.Do(func() {
-		err = c.conn.Close()
 		// 先置 closed 标志: Handle 在见到 closed=true 后不再 send, 避免与
 		// close(msgchan) 之后的 send 撞上 panic.
 		c.closed.Store(true)
+		err = c.conn.Close()
 		// best-effort: 在 close 前尝试投递一个 Closed=true 包给 reader 做
 		// reconnect 提示, 拥塞或 ctx 取消时就跳过.
 		select {

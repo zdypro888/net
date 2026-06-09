@@ -61,6 +61,8 @@ type Session[T any] struct {
 	// 与其它字段同瞬一致).
 	lastWriteError atomic.Pointer[error]
 	wsconn         atomic.Pointer[wsconnection[T]]
+	connGeneration atomic.Uint64
+	onDisconnect   atomic.Pointer[func(session *Session[T], generation uint64)]
 }
 
 // Stats 拍 session 当前队列占用 + 观察性计数器. 不持锁 — Len/Cap 是 chan
@@ -111,19 +113,40 @@ func (s *Session[T]) closed() bool {
 	return s.asyncChan == nil
 }
 
+func (s *Session[T]) generation() uint64 {
+	return s.connGeneration.Load()
+}
+
+func (s *Session[T]) advanceGeneration() uint64 {
+	return s.connGeneration.Add(1)
+}
+
+func (s *Session[T]) setOnDisconnect(fn func(session *Session[T], generation uint64)) {
+	s.onDisconnect.Store(&fn)
+}
+
+func (s *Session[T]) notifyDisconnect(generation uint64) {
+	if fn := s.onDisconnect.Load(); fn != nil {
+		(*fn)(s, generation)
+	}
+}
+
 func createSessionWithBuffer[T any](guid string, bufferSize int) *Session[T] {
 	if bufferSize <= 0 {
 		bufferSize = DefaultBufferSize
 	}
+	handchan := make(chan *Packet[T], bufferSize)
+	stopChan := make(chan struct{})
+	asyncChan := make(chan *asyncInfo[T], bufferSize)
 	s := &Session[T]{
 		guid:       guid,
 		bufferSize: bufferSize,
-		handchan:   make(chan *Packet[T], bufferSize),
-		stopChan:   make(chan struct{}),
+		handchan:   handchan,
+		stopChan:   stopChan,
+		asyncChan:  asyncChan,
 	}
-	s.asyncChan = make(chan *asyncInfo[T], bufferSize)
 	// Go 1.25 WaitGroup.Go 自动 Add(1)/Done, 比显式 Add+defer Done 少一个易错点.
-	s.waiter.Go(func() { s.asyncGo(s.asyncChan, s.handchan, s.stopChan) })
+	s.waiter.Go(func() { s.asyncGo(asyncChan, handchan, stopChan) })
 	return s
 }
 
@@ -161,16 +184,26 @@ func (info *asyncInfo[T]) Response(msg *Message[T], err error) {
 	}
 }
 
-func (s *Session[T]) handleMessageGo(handchan chan *Packet[T], msgchan <-chan *messagechannel[T], stopChan chan struct{}) {
+func (s *Session[T]) handleMessageGo(handchan chan *Packet[T], msgchan <-chan *messagechannel[T], stopChan chan struct{}, generation uint64) {
 	running := true
+	disconnected := false
+	defer func() {
+		if disconnected {
+			s.notifyDisconnect(generation)
+		}
+	}()
 	for running {
 		select {
 		case <-stopChan:
 			running = false
 		case msg, ok := <-msgchan:
 			if !ok {
+				disconnected = true
 				running = false
 			} else {
+				if msg.Closed {
+					disconnected = true
+				}
 				packet := msg.ToPacket()
 				// 快路径: handchan 有空位立即写入.
 				select {
@@ -224,9 +257,10 @@ func (s *Session[T]) asyncGo(asyncChan <-chan *asyncInfo[T], handchan chan *Pack
 		case asyncCommandConn: // 设置连接
 			// wsConn 所有权转移到 rawconn, rawconn.Close 时会关闭连接
 			wsConn := createWSConnection[T](info.Conn, s.bufferSize, info.Codec)
+			generation := s.advanceGeneration()
 			s.wsconn.Store(wsConn)
 			// Go 1.25 WaitGroup.Go.
-			recvWaiter.Go(func() { s.handleMessageGo(handchan, wsConn.channel(), stopChan) })
+			recvWaiter.Go(func() { s.handleMessageGo(handchan, wsConn.channel(), stopChan, generation) })
 			rawconn.ResetUnsafe(context.Background(), wsConn)
 			if info.ready != nil {
 				info.ready <- nil

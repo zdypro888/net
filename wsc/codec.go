@@ -2,6 +2,7 @@ package wsc
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -12,7 +13,8 @@ const CodecJSON = "json"
 // Codec 把消息信封序列化为单个 WebSocket 帧, 以及反向解析。实现必须并发安全。
 //
 // 默认实现是 JSONCodec; Protocol Buffers codec 在 protocodec 子包中。codec 在握手
-// 阶段协商 (见 HandshakeRequest.Codecs), 因此一个服务端可同时服务 JSON 与 proto 客户端。
+// 阶段协商 (见 HandshakeRequest.Codecs), 因此一个服务端可同时服务同协议版本的
+// JSON 与 proto 客户端。
 type Codec interface {
 	// Name 是握手协商时交换的标识符。
 	Name() string
@@ -51,8 +53,9 @@ var defaultCodec Codec = JSONCodec{}
 type Option func(*options)
 
 type options struct {
-	codecs         []Codec
-	maxMessageSize int64
+	codecs             []Codec
+	maxMessageSize     int64
+	sessionIdleTimeout *time.Duration
 }
 
 // resolvedMaxMessageSize 返回配置的入站消息上限, 未配置(<=0)时回退默认 MaxMessageSize。
@@ -74,6 +77,12 @@ func WithCodecs(codecs ...Codec) Option {
 // <=0 使用默认 MaxMessageSize。Client 生效于拨号建立的连接, Server 生效于接受的连接。
 func WithMaxMessageSize(n int64) Option {
 	return func(o *options) { o.maxMessageSize = n }
+}
+
+// WithSessionIdleTimeout 设置 Server 在底层连接断开后保留 session 的时间.
+// timeout <= 0 表示不自动清理断线 session. Client 会忽略该选项。
+func WithSessionIdleTimeout(timeout time.Duration) Option {
+	return func(o *options) { o.sessionIdleTimeout = &timeout }
 }
 
 // codecSet 按优先级保存已配置的 codec, 并提供按名查找与协商。

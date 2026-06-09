@@ -362,6 +362,98 @@ oldHandleClosed:
 	}
 }
 
+func TestServerRemovesDisconnectedSessionAfterIdleTimeout(t *testing.T) {
+	server := NewServerWithBuffer[testPayload](64, WithSessionIdleTimeout(20*time.Millisecond))
+	upgrader := websocket.Upgrader{}
+	sessionCh := make(chan *Session[testPayload], 1)
+	errCh := make(chan error, 1)
+
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		session, err := server.OnConnection(conn, nil)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		sessionCh <- session
+	}))
+	defer httpServer.Close()
+	defer checkClose(t, "server", server.Close)
+
+	client := NewClientWithBuffer[testPayload]("ws"+httpServer.URL[len("http"):], 64)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	var session *Session[testPayload]
+	select {
+	case session = <-sessionCh:
+	case err := <-errCh:
+		t.Fatalf("server connection failed: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for session: %v", ctx.Err())
+	}
+	guid := session.GUID()
+	if server.GetSession(guid) == nil {
+		t.Fatalf("server did not retain connected session %q", guid)
+	}
+
+	checkClose(t, "client", client.Close)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if server.GetSession(guid) == nil {
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			t.Fatalf("session %q was not removed after idle timeout: %v", guid, ctx.Err())
+		}
+	}
+}
+
+func TestServerIdleCleanupDoesNotRemoveAdvancedGeneration(t *testing.T) {
+	server := NewServerWithBuffer[testPayload](64, WithSessionIdleTimeout(20*time.Millisecond))
+	defer checkClose(t, "server", server.Close)
+
+	session := createSessionWithBuffer[testPayload]("reconnecting-guid", 64)
+	session.setOnDisconnect(server.scheduleSessionCleanup)
+	server.locker.Lock()
+	server.sessions[session.guid] = session
+	server.locker.Unlock()
+
+	oldGeneration := session.generation()
+	server.scheduleSessionCleanup(session, oldGeneration)
+	session.advanceGeneration()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if server.GetSession(session.guid) == nil {
+			t.Fatalf("stale idle cleanup removed advanced-generation session")
+		}
+		server.locker.Lock()
+		_, pendingCleanup := server.cleanupTimers[session.guid]
+		server.locker.Unlock()
+		if !pendingCleanup {
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			t.Fatalf("stale idle cleanup timer was not cleared: %v", ctx.Err())
+		}
+	}
+}
+
 func TestWSConnectionCloseDoesNotBlockWhenMessageChannelIsFull(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

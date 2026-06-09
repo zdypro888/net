@@ -2,10 +2,38 @@ package net
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	stdurl "net/url"
+	"strings"
 	"testing"
 )
+
+func TestSafeURLForLogRedactsSensitiveParts(t *testing.T) {
+	got := safeURLForLog("https://user:pass@example.com:8443/path/to?q=token&signature=secret#fragment")
+	want := "https://example.com:8443/path/to"
+	if got != want {
+		t.Fatalf("safeURLForLog() = %q, want %q", got, want)
+	}
+}
+
+func TestSafeErrorForLogRedactsURLErrorURL(t *testing.T) {
+	rawURL := "https://user:pass@example.com/path?q=token&signature=secret#fragment"
+	got := safeErrorForLog(rawURL, &stdurl.Error{
+		Op:  "Get",
+		URL: rawURL,
+		Err: errors.New("dial failed"),
+	})
+	for _, secret := range []string{"user:pass", "token", "signature=secret", "fragment"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("safeErrorForLog() leaked %q in %q", secret, got)
+		}
+	}
+	if !strings.Contains(got, "https://example.com/path") {
+		t.Fatalf("safeErrorForLog() = %q, want sanitized URL", got)
+	}
+}
 
 // TestRequestMethodNegativeAutoRetryDoesNotReturnNilNil 是 D-P2-2 的回归测试.
 // 旧实现 RequestMethod 仅判 AutoRetry==0; 负值会落进 for i:=total;i>0 循环体
