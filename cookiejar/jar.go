@@ -299,6 +299,11 @@ func (j *Jar) setCookies(u *url.URL, cookies []*http.Cookie, now time.Time) {
 		if len(submap) == 0 {
 			delete(j.Entries, key)
 		} else {
+			// 反序列化得到的 Jar 其 Entries 可能为 nil(空 jar 持久化后), 写入前惰性初始化,
+			// 避免 nil map 赋值 panic. delete 对 nil map 是安全 no-op, 故只需护 else 分支.
+			if j.Entries == nil {
+				j.Entries = make(map[string]map[string]Entry)
+			}
 			j.Entries[key] = submap
 		}
 	}

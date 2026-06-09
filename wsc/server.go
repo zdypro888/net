@@ -2,7 +2,9 @@ package wsc
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -42,34 +44,48 @@ func NewServerWithBuffer[T any](bufferSize int, opts ...Option) *Server[T] {
 // args 是可选的额外参数
 // 返回 Session，通过 session.Handle() 获取消息通道
 func (server *Server[T]) OnConnection(conn *websocket.Conn, args any) (*Session[T], error) {
-	conn.SetReadDeadline(time.Now().Add(HandshakeTimeout))
+	if err := conn.SetReadDeadline(time.Now().Add(HandshakeTimeout)); err != nil {
+		return nil, errors.Join(err, conn.Close())
+	}
 	var req HandshakeRequest
 	if err := conn.ReadJSON(&req); err != nil {
-		conn.Close()
-		return nil, err
+		return nil, errors.Join(err, conn.Close())
 	}
 	// 校验握手请求
 	if req.GUID == "" || req.Version != ProtocolVersion {
-		conn.SetWriteDeadline(time.Now().Add(HandshakeTimeout))
-		conn.WriteJSON(HandshakeResponse{Status: 500, Message: "invalid request"})
-		conn.Close()
-		return nil, fmt.Errorf("client[%s] handshake failed. version=%s", req.GUID, req.Version)
+		handshakeErr := fmt.Errorf("client[%s] handshake failed. version=%s", req.GUID, req.Version)
+		if err := conn.SetWriteDeadline(time.Now().Add(HandshakeTimeout)); err != nil {
+			return nil, errors.Join(handshakeErr, err, conn.Close())
+		}
+		if err := conn.WriteJSON(HandshakeResponse{Status: 500, Message: "invalid request"}); err != nil {
+			return nil, errors.Join(handshakeErr, err, conn.Close())
+		}
+		return nil, errors.Join(handshakeErr, conn.Close())
 	}
 	// 协商 codec: 取客户端偏好里服务端也支持的第一个; 客户端未带偏好 (旧客户端) 回退 JSON。
 	codec, ok := server.codecs.negotiate(req.Codecs)
 	if !ok {
-		conn.SetWriteDeadline(time.Now().Add(HandshakeTimeout))
-		conn.WriteJSON(HandshakeResponse{Status: 500, Message: "no common codec"})
-		conn.Close()
-		return nil, fmt.Errorf("client[%s] handshake failed: no common codec, client offered %v", req.GUID, req.Codecs)
+		handshakeErr := fmt.Errorf("client[%s] handshake failed: no common codec, client offered %v", req.GUID, req.Codecs)
+		if err := conn.SetWriteDeadline(time.Now().Add(HandshakeTimeout)); err != nil {
+			return nil, errors.Join(handshakeErr, err, conn.Close())
+		}
+		if err := conn.WriteJSON(HandshakeResponse{Status: 500, Message: "no common codec"}); err != nil {
+			return nil, errors.Join(handshakeErr, err, conn.Close())
+		}
+		return nil, errors.Join(handshakeErr, conn.Close())
 	}
-	conn.SetReadDeadline(time.Time{})
-	conn.SetWriteDeadline(time.Now().Add(HandshakeTimeout))
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		return nil, errors.Join(err, conn.Close())
+	}
+	if err := conn.SetWriteDeadline(time.Now().Add(HandshakeTimeout)); err != nil {
+		return nil, errors.Join(err, conn.Close())
+	}
 	if err := conn.WriteJSON(HandshakeResponse{Status: 200, Codec: codec.Name()}); err != nil {
-		conn.Close()
-		return nil, err
+		return nil, errors.Join(err, conn.Close())
 	}
-	conn.SetWriteDeadline(time.Time{})
+	if err := conn.SetWriteDeadline(time.Time{}); err != nil {
+		return nil, errors.Join(err, conn.Close())
+	}
 	var session *Session[T]
 	var created bool
 	server.locker.Lock()
@@ -82,16 +98,16 @@ func (server *Server[T]) OnConnection(conn *websocket.Conn, args any) (*Session[
 	}
 	server.locker.Unlock()
 	if err := session.reset(context.Background(), conn, codec); err != nil {
-		conn.Close()
+		closeErr := conn.Close()
 		if created {
 			server.locker.Lock()
 			if cur, ok := server.sessions[req.GUID]; ok && cur == session {
 				delete(server.sessions, req.GUID)
 			}
 			server.locker.Unlock()
-			session.Close()
+			return nil, errors.Join(err, closeErr, session.Close())
 		}
-		return nil, err
+		return nil, errors.Join(err, closeErr)
 	}
 	return session, nil
 }
@@ -101,11 +117,12 @@ func (server *Server[T]) Close() error {
 	server.locker.Lock()
 	defer server.locker.Unlock()
 
+	var err error
 	for guid, session := range server.sessions {
-		session.Close()
+		err = errors.Join(err, session.Close())
 		delete(server.sessions, guid)
 	}
-	return nil
+	return err
 }
 
 // GetSession 获取指定 GUID 的会话
@@ -120,7 +137,10 @@ func (server *Server[T]) RemoveSession(guid string) {
 	server.locker.Lock()
 	defer server.locker.Unlock()
 	if session, ok := server.sessions[guid]; ok {
-		session.Close()
+		if err := session.Close(); err != nil {
+			slog.Warn("wsc server remove session close failed",
+				slog.String("guid", guid), slog.Any("err", err))
+		}
 		delete(server.sessions, guid)
 	}
 }

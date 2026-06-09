@@ -85,7 +85,9 @@ func (c *wsconnection[T]) Close(ctx context.Context) error {
 // 让上层 net.Client 走 lastError → 关连接 → 重连. 心跳本身 30s 一次, 60s 上限
 // 容忍单次心跳抖动 + 时序漂移. 详见 ReadIdleTimeout 注释.
 func (c *wsconnection[T]) Read(ctx context.Context) (*Message[T], error) {
-	c.conn.SetReadDeadline(time.Now().Add(ReadIdleTimeout))
+	if err := c.conn.SetReadDeadline(time.Now().Add(ReadIdleTimeout)); err != nil {
+		return nil, err
+	}
 	messageType, data, err := c.conn.ReadMessage()
 	if err != nil {
 		return nil, err
@@ -103,9 +105,13 @@ func (c *wsconnection[T]) Write(ctx context.Context, data *Message[T]) error {
 	if err != nil {
 		return err
 	}
-	c.conn.SetWriteDeadline(time.Now().Add(WriteTimeout))
+	if err := c.conn.SetWriteDeadline(time.Now().Add(WriteTimeout)); err != nil {
+		return err
+	}
 	err = c.conn.WriteMessage(messageType, payload)
-	c.conn.SetWriteDeadline(time.Time{})
+	if clearErr := c.conn.SetWriteDeadline(time.Time{}); err == nil && clearErr != nil {
+		return clearErr
+	}
 	return err
 }
 

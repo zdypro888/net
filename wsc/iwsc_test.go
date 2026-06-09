@@ -17,6 +17,13 @@ type testPayload struct {
 	Value int    `json:"value"`
 }
 
+func checkClose(t *testing.T, name string, closeFn func() error) {
+	t.Helper()
+	if err := closeFn(); err != nil {
+		t.Logf("%s close returned: %v", name, err)
+	}
+}
+
 func TestClientServerWriteAndRequest(t *testing.T) {
 	server := NewServerWithBuffer[testPayload](64)
 	upgrader := websocket.Upgrader{}
@@ -37,10 +44,10 @@ func TestClientServerWriteAndRequest(t *testing.T) {
 		sessionCh <- session
 	}))
 	defer httpServer.Close()
-	defer server.Close()
+	defer checkClose(t, "server", server.Close)
 
 	client := NewClientWithBuffer[testPayload]("ws"+httpServer.URL[len("http"):], 64)
-	defer client.Close()
+	defer checkClose(t, "client", client.Close)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -119,7 +126,7 @@ func TestRequestTimeoutAndCloseDoNotBlock(t *testing.T) {
 		sessionCh <- session
 	}))
 	defer httpServer.Close()
-	defer server.Close()
+	defer checkClose(t, "server", server.Close)
 
 	client := NewClientWithBuffer[testPayload]("ws"+httpServer.URL[len("http"):], 64)
 
@@ -196,7 +203,7 @@ func TestClientCloseDoesNotWaitForPendingRequestContext(t *testing.T) {
 		sessionCh <- session
 	}))
 	defer httpServer.Close()
-	defer server.Close()
+	defer checkClose(t, "server", server.Close)
 
 	client := NewClientWithBuffer[testPayload]("ws"+httpServer.URL[len("http"):], 64)
 
@@ -274,7 +281,7 @@ func TestWSConnectionCloseDoesNotBlockWhenMessageChannelIsFull(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer checkClose(t, "websocket conn", conn.Close)
 		<-r.Context().Done()
 	}))
 	defer httpServer.Close()

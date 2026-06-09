@@ -72,18 +72,21 @@ func (response *Response) Read(p []byte) (int, error) {
 
 func (response *Response) Close() error {
 	if response.Body != nil {
+		var err error
 		if response.reader != nil {
-			if closer, ok := response.reader.(io.Closer); ok {
-				closer.Close()
+			if closer, ok := response.reader.(*gzip.Reader); ok {
+				err = closer.Close()
 			}
 		}
-		return response.Body.Close()
+		return errors.Join(err, response.Body.Close())
 	}
 	return nil
 }
 
-func (res *Response) Data() ([]byte, error) {
-	defer res.Close()
+func (res *Response) Data() (data []byte, err error) {
+	defer func() {
+		err = errors.Join(err, res.Close())
+	}()
 	return io.ReadAll(res)
 }
 
@@ -170,7 +173,9 @@ func (h *HTTP) Dispose() {
 	case *http.Transport:
 		transport.CloseIdleConnections()
 	case *http3.Transport:
-		transport.Close()
+		if err := transport.Close(); err != nil {
+			slog.Warn("net.HTTP Dispose http3 transport close failed", slog.Any("err", err))
+		}
 	}
 }
 
@@ -268,7 +273,7 @@ func (h *HTTP) requestWithRequest(ctx context.Context, request *http.Request) (*
 }
 
 // requestMethodDo 发送请求
-func (h *HTTP) requestMethodDo(ctx context.Context, url string, method string, headers http.Header, body io.Reader) (*Response, error) {
+func (h *HTTP) requestMethodDo(ctx context.Context, url string, method string, headers http.Header, body io.Reader) (response *Response, err error) {
 	request, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return nil, err
@@ -276,7 +281,9 @@ func (h *HTTP) requestMethodDo(ctx context.Context, url string, method string, h
 	if body != nil {
 		// 如果是 utils.Reader 则扩展处理
 		if breader, ok := body.(*utils.Reader); ok {
-			defer breader.Close()
+			defer func() {
+				err = errors.Join(err, breader.Close())
+			}()
 			request.ContentLength = breader.Size()
 			request.Body = breader.Temporary()
 			request.GetBody = func() (io.ReadCloser, error) {
@@ -290,17 +297,18 @@ func (h *HTTP) requestMethodDo(ctx context.Context, url string, method string, h
 	return h.requestWithRequest(ctx, request)
 }
 
-func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, headers http.Header, body io.Reader) (*Response, error) {
+func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, headers http.Header, body io.Reader) (response *Response, err error) {
 	// AutoRetry <= 0 表示不重试, 单发一次. 旧实现只判 ==0, 负值会落进下方
 	// for i:=total;i>0 循环体一次不执行, 返回 (nil,nil) 让 caller NPE; 这里收敛.
 	if h.AutoRetry <= 0 {
 		return h.requestMethodDo(ctx, url, method, headers, body)
 	}
-	var err error
 	var breader *utils.Reader
 	if body != nil {
 		if bodyCloser, ok := body.(io.Closer); ok {
-			defer bodyCloser.Close()
+			defer func() {
+				err = errors.Join(err, bodyCloser.Close())
+			}()
 		}
 		switch v := body.(type) {
 		case *bytes.Buffer:
@@ -319,6 +327,9 @@ func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, hea
 			}
 		}
 		body = breader
+		defer func() {
+			err = errors.Join(err, breader.Close())
+		}()
 	}
 	request, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
@@ -327,7 +338,6 @@ func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, hea
 	if headers != nil {
 		request.Header = http.Header(headers).Clone()
 	}
-	var response *Response
 	backoff := h.retryBackoff
 	if backoff == nil {
 		backoff = DefaultRetryBackoff

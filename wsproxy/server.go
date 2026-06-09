@@ -59,18 +59,28 @@ func NewServer() *Server {
 func (server *Server) OnConnection(conn *websocket.Conn) {
 	if server.closed.Load() {
 		// CloseAll 已调用, 不接新连接.
-		conn.Close()
+		if err := conn.Close(); err != nil {
+			slog.Warn("wsproxy OnConnection close rejected connection failed", slog.Any("err", err))
+		}
 		return
 	}
 	// 设置读取超时，防止恶意连接
-	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	if err := conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		if closeErr := conn.Close(); closeErr != nil {
+			slog.Warn("wsproxy OnConnection close after deadline setup failure failed",
+				slog.Any("deadline_err", err), slog.Any("close_err", closeErr))
+		}
+		return
+	}
 	var incoming connPacket
 	if err := conn.ReadJSON(&incoming); err != nil {
 		server.badHandshakes.Add(1)
 		slog.Warn("wsproxy OnConnection ReadJSON failed",
 			slog.String("remote", conn.RemoteAddr().String()),
 			slog.Any("err", err))
-		conn.Close()
+		if closeErr := conn.Close(); closeErr != nil {
+			slog.Warn("wsproxy OnConnection close after bad handshake failed", slog.Any("err", closeErr))
+		}
 		return
 	}
 	if server.Token != "" && subtle.ConstantTimeCompare([]byte(incoming.Token), []byte(server.Token)) != 1 {
@@ -79,11 +89,19 @@ func (server *Server) OnConnection(conn *websocket.Conn) {
 		slog.Warn("wsproxy OnConnection token mismatch",
 			slog.String("remote", conn.RemoteAddr().String()),
 			slog.Int("method", int(incoming.Method)))
-		conn.Close()
+		if err := conn.Close(); err != nil {
+			slog.Warn("wsproxy OnConnection close after token mismatch failed", slog.Any("err", err))
+		}
 		return
 	}
 	// 清除读取超时
-	conn.SetReadDeadline(time.Time{})
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		if closeErr := conn.Close(); closeErr != nil {
+			slog.Warn("wsproxy OnConnection close after deadline clear failure failed",
+				slog.Any("deadline_err", err), slog.Any("close_err", closeErr))
+		}
+		return
+	}
 	switch incoming.Method {
 	case MethodRegisterSlaver:
 		// 注册连接
@@ -91,7 +109,9 @@ func (server *Server) OnConnection(conn *websocket.Conn) {
 		server.locker.Lock()
 		if server.closed.Load() {
 			server.locker.Unlock()
-			conn.Close()
+			if err := conn.Close(); err != nil {
+				slog.Warn("wsproxy OnConnection close late rejected slaver failed", slog.Any("err", err))
+			}
 			return
 		}
 		server.sessions.PushBack(session)
@@ -102,7 +122,9 @@ func (server *Server) OnConnection(conn *websocket.Conn) {
 		server.locker.Lock()
 		if server.closed.Load() {
 			server.locker.Unlock()
-			conn.Close()
+			if err := conn.Close(); err != nil {
+				slog.Warn("wsproxy OnConnection close late rejected dialout failed", slog.Any("err", err))
+			}
 			return
 		}
 		server.activeWG.Go(func() {
@@ -114,7 +136,9 @@ func (server *Server) OnConnection(conn *websocket.Conn) {
 		slog.Warn("wsproxy OnConnection unknown method",
 			slog.String("remote", conn.RemoteAddr().String()),
 			slog.Int("method", int(incoming.Method)))
-		conn.Close()
+		if err := conn.Close(); err != nil {
+			slog.Warn("wsproxy OnConnection close unknown method failed", slog.Any("err", err))
+		}
 	}
 }
 
@@ -149,12 +173,10 @@ func (server *Server) DialContext(ctx context.Context, network, address string) 
 		deadline = d
 	}
 	if err := session.Conn.SetWriteDeadline(deadline); err != nil {
-		session.Close()
-		return nil, err
+		return nil, errors.Join(err, session.Close())
 	}
 	if err := session.Conn.SetReadDeadline(deadline); err != nil {
-		session.Close()
-		return nil, err
+		return nil, errors.Join(err, session.Close())
 	}
 
 	outgoing := &connPacket{
@@ -165,25 +187,27 @@ func (server *Server) DialContext(ctx context.Context, network, address string) 
 		Token:   server.Token,
 	}
 	if err := session.Conn.WriteJSON(outgoing); err != nil {
-		session.Close()
-		return nil, err
+		return nil, errors.Join(err, session.Close())
 	}
 	var incoming connPacket
 	if err := session.Conn.ReadJSON(&incoming); err != nil {
-		session.Close()
-		return nil, err
+		return nil, errors.Join(err, session.Close())
 	}
 
 	// 清除超时，后续由 copyLoop 管理
-	session.Conn.SetWriteDeadline(time.Time{})
-	session.Conn.SetReadDeadline(time.Time{})
+	if err := session.Conn.SetWriteDeadline(time.Time{}); err != nil {
+		return nil, errors.Join(err, session.Close())
+	}
+	if err := session.Conn.SetReadDeadline(time.Time{}); err != nil {
+		return nil, errors.Join(err, session.Close())
+	}
 
 	if incoming.Method != MethodSlaverDialoutSuccess {
-		session.Close()
+		closeErr := session.Close()
 		if incoming.Error != "" {
-			return nil, errors.New(incoming.Error)
+			return nil, errors.Join(errors.New(incoming.Error), closeErr)
 		}
-		return nil, errors.New("dial failed")
+		return nil, errors.Join(errors.New("dial failed"), closeErr)
 	}
 
 	return session, nil
@@ -192,13 +216,17 @@ func (server *Server) DialContext(ctx context.Context, network, address string) 
 func (server *Server) onClientDialout(ctx context.Context, conn *websocket.Conn, packet *connPacket) {
 	session, err := server.DialContext(ctx, packet.Network, packet.Address)
 	if err != nil {
-		// 发送连接错误响应，忽略写入错误（连接可能已断开）
-		conn.WriteJSON(&connPacket{
+		if writeErr := conn.WriteJSON(&connPacket{
 			Id:     packet.Id,
 			Method: MethodClientDialoutError, // 连接错误
 			Error:  err.Error(),
-		})
-		conn.Close()
+		}); writeErr != nil {
+			slog.Warn("wsproxy onClientDialout write error response failed",
+				slog.Any("dial_err", err), slog.Any("write_err", writeErr))
+		}
+		if closeErr := conn.Close(); closeErr != nil {
+			slog.Warn("wsproxy onClientDialout close client after dial failure failed", slog.Any("err", closeErr))
+		}
 		return
 	}
 	// 发送连接成功响应
@@ -207,14 +235,18 @@ func (server *Server) onClientDialout(ctx context.Context, conn *websocket.Conn,
 		Method: MethodClientDialoutSuccess, // 连接成功
 	}); err != nil {
 		// WebSocket 写入失败，关闭两端连接
-		conn.Close()
-		session.Close()
+		if closeErr := errors.Join(conn.Close(), session.Close()); closeErr != nil {
+			slog.Warn("wsproxy onClientDialout close after success response failure failed",
+				slog.Any("write_err", err), slog.Any("close_err", closeErr))
+		}
 		return
 	}
 	server.activeDialouts.Add(1)
 	defer server.activeDialouts.Add(-1)
 	p := &pump{}
-	p.copyLoop(ctx, conn, session)
+	if err := p.copyLoop(ctx, conn, session); err != nil {
+		slog.Warn("wsproxy onClientDialout copy loop failed", slog.Any("err", err))
+	}
 }
 
 // ConnectionCount 返回当前连接数
@@ -246,7 +278,9 @@ func (server *Server) CloseAll() {
 	for server.sessions.Len() > 0 {
 		front := server.sessions.Front()
 		server.sessions.Remove(front)
-		front.Value.(*Session).Close()
+		if err := front.Value.(*Session).Close(); err != nil {
+			slog.Warn("wsproxy CloseAll session close failed", slog.Any("err", err))
+		}
 	}
 	server.locker.Unlock()
 

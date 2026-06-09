@@ -2,6 +2,9 @@ package wsproxy
 
 import (
 	"context"
+	"errors"
+	"io"
+	"log/slog"
 	"net"
 	"sync"
 
@@ -39,8 +42,9 @@ func (p *pump) copyLoop(ctx context.Context, wsConn *websocket.Conn, conn net.Co
 	var closeOnce sync.Once
 	closeBoth := func() {
 		closeOnce.Do(func() {
-			wsConn.Close()
-			conn.Close()
+			if err := errors.Join(wsConn.Close(), conn.Close()); err != nil {
+				slog.Warn("wsproxy pump close failed", slog.Any("err", err))
+			}
 		})
 	}
 
@@ -57,11 +61,27 @@ func (p *pump) copyLoop(ctx context.Context, wsConn *websocket.Conn, conn net.Co
 
 	// Go 1.25 WaitGroup.Go 自动 Add(1)/Done, 配套替换显式 Add(2)+defer Done.
 	var waiter sync.WaitGroup
-	waiter.Go(func() { p.wsCopyToConn(closeBoth, wsConn, conn) })
-	waiter.Go(func() { p.connCopyToWs(closeBoth, conn, wsConn) })
+	waiter.Go(func() {
+		p.logCopyError("ws_to_conn", p.wsCopyToConn(closeBoth, wsConn, conn))
+	})
+	waiter.Go(func() {
+		p.logCopyError("conn_to_ws", p.connCopyToWs(closeBoth, conn, wsConn))
+	})
 	waiter.Wait()
 	close(done)
 	return nil
+}
+
+func (p *pump) logCopyError(direction string, err error) {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
+		return
+	}
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		return
+	}
+	slog.Warn("wsproxy pump copy failed",
+		slog.String("direction", direction), slog.Any("err", err))
 }
 
 func (p *pump) wsCopyToConn(closeBoth func(), wsConn *websocket.Conn, conn net.Conn) error {

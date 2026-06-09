@@ -12,6 +12,13 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+func checkClose(t *testing.T, name string, closeFn func() error) {
+	t.Helper()
+	if err := closeFn(); err != nil {
+		t.Logf("%s close returned: %v", name, err)
+	}
+}
+
 func TestClientDialHandshakeHonorsContextDeadline(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -19,7 +26,7 @@ func TestClientDialHandshakeHonorsContextDeadline(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer checkClose(t, "server websocket", conn.Close)
 		<-r.Context().Done()
 	}))
 	defer server.Close()
@@ -30,7 +37,7 @@ func TestClientDialHandshakeHonorsContextDeadline(t *testing.T) {
 
 	conn, err := client.Dial(ctx, "tcp", "example.com:443")
 	if conn != nil {
-		conn.Close()
+		checkClose(t, "client dial conn", conn.Close)
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Dial error = %v, want context deadline", err)
@@ -83,7 +90,7 @@ func TestPumpCopyLoopReturnsWhenWebSocketSideCloses(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatalf("copyLoop blocked after websocket close")
 	}
-	pipeWriter.Close()
+	checkClose(t, "pipe writer", pipeWriter.Close)
 }
 
 // TestServerCloseAllCancelsInflightDialout 回归 BUG-4:
@@ -109,8 +116,11 @@ func TestServerCloseAllCancelsInflightDialout(t *testing.T) {
 		}
 		slaverIncoming <- struct{}{}
 		// 不主动 read/write, 等连接被对端关闭.
-		_, _, _ = conn.ReadMessage()
-		conn.Close()
+		messageType, message, err := conn.ReadMessage()
+		if err == nil {
+			t.Logf("unexpected slaver message before close: type=%d bytes=%d", messageType, len(message))
+		}
+		checkClose(t, "slaver server websocket", conn.Close)
 	}))
 	defer slaverServer.Close()
 
@@ -119,7 +129,7 @@ func TestServerCloseAllCancelsInflightDialout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("slaver dial failed: %v", err)
 	}
-	defer slaverConn.Close()
+	defer checkClose(t, "slaver websocket", slaverConn.Close)
 	// 直接 push 到 sessions 池, 跳过 OnConnection 握手.
 	proxyServer.locker.Lock()
 	proxyServer.sessions.PushBack(&Session{Id: "slaver-99", Conn: slaverConn})
@@ -140,7 +150,7 @@ func TestServerCloseAllCancelsInflightDialout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client dial failed: %v", err)
 	}
-	defer clientWS.Close()
+	defer checkClose(t, "client websocket", clientWS.Close)
 	if err := clientWS.WriteJSON(&connPacket{
 		Id:      "client-1",
 		Method:  MethodSlaverDialout,
@@ -192,7 +202,9 @@ func TestServerTokenRequiredForRegistration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Dial failed: %v", err)
 		}
-		_ = conn.WriteJSON(&connPacket{Id: "slaver-1", Method: MethodRegisterSlaver, Token: token})
+		if err := conn.WriteJSON(&connPacket{Id: "slaver-1", Method: MethodRegisterSlaver, Token: token}); err != nil {
+			t.Fatalf("WriteJSON register failed: %v", err)
+		}
 		return conn
 	}
 	waitForCount := func(want int) bool {
@@ -206,13 +218,13 @@ func TestServerTokenRequiredForRegistration(t *testing.T) {
 		return proxyServer.ConnectionCount() == want
 	}
 
-	writeRegister("wrong").Close()
+	checkClose(t, "bad token websocket", writeRegister("wrong").Close)
 	if !waitForCount(0) {
 		t.Fatalf("ConnectionCount after bad token = %d, want 0", proxyServer.ConnectionCount())
 	}
 
 	conn := writeRegister("secret")
-	defer conn.Close()
+	defer checkClose(t, "good token websocket", conn.Close)
 	if !waitForCount(1) {
 		t.Fatalf("ConnectionCount after good token = %d, want 1", proxyServer.ConnectionCount())
 	}

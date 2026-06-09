@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -60,7 +61,9 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 			auth := &socks5.UsernamePassword{
 				Username: proxyURL.User.Username(),
 			}
-			auth.Password, _ = proxyURL.User.Password()
+			if password, ok := proxyURL.User.Password(); ok {
+				auth.Password = password
+			}
 			d.AuthMethods = []socks5.AuthMethod{
 				socks5.AuthMethodNotRequired,
 				socks5.AuthMethodUsernamePassword,
@@ -87,8 +90,7 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 			}
 			tlsConn := tls.Client(conn, tlsCfg)
 			if err := tlsConn.HandshakeContext(ctx); err != nil {
-				conn.Close()
-				return nil, err
+				return nil, errors.Join(err, conn.Close())
 			}
 			conn = tlsConn
 		}
@@ -97,8 +99,7 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 			deadline = ctxDeadline
 		}
 		if err := conn.SetDeadline(deadline); err != nil {
-			conn.Close()
-			return nil, err
+			return nil, errors.Join(err, conn.Close())
 		}
 		connectReq := (&http.Request{
 			Method: "CONNECT",
@@ -111,20 +112,19 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 			connectReq.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(auth)))
 		}
 		if err = connectReq.Write(conn); err != nil {
-			conn.Close()
-			return nil, err
+			return nil, errors.Join(err, conn.Close())
 		}
 		br := bufio.NewReader(conn)
 		var response *http.Response
 		if response, err = http.ReadResponse(br, connectReq); err != nil {
-			conn.Close()
-			return nil, err
+			return nil, errors.Join(err, conn.Close())
 		}
 		if response.StatusCode != 200 {
-			conn.Close()
-			return nil, fmt.Errorf("connect http tunnel faild: %d", response.StatusCode)
+			return nil, errors.Join(fmt.Errorf("connect http tunnel faild: %d", response.StatusCode), conn.Close())
 		}
-		conn.SetDeadline(time.Time{})
+		if err := conn.SetDeadline(time.Time{}); err != nil {
+			return nil, errors.Join(err, conn.Close())
+		}
 		return conn, nil
 	case "ws", "wss":
 		if proxy.server != nil {

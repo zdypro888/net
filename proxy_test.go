@@ -24,7 +24,7 @@ func TestProxyDialContextUsesTLSForHTTPSProxy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DialContext failed: %v", err)
 	}
-	conn.Close()
+	checkClose(t, "proxy conn", conn.Close)
 
 	req := <-requests
 	if req.TLS == nil {
@@ -47,7 +47,7 @@ func TestProxyDialContextHTTPSProxyStrictRejectsSelfSigned(t *testing.T) {
 	proxy := &Proxy{Address: "https://" + server.Listener.Addr().String(), TLSConfig: StrictTLSConfig()}
 	conn, err := proxy.DialContext(context.Background(), "tcp", "example.com:443")
 	if conn != nil {
-		conn.Close()
+		checkClose(t, "proxy conn", conn.Close)
 	}
 	if err == nil {
 		t.Fatalf("DialContext should have failed against self-signed proxy with strict TLS config")

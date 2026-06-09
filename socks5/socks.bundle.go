@@ -20,8 +20,14 @@ func (d *Dialer) connect(ctx context.Context, c net.Conn, address string) (_ net
 		return nil, err
 	}
 	if deadline, ok := ctx.Deadline(); ok && !deadline.IsZero() {
-		c.SetDeadline(deadline)
-		defer c.SetDeadline(socksnoDeadline)
+		if err := c.SetDeadline(deadline); err != nil {
+			return nil, err
+		}
+		defer func() {
+			if err := c.SetDeadline(socksnoDeadline); ctxErr == nil {
+				ctxErr = err
+			}
+		}()
 	}
 	if ctx != context.Background() {
 		errCh := make(chan error, 1)
@@ -35,8 +41,7 @@ func (d *Dialer) connect(ctx context.Context, c net.Conn, address string) (_ net
 		go func() {
 			select {
 			case <-ctx.Done():
-				c.SetDeadline(socksaLongTimeAgo)
-				errCh <- ctx.Err()
+				errCh <- errors.Join(ctx.Err(), c.SetDeadline(socksaLongTimeAgo))
 			case <-done:
 				errCh <- nil
 			}
@@ -317,9 +322,9 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 	}
 	a, err := d.connect(ctx, c, address)
 	if err != nil {
-		c.Close()
+		closeErr := c.Close()
 		proxy, dst, _ := d.pathAddrs(address)
-		return nil, &net.OpError{Op: d.cmd.String(), Net: network, Source: proxy, Addr: dst, Err: err}
+		return nil, &net.OpError{Op: d.cmd.String(), Net: network, Source: proxy, Addr: dst, Err: errors.Join(err, closeErr)}
 	}
 	return &socksConn{Conn: c, boundAddr: a}, nil
 }
@@ -370,8 +375,7 @@ func (d *Dialer) Dial(network, address string) (net.Conn, error) {
 		return nil, &net.OpError{Op: d.cmd.String(), Net: network, Source: proxy, Addr: dst, Err: err}
 	}
 	if _, err := d.DialWithConn(context.Background(), c, network, address); err != nil {
-		c.Close()
-		return nil, err
+		return nil, errors.Join(err, c.Close())
 	}
 	return c, nil
 }

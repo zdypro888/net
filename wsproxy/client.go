@@ -44,12 +44,10 @@ func (client *Client) Dial(ctx context.Context, network, address string) (net.Co
 		return err
 	}
 	if err := wsConn.SetWriteDeadline(deadline); err != nil {
-		wsConn.Close()
-		return nil, err
+		return nil, errors.Join(err, wsConn.Close())
 	}
 	if err := wsConn.SetReadDeadline(deadline); err != nil {
-		wsConn.Close()
-		return nil, err
+		return nil, errors.Join(err, wsConn.Close())
 	}
 	outgoing := &connPacket{
 		Id:      client.Id,
@@ -59,22 +57,24 @@ func (client *Client) Dial(ctx context.Context, network, address string) (net.Co
 		Token:   client.Token,
 	}
 	if err := wsConn.WriteJSON(outgoing); err != nil {
-		wsConn.Close()
-		return nil, normalizeHandshakeError(err)
+		return nil, errors.Join(normalizeHandshakeError(err), wsConn.Close())
 	}
 	var dialPacket connPacket
 	if err := wsConn.ReadJSON(&dialPacket); err != nil {
-		wsConn.Close()
-		return nil, normalizeHandshakeError(err)
+		return nil, errors.Join(normalizeHandshakeError(err), wsConn.Close())
 	}
 	if dialPacket.Method != MethodClientDialoutSuccess {
-		wsConn.Close()
+		closeErr := wsConn.Close()
 		if dialPacket.Error != "" {
-			return nil, errors.New(dialPacket.Error)
+			return nil, errors.Join(errors.New(dialPacket.Error), closeErr)
 		}
-		return nil, errors.New("dial failed")
+		return nil, errors.Join(errors.New("dial failed"), closeErr)
 	}
-	wsConn.SetWriteDeadline(time.Time{})
-	wsConn.SetReadDeadline(time.Time{})
+	if err := wsConn.SetWriteDeadline(time.Time{}); err != nil {
+		return nil, errors.Join(err, wsConn.Close())
+	}
+	if err := wsConn.SetReadDeadline(time.Time{}); err != nil {
+		return nil, errors.Join(err, wsConn.Close())
+	}
 	return &Session{Id: client.Id, Conn: wsConn}, nil
 }

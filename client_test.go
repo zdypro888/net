@@ -73,11 +73,18 @@ func (c *fakeConn) Handle(ctx context.Context, msg testMessage) {
 	c.handled = append(c.handled, msg)
 }
 
+func checkClose(t *testing.T, name string, closeFn func() error) {
+	t.Helper()
+	if err := closeFn(); err != nil {
+		t.Logf("%s close returned: %v", name, err)
+	}
+}
+
 func TestClientRequestResponse(t *testing.T) {
 	conn := newFakeConn()
 	client := NewClient[testMessage, *fakeConn]()
 	client.Reset(context.Background(), conn)
-	defer client.Close()
+	defer checkClose(t, "client", client.Close)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -107,7 +114,7 @@ func TestClientRequestReturnsWhenConnectionCloses(t *testing.T) {
 	conn := newFakeConn()
 	client := NewClient[testMessage, *fakeConn]()
 	client.Reset(context.Background(), conn)
-	defer client.Close()
+	defer checkClose(t, "client", client.Close)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -185,8 +192,10 @@ func TestClientAsyncRespectsCtxDeadline(t *testing.T) {
 	client := NewClient[testMessage, *fakeConn]()
 	client.Reset(context.Background(), conn)
 	t.Cleanup(func() {
-		_ = conn.Close(context.Background()) // 让 conn.Write 走 ErrConnectionClosed, 解锁 asyncGo
-		_ = client.Close()
+		checkClose(t, "fake conn", func() error {
+			return conn.Close(context.Background()) // 让 conn.Write 走 ErrConnectionClosed, 解锁 asyncGo
+		})
+		checkClose(t, "client", client.Close)
 	})
 
 	// 1. 灌满 conn.writeCh (cap=16): 触发 asyncGo 取出第 17 条时卡 conn.Write.
@@ -339,7 +348,7 @@ func TestClientRequestContextCancel(t *testing.T) {
 	conn := newFakeConn()
 	client := NewClient[testMessage, *fakeConn]()
 	client.Reset(context.Background(), conn)
-	defer client.Close()
+	defer checkClose(t, "client", client.Close)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)

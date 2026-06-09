@@ -25,6 +25,8 @@ type Conn[T any] interface {
 
 	// Handle 处理无法匹配到请求的消息（如服务端主动推送）。
 	// 在唯一的处理协程中调用，保证线程安全。
+	// 实现必须观察 ctx.Done 并及时返回；Client.Close/Reset 会通过该 ctx
+	// 取消正在执行的 Handle。若实现忽略 ctx 并长期阻塞，关闭路径也会被阻塞。
 	Handle(ctx context.Context, data T)
 }
 

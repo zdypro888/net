@@ -26,7 +26,9 @@ func TestRequestMethodNegativeAutoRetryDoesNotReturnNilNil(t *testing.T) {
 		t.Fatalf("RequestMethod with negative AutoRetry returned (nil, nil); caller would NPE")
 	}
 	if resp != nil {
-		resp.Close()
+		if err := resp.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200", resp.StatusCode)
 		}

@@ -238,7 +238,10 @@ func (s *Session[T]) asyncGo(asyncChan <-chan *asyncInfo[T], handchan chan *Pack
 			}
 		}
 	}
-	rawconn.Close()
+	if err := rawconn.Close(); err != nil {
+		slog.Warn("wsc Session async raw connection close failed",
+			slog.String("guid", s.guid), slog.Any("err", err))
+	}
 	// stopChan 关闭（特意设计,其它地方不会关闭 stopChan）
 	close(stopChan)
 	recvWaiter.Wait()

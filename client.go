@@ -393,8 +393,12 @@ func (client *Client[M, T]) asyncGo(ctx context.Context, handleCtx context.Conte
 		}
 	}
 
-	// 关闭底层连接，让 receiveGo 退出
-	conn.Close(ctx)
+	// 关闭底层连接，让 receiveGo 退出. close 错误只记日志, 不写入 lastError:
+	// 保持 Close/pending Request 的返回错误归一为 ErrConnectionClosed(与 receiveGo
+	// 及其它 Close 错误处理一致), 避免 conn.Close 偶发错误污染对外错误契约.
+	if err := conn.Close(ctx); err != nil {
+		slog.Warn("net.Client teardown close failed", slog.Any("err", err))
+	}
 	// 先 cancel handleCtx 再 cancel cctx (cctx cancel 会级联 cancel handleCtx,
 	// 显式调用是为了清晰 + 释放 context 资源, 幂等).
 	handleCancel()
