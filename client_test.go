@@ -254,6 +254,87 @@ func TestClientCloseDrainsPendingWrites(t *testing.T) {
 	}
 }
 
+// blockingHandleConn 的 Handle 会一直阻塞, 直到 ctx 被取消 (遵守 Conn.Handle
+// 的契约: 在唯一处理协程中调用, 用 ctx 控制生命周期). 用于回归 D-P1-1.
+type blockingHandleConn struct {
+	readCh      chan testMessage
+	closed      chan struct{}
+	once        sync.Once
+	handleEnter chan struct{} // Handle 进入时关闭一次, 让测试确认分发已开始
+	enterOnce   sync.Once
+}
+
+func newBlockingHandleConn() *blockingHandleConn {
+	return &blockingHandleConn{
+		readCh:      make(chan testMessage, DefaultBufferSize),
+		closed:      make(chan struct{}),
+		handleEnter: make(chan struct{}),
+	}
+}
+
+func (c *blockingHandleConn) Close(ctx context.Context) error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+func (c *blockingHandleConn) Read(ctx context.Context) (testMessage, error) {
+	select {
+	case msg := <-c.readCh:
+		return msg, nil
+	case <-c.closed:
+		return testMessage{}, ErrConnectionClosed
+	case <-ctx.Done():
+		return testMessage{}, ctx.Err()
+	}
+}
+
+func (c *blockingHandleConn) Write(ctx context.Context, msg testMessage) error {
+	select {
+	case <-c.closed:
+		return ErrConnectionClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Handle 阻塞直到 ctx 取消. 这模拟"用户回调长时间不返回"的场景: 旧实现里
+// asyncGo 同步卡在此处, 传给 Handle 的 ctx 只在 asyncGo 主循环之后才 cancel — 永远到不了,
+// 于是 Close 的 waiter.Wait() 永久挂起. 修复后 CloseUnsafe 立即 cancel handleCtx,
+// 这里因 ctx.Done() 解阻塞, asyncGo 退出, Close 返回.
+func (c *blockingHandleConn) Handle(ctx context.Context, msg testMessage) {
+	c.enterOnce.Do(func() { close(c.handleEnter) })
+	<-ctx.Done()
+}
+
+// TestClientCloseUnblocksBlockedHandle 回归 D-P1-1:
+// 用户 Conn.Handle 回调在 asyncGo 单协程内同步执行. 若回调长时间阻塞 (遵守 ctx
+// 契约但等 ctx 取消), 旧实现 Close 无法把取消透传给 Handle, waiter.Wait() 永久挂起.
+// 修复: CloseUnsafe 立即 cancel handleCtx, 让阻塞的 Handle 解锁 → asyncGo 退出.
+func TestClientCloseUnblocksBlockedHandle(t *testing.T) {
+	conn := newBlockingHandleConn()
+	client := NewClient[testMessage, *blockingHandleConn]()
+	client.Reset(context.Background(), conn)
+
+	// 推一条无法匹配任何 request 的消息 (无 id), asyncGo 会走 conn.Handle 分发并卡住.
+	conn.readCh <- testMessage{value: "push-no-id"}
+
+	// 确认 Handle 已经被调用且正在阻塞.
+	select {
+	case <-conn.handleEnter:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Handle was never invoked")
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- client.Close() }()
+	select {
+	case <-done:
+		// 修复后: CloseUnsafe cancel handleCtx → Handle 的 <-ctx.Done() 解锁 → asyncGo 退出.
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close blocked behind a blocked user Handle callback (D-P1-1)")
+	}
+}
+
 func TestClientRequestContextCancel(t *testing.T) {
 	conn := newFakeConn()
 	client := NewClient[testMessage, *fakeConn]()
