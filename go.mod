@@ -7,7 +7,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/quic-go/quic-go v0.60.0
-	github.com/zdypro888/utils v0.0.0-20260610032405-5ae5e0dcc220
+	github.com/zdypro888/utils v0.0.0-20260610033751-607c0b6eab68
 	golang.org/x/net v0.55.0
 	google.golang.org/protobuf v1.36.11
 )

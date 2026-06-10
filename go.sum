@@ -20,8 +20,8 @@ github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 github.com/xyproto/randomstring v1.0.5 h1:YtlWPoRdgMu3NZtP45drfy1GKoojuR7hmRcnhZqKjWU=
 github.com/xyproto/randomstring v1.0.5/go.mod h1:rgmS5DeNXLivK7YprL0pY+lTuhNQW3iGxZ18UQApw/E=
-github.com/zdypro888/utils v0.0.0-20260610032405-5ae5e0dcc220 h1:j30Kc8YFgeitKYlZaifInT5fba+Gao/Z5C+ijUH8CVM=
-github.com/zdypro888/utils v0.0.0-20260610032405-5ae5e0dcc220/go.mod h1:AaOEK1O8zkZ0xDc5Sr0l75IGqVvrGAKwmphW60EZUVw=
+github.com/zdypro888/utils v0.0.0-20260610033751-607c0b6eab68 h1:NhAwCJrzrIgZVQ576XKQkPd0mNajhfaFv+PlVAXVa5M=
+github.com/zdypro888/utils v0.0.0-20260610033751-607c0b6eab68/go.mod h1:T2dDmTNMjuhjmK4hs0XMsgpoT4S8iqMGQjUOEkv4CcQ=
 go.uber.org/mock v0.6.0 h1:hyF9dfmbgIX5EfOdasqLsWD6xqpNZlXblLB/Dbnwv3Y=
 go.uber.org/mock v0.6.0/go.mod h1:KiVJ4BqZJaMj4svdfmHM0AUx4NJYO8ZNpPnZn1Z+BBU=
 golang.org/x/crypto v0.53.0 h1:QZ4Muo8THX6CizN2vPPd5fBGHyogrdK9fG4wLPFUsto=
