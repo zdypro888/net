@@ -63,6 +63,7 @@ type Session[T any] struct {
 	wsconn         atomic.Pointer[wsconnection[T]]
 	connGeneration atomic.Uint64
 	onDisconnect   atomic.Pointer[func(session *Session[T], generation uint64)]
+	closedSignal   atomic.Bool
 }
 
 // Stats 拍 session 当前队列占用 + 观察性计数器. 不持锁 — Len/Cap 是 chan
@@ -187,11 +188,32 @@ func (info *asyncInfo[T]) Response(msg *Message[T], err error) {
 func (s *Session[T]) handleMessageGo(handchan chan *Packet[T], msgchan <-chan *messagechannel[T], stopChan chan struct{}, generation uint64) {
 	running := true
 	disconnected := false
-	defer func() {
-		if disconnected {
+	notifiedDisconnect := false
+	notifyDisconnect := func() {
+		if disconnected && !notifiedDisconnect {
+			notifiedDisconnect = true
 			s.notifyDisconnect(generation)
 		}
-	}()
+	}
+	// forwardClosed 用 closedSignal 把"正在补发的 Closed 包"合并为最多一个: client 的重连
+	// 循环依赖 handchan 上的 Closed 包触发重连, 但 server 端若禁用 idle cleanup 且上层永久不
+	// 消费, 每个断线 generation 都阻塞补发会无界堆 goroutine。CAS 抢到信号者才阻塞投递, 其余
+	// 直接返回(被合并, 不 park), 因此任一时刻至多一个 goroutine 卡在投递上。
+	// 投递成功(或整体关闭走 stopChan)后必须无条件清掉信号: 否则 server 端没有"消费即复位"的
+	// 钩子(只有 client.go 在读到 Closed 时复位), 一旦投递完成时 handchan 恰满, 信号会永久卡在
+	// true → 该 session 后续所有断线的 Closed 都被合并丢弃(小 buffer 下首次断线即触发)。复位后
+	// 后续断线可再次投递, 与上面注释"至少给恢复后的 consumer 留一个 Closed"的本意一致。
+	forwardClosed := func() {
+		if !s.closedSignal.CompareAndSwap(false, true) {
+			return
+		}
+		select {
+		case handchan <- &Packet[T]{Closed: true}:
+		case <-stopChan:
+		}
+		s.closedSignal.Store(false)
+	}
+	defer notifyDisconnect()
 	for running {
 		select {
 		case <-stopChan:
@@ -200,9 +222,15 @@ func (s *Session[T]) handleMessageGo(handchan chan *Packet[T], msgchan <-chan *m
 			if !ok {
 				disconnected = true
 				running = false
+				notifyDisconnect()
+				forwardClosed()
 			} else {
 				if msg.Closed {
 					disconnected = true
+					notifyDisconnect()
+					running = false
+					forwardClosed()
+					continue
 				}
 				packet := msg.ToPacket()
 				// 快路径: handchan 有空位立即写入.

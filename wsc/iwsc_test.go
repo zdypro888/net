@@ -556,6 +556,118 @@ func TestServerReconnectFailureReschedulesIdleCleanup(t *testing.T) {
 	}
 }
 
+func TestServerDisconnectCoalescesBlockedClosedPacketDelivery(t *testing.T) {
+	server := NewServerWithBuffer[testPayload](1, WithSessionIdleTimeout(time.Hour))
+	defer checkClose(t, "server", server.Close)
+
+	session := createSessionWithBuffer[testPayload]("blocked-closed-consumer-guid", 1)
+	session.setOnDisconnect(server.scheduleSessionCleanup)
+	server.locker.Lock()
+	server.sessions[session.guid] = session
+	server.locker.Unlock()
+
+	session.handchan <- &Packet[testPayload]{Data: testPayload{Kind: "queued"}}
+	done := make(chan struct{}, 2)
+	for range 2 {
+		msgchan := make(chan *messagechannel[testPayload])
+		close(msgchan)
+		go func() {
+			session.handleMessageGo(session.handchan, msgchan, session.stopChan, session.generation())
+			done <- struct{}{}
+		}()
+	}
+
+	hasCleanupTimer := func() bool {
+		server.locker.Lock()
+		defer server.locker.Unlock()
+		_, ok := server.cleanupTimers[session.guid]
+		return ok
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for !hasCleanupTimer() {
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			t.Fatalf("disconnect did not schedule cleanup while Closed packet consumer was blocked: %v", ctx.Err())
+		}
+	}
+	for !session.closedSignal.Load() {
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			t.Fatalf("disconnect did not leave a pending Closed signal while consumer was blocked: %v", ctx.Err())
+		}
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatalf("second concurrent disconnect did not coalesce while first Closed send was blocked: %v", ctx.Err())
+	}
+
+	packet := <-session.handchan
+	if packet.Closed {
+		t.Fatalf("first queued packet should not be the synthetic Closed packet")
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatalf("blocked handleMessageGo did not finish after consumer resumed: %v", ctx.Err())
+	}
+}
+
+// TestServerDisconnectClosedSignalResetsAfterDelivery 锁定: server 端补发 Closed 投递成功
+// 后必须无条件复位 closedSignal, 否则一旦投递时 handchan 恰满(小 buffer 下首次断线即满),
+// 信号会永久卡 true, 该 session 后续所有断线的 Closed 都被合并丢弃。bufferSize=1: 投递一个
+// Closed 即把 handchan(cap 1)填满, len<cap 永远为假, 是该卡死的确定性复现。
+func TestServerDisconnectClosedSignalResetsAfterDelivery(t *testing.T) {
+	server := NewServerWithBuffer[testPayload](1, WithSessionIdleTimeout(time.Hour))
+	defer checkClose(t, "server", server.Close)
+
+	session := createSessionWithBuffer[testPayload]("closed-signal-reset-guid", 1)
+	session.setOnDisconnect(server.scheduleSessionCleanup)
+	server.locker.Lock()
+	server.sessions[session.guid] = session
+	server.locker.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	runDisconnect := func() {
+		msgchan := make(chan *messagechannel[testPayload])
+		close(msgchan)
+		done := make(chan struct{})
+		go func() {
+			session.handleMessageGo(session.handchan, msgchan, session.stopChan, session.generation())
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			t.Fatalf("handleMessageGo did not finish: %v", ctx.Err())
+		}
+	}
+
+	runDisconnect()
+	first := <-session.handchan
+	if !first.Closed {
+		t.Fatalf("first disconnect should deliver a Closed packet, got %#v", first)
+	}
+	// 消费掉首个 Closed 后(server 端无 client.go 那样的消费即复位钩子), 第二次断线必须仍能投递
+	// 一个新的 Closed —— 若 closedSignal 卡在 true, forwardClosed 的 CAS 会失败而静默丢弃。
+	runDisconnect()
+	select {
+	case second := <-session.handchan:
+		if !second.Closed {
+			t.Fatalf("second disconnect should deliver a Closed packet, got %#v", second)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("second disconnect delivered no Closed packet: closedSignal stuck true after first delivery")
+	}
+}
+
 func TestWSConnectionCloseDoesNotBlockWhenMessageChannelIsFull(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

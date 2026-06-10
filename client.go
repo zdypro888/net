@@ -184,7 +184,7 @@ func (client *Client[M, T]) ResetUnsafe(ctx context.Context, conn T) {
 	// 启动工作协程. 用 Go 1.25 WaitGroup.Go 自动 Add(1)/Done, 避免显式
 	// Add/Done 配对错位的经典坑.
 	client.waiter.Go(func() {
-		client.asyncGo(cctx, handleCtx, cancel, handleCancel, conn, asynchan, recvchan, stopChan)
+		client.asyncGo(cctx, handleCtx, cancel, handleCancel, conn, asynchan, recvchan)
 	})
 	client.waiter.Go(func() { client.receiveGo(cctx, conn, recvchan) })
 }
@@ -282,7 +282,7 @@ func (client *Client[M, T]) receiveGo(ctx context.Context, conn T, recvchan chan
 // 2. 处理接收队列（recvchan）中的响应
 // 3. 匹配请求和响应（通过 Notify.Id）
 // 4. 分发未匹配的消息到 Handle
-func (client *Client[M, T]) asyncGo(ctx context.Context, handleCtx context.Context, cancel context.CancelFunc, handleCancel context.CancelFunc, conn T, asynchan <-chan *asynRequest[M, T], recvchan <-chan M, stopchan chan struct{}) {
+func (client *Client[M, T]) asyncGo(ctx context.Context, handleCtx context.Context, cancel context.CancelFunc, handleCancel context.CancelFunc, conn T, asynchan <-chan *asynRequest[M, T], recvchan <-chan M) {
 	// asyncNotifys 存储等待响应的请求，key 是 Notify.Id()
 	asyncNotifys := make(map[any]*asyncMessage[M])
 	var zeroM M
@@ -568,23 +568,14 @@ func (client *Client[M, T]) Write(ctx context.Context, data M) error {
 // *注意* 次方法会阻塞直到收到响应或发生错误, 所以不可以在 Handle 回调中调用此方法.
 // 注意：此方法不持有锁，调用方需自行确保并发安全。
 func (client *Client[M, T]) RequestUnsafe(ctx context.Context, data M) (M, error) {
-	var zeroM M
 	message, err := client.asyncMessage(ctx, data, true)
 	if err != nil {
+		var zeroM M
 		return zeroM, err
 	}
-	select {
-	case <-ctx.Done():
-		// 标记 canceled, asyncGo 清理路径会跳过. waiter buffer=1, asyncGo
-		// 后续 Response 时 select+default 不阻塞, close(waiter) 安全 (caller 已走).
-		message.canceled.Store(true)
-		return zeroM, ctx.Err()
-	case resp, ok := <-message.waiter:
-		if !ok {
-			return zeroM, ErrConnectionClosed
-		}
-		return resp.Response, resp.Error
-	}
+	// 等待逻辑与 Request 完全一致, 复用 waitResponse 避免两份 select 漂移
+	// (canceled 标记 / waiter close 语义二者必须一致, 单点维护更安全).
+	return client.waitResponse(ctx, message)
 }
 
 // Request 发送数据到连接, 等待响应.
