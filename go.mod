@@ -1,6 +1,6 @@
 module github.com/zdypro888/net
 
-go 1.25.0
+go 1.26.4
 
 require (
 	github.com/andybalholm/brotli v1.2.1
@@ -8,7 +8,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/quic-go/quic-go v0.59.0
 	github.com/zdypro888/utils v0.0.0-20260509170909-31773e315302
-	golang.org/x/net v0.54.0
+	golang.org/x/net v0.55.0
 	google.golang.org/protobuf v1.36.11
 )
 
@@ -18,6 +18,6 @@ require (
 	github.com/quic-go/qpack v0.6.0 // indirect
 	go.uber.org/mock v0.6.0 // indirect
 	golang.org/x/crypto v0.51.0 // indirect
-	golang.org/x/sys v0.44.0 // indirect
+	golang.org/x/sys v0.45.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 )

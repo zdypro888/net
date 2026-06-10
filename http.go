@@ -30,7 +30,13 @@ func DefaultRetryBackoff(attempt int) time.Duration {
 	if attempt < 0 {
 		attempt = 0
 	}
-	base := time.Duration(100*(1<<uint(attempt))) * time.Millisecond
+	const maxShiftBeforeCap = 6 // 100ms<<6 = 6.4s, the first value capped to 5s.
+	var base time.Duration
+	if attempt >= maxShiftBeforeCap {
+		base = 5 * time.Second
+	} else {
+		base = time.Duration(100*(1<<uint(attempt))) * time.Millisecond
+	}
 	if base > 5*time.Second {
 		base = 5 * time.Second
 	}

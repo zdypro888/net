@@ -8,6 +8,7 @@ import (
 	stdurl "net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSafeURLForLogRedactsSensitiveParts(t *testing.T) {
@@ -32,6 +33,15 @@ func TestSafeErrorForLogRedactsURLErrorURL(t *testing.T) {
 	}
 	if !strings.Contains(got, "https://example.com/path") {
 		t.Fatalf("safeErrorForLog() = %q, want sanitized URL", got)
+	}
+}
+
+func TestDefaultRetryBackoffLargeAttemptDoesNotPanic(t *testing.T) {
+	for _, attempt := range []int{6, 60, 1000} {
+		got := DefaultRetryBackoff(attempt)
+		if got < 5*time.Second || got >= 6250*time.Millisecond {
+			t.Fatalf("DefaultRetryBackoff(%d) = %v, want [5s, 6.25s)", attempt, got)
+		}
 	}
 }
 
