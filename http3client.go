@@ -23,6 +23,5 @@ func NewHTTP3(config *tls.Config) *HTTP {
 		transport: transport,
 		client:    client,
 	}
-	// client.CheckRedirect = h.redirect
 	return h
 }

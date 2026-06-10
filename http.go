@@ -123,16 +123,19 @@ func safeErrorForLog(requestURL string, err error) string {
 	if requestURL != "" {
 		msg = strings.ReplaceAll(msg, requestURL, safeURLForLog(requestURL))
 	}
-	var urlErr *url.Error
-	if errors.As(err, &urlErr) && urlErr.URL != "" {
+	if urlErr, ok := errors.AsType[*url.Error](err); ok && urlErr.URL != "" {
 		msg = strings.ReplaceAll(msg, urlErr.URL, safeURLForLog(urlErr.URL))
 	}
 	return msg
 }
 
 type HTTP struct {
-	transport    http.RoundTripper
-	client       *http.Client
+	transport http.RoundTripper
+	client    *http.Client
+	// baseDial 是 NewHTTP 创建时的基础拨号函数 (20s 拨号超时, 响应 ctx 取消/deadline).
+	// ConfigureProxyClear / ConfigureProxyReset(未存代理拨号时) 恢复到它, 保证清除代理后
+	// 拨号超时语义不丢. NewHTTP3 (http3.Transport) 不走 DialContext, 该字段为 nil 且不被使用.
+	baseDial     func(ctx context.Context, network, addr string) (net.Conn, error)
 	proxyURL     func(*http.Request) (*url.URL, error)
 	proxyDial    func(ctx context.Context, network, addr string) (net.Conn, error)
 	retryBackoff func(attempt int) time.Duration
@@ -180,10 +183,13 @@ func NewHTTP(config *tls.Config) *HTTP {
 	if config == nil {
 		config = DefaultTLSConfig()
 	}
+	// 基础拨号用 DialContext (而非废弃的 Transport.Dial): 拨号阶段同样响应
+	// ctx 取消与 deadline, 保留原 20s 拨号超时语义.
+	baseDial := (&net.Dialer{
+		Timeout: 20 * time.Second,
+	}).DialContext
 	transport := &http.Transport{
-		Dial: (&net.Dialer{
-			Timeout: 20 * time.Second,
-		}).Dial,
+		DialContext:           baseDial,
 		ResponseHeaderTimeout: 20 * time.Second,
 		ExpectContinueTimeout: 5 * time.Second,
 		TLSHandshakeTimeout:   30 * time.Second,
@@ -196,8 +202,8 @@ func NewHTTP(config *tls.Config) *HTTP {
 	h := &HTTP{
 		transport: transport,
 		client:    client,
+		baseDial:  baseDial,
 	}
-	// client.CheckRedirect = h.redirect
 	return h
 }
 
@@ -249,26 +255,39 @@ func (h *HTTP) ConfigureProxyDial(dialContext func(ctx context.Context, network,
 	}
 	switch transport := h.transport.(type) {
 	case *http.Transport:
-		transport.DialContext = dialContext
+		if dialContext != nil {
+			transport.DialContext = dialContext
+		} else {
+			// 传 nil 表示去掉代理拨号: 回基础拨号, 不能让 transport 退到无超时的零值 Dialer.
+			transport.DialContext = h.baseDial
+		}
 	case *http3.Transport:
 		return errors.New("quic protocol can not set proxy")
 	}
 	return nil
 }
 
+// ConfigureProxyClear 清除当前代理设置, 拨号恢复到 NewHTTP 的基础拨号 (保留 20s 拨号超时).
+// 不清除 proxyURL/proxyDial 缓存, 之后可用 ConfigureProxyReset 还原.
 func (h *HTTP) ConfigureProxyClear() {
 	switch transport := h.transport.(type) {
 	case *http.Transport:
 		transport.Proxy = nil
-		transport.DialContext = nil
+		transport.DialContext = h.baseDial
 	}
 }
 
+// ConfigureProxyReset 还原到缓存的代理设置 (ConfigureProxy / ConfigureProxyDial 的
+// storeCache=true 路径). 未缓存代理拨号时回到基础拨号, 与 ConfigureProxyClear 行为一致.
 func (h *HTTP) ConfigureProxyReset() {
 	switch transport := h.transport.(type) {
 	case *http.Transport:
 		transport.Proxy = h.proxyURL
-		transport.DialContext = h.proxyDial
+		if h.proxyDial != nil {
+			transport.DialContext = h.proxyDial
+		} else {
+			transport.DialContext = h.baseDial
+		}
 	}
 }
 

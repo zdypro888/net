@@ -3,6 +3,7 @@ package net
 import (
 	"context"
 	"errors"
+	gonet "net"
 	"net/http"
 	"net/http/httptest"
 	stdurl "net/url"
@@ -70,5 +71,81 @@ func TestRequestMethodNegativeAutoRetryDoesNotReturnNilNil(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200", resp.StatusCode)
 		}
+	}
+}
+
+// TestConfigureProxyDialClearResetPreservesBaseDial 回归 B1:
+// 旧实现 NewHTTP 用废弃的 Transport.Dial 做基础拨号 (拨号期不响应 ctx),
+// ConfigureProxyClear 把 DialContext 置 nil 后靠 Dial 兜底. 迁移到 DialContext
+// 后必须保证: Clear 恢复基础拨号 (而非 nil/丢失 20s 超时), Reset 在有缓存代理
+// 拨号时还原代理拨号、无缓存时回基础拨号.
+func TestConfigureProxyDialClearResetPreservesBaseDial(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	h := NewHTTP(nil)
+	defer h.Dispose()
+	transport, ok := h.transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", h.transport)
+	}
+	//lint:ignore SA1019 回归断言: NewHTTP 不应再设置废弃的 Transport.Dial
+	if transport.Dial != nil { //nolint:staticcheck // 同上, 仅作回归断言
+		t.Fatal("NewHTTP still sets deprecated Transport.Dial")
+	}
+	if transport.DialContext == nil {
+		t.Fatal("NewHTTP did not set Transport.DialContext")
+	}
+
+	var proxyDials int
+	countingDial := func(ctx context.Context, network, addr string) (gonet.Conn, error) {
+		proxyDials++
+		return (&gonet.Dialer{Timeout: 20 * time.Second}).DialContext(ctx, network, addr)
+	}
+	if err := h.ConfigureProxyDial(countingDial, true); err != nil {
+		t.Fatalf("ConfigureProxyDial failed: %v", err)
+	}
+	doRequest := func(stage string) {
+		res, err := h.Request(context.Background(), server.URL, nil, nil)
+		if err != nil {
+			t.Fatalf("%s: request failed: %v", stage, err)
+		}
+		if _, err := res.Data(); err != nil {
+			t.Fatalf("%s: read body failed: %v", stage, err)
+		}
+		h.client.CloseIdleConnections() // 强制下次请求重新拨号
+	}
+
+	doRequest("proxy dial active")
+	if proxyDials != 1 {
+		t.Fatalf("proxy dials after ConfigureProxyDial = %d, want 1", proxyDials)
+	}
+
+	h.ConfigureProxyClear()
+	if transport.DialContext == nil {
+		t.Fatal("ConfigureProxyClear left DialContext nil; base dial (20s timeout) lost")
+	}
+	doRequest("after clear")
+	if proxyDials != 1 {
+		t.Fatalf("proxy dials after ConfigureProxyClear = %d, want 1 (base dial expected)", proxyDials)
+	}
+
+	h.ConfigureProxyReset()
+	doRequest("after reset")
+	if proxyDials != 2 {
+		t.Fatalf("proxy dials after ConfigureProxyReset = %d, want 2 (cached proxy dial restored)", proxyDials)
+	}
+
+	// 无缓存代理拨号时 Reset 回基础拨号, 与 Clear 等价.
+	h.proxyDial = nil
+	h.ConfigureProxyReset()
+	if transport.DialContext == nil {
+		t.Fatal("ConfigureProxyReset with no cached proxy dial left DialContext nil")
+	}
+	doRequest("after reset without cache")
+	if proxyDials != 2 {
+		t.Fatalf("proxy dials after Reset without cache = %d, want 2", proxyDials)
 	}
 }

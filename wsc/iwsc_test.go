@@ -704,3 +704,55 @@ func TestWSConnectionCloseDoesNotBlockWhenMessageChannelIsFull(t *testing.T) {
 		t.Fatalf("Close blocked on full message channel")
 	}
 }
+
+// TestServerSessionDirectCloseRemovesTableEntry 回归 D4:
+// 调用方拿到 OnConnection 返回的 Session 后直接 session.Close() (不经
+// server.RemoveSession) 时, 旧实现 server.sessions[guid] 滞留到 idle-timeout;
+// WithSessionIdleTimeout(0) (禁用空闲清理) 下则永不回收. 修复后 Session.Close
+// 通过 onClose 回调摘除表项, 与 idle-timeout 配置无关.
+func TestServerSessionDirectCloseRemovesTableEntry(t *testing.T) {
+	server := NewServerWithBuffer[testPayload](8, WithSessionIdleTimeout(0))
+	upgrader := websocket.Upgrader{}
+	sessionCh := make(chan *Session[testPayload], 1)
+
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		session, err := server.OnConnection(conn, nil)
+		if err != nil {
+			return
+		}
+		select {
+		case sessionCh <- session:
+		default:
+		}
+	}))
+	defer httpServer.Close()
+	defer checkClose(t, "server", server.Close)
+
+	client := NewClientWithBuffer[testPayload]("ws"+httpServer.URL[len("http"):], 8)
+	defer checkClose(t, "client", client.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+
+	var session *Session[testPayload]
+	select {
+	case session = <-sessionCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server session not established")
+	}
+	guid := session.GUID()
+	if server.GetSession(guid) != session {
+		t.Fatal("session not registered in server table")
+	}
+
+	checkClose(t, "session", session.Close)
+	if got := server.GetSession(guid); got != nil {
+		t.Fatalf("server table still holds session %q after direct Close; zombie entry", guid)
+	}
+}

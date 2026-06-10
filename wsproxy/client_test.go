@@ -44,7 +44,7 @@ func TestClientDialHandshakeHonorsContextDeadline(t *testing.T) {
 	}
 }
 
-func TestPumpCopyLoopReturnsWhenWebSocketSideCloses(t *testing.T) {
+func TestCopyLoopReturnsWhenWebSocketSideCloses(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	serverConn := make(chan *websocket.Conn, 1)
 	errCh := make(chan error, 1)
@@ -75,7 +75,7 @@ func TestPumpCopyLoopReturnsWhenWebSocketSideCloses(t *testing.T) {
 	pipeReader, pipeWriter := net.Pipe()
 	done := make(chan error, 1)
 	go func() {
-		done <- (&pump{}).copyLoop(context.Background(), proxyConn, pipeReader)
+		done <- copyLoop(context.Background(), proxyConn, pipeReader)
 	}()
 
 	if err := wsConn.Close(); err != nil {
@@ -101,10 +101,10 @@ func TestServerCloseAllCancelsInflightDialout(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 
 	// 测试服务器作为 wsproxy.Server 的 OnConnection 入口.
-	// 我们要让 OnConnection 进入 dialout 路径, 即收到 MethodSlaverDialout.
-	// 因为没有可注册的 slaver, DialContext 会立即 ErrNoConnection 退出 copyLoop.
-	// 这条路径不足以触发 activeWG 的真正等待. 改为在 server 上预先 push 一个 fake
-	// slaver, 然后让 OnConnection 收到 MethodSlaverDialout 触发 onClientDialout
+	// 我们要让 OnConnection 进入 client dialout 路径, 即收到 MethodClientDialout.
+	// 如果没有可用 slaver, DialContext 会立即 ErrNoConnection, 不会进入 copyLoop,
+	// 也不足以触发 activeWG 的真正等待. 因此先在 server 上注册一个 fake slaver,
+	// 再让 OnConnection 收到 MethodClientDialout 触发 onClientDialout
 	// 走完整流程进入 copyLoop, CloseAll 时 ctx-cancel 让 copyLoop 退出.
 
 	// 准备 fake slaver: 一个会卡住的 websocket 连接, 它的 ReadJSON 会一直等.
@@ -130,10 +130,10 @@ func TestServerCloseAllCancelsInflightDialout(t *testing.T) {
 		t.Fatalf("slaver dial failed: %v", err)
 	}
 	defer checkClose(t, "slaver websocket", slaverConn.Close)
-	// 直接 push 到 sessions 池, 跳过 OnConnection 握手.
-	proxyServer.locker.Lock()
-	proxyServer.sessions.PushBack(&Session{Id: "slaver-99", Conn: slaverConn})
-	proxyServer.locker.Unlock()
+	// 直接入池 (跳过 OnConnection 握手), 走与注册分支相同的 registerSlaverSession.
+	if !proxyServer.registerSlaverSession(&Session{Id: "slaver-99", Conn: slaverConn}) {
+		t.Fatal("registerSlaverSession rejected fake slaver")
+	}
 
 	// 起 OnConnection 入口 server.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -153,7 +153,7 @@ func TestServerCloseAllCancelsInflightDialout(t *testing.T) {
 	defer checkClose(t, "client websocket", clientWS.Close)
 	if err := clientWS.WriteJSON(&connPacket{
 		Id:      "client-1",
-		Method:  MethodSlaverDialout,
+		Method:  MethodClientDialout, // A1: client → server 的拨号请求方法
 		Network: "tcp",
 		Address: "127.0.0.1:1", // 拨号会失败, 但 onClientDialout 在 DialContext 失败前
 	}); err != nil {
@@ -209,9 +209,9 @@ func TestServerDialContextCancelWhileWaitingForSlaverReply(t *testing.T) {
 	if err != nil {
 		t.Fatalf("slaver dial failed: %v", err)
 	}
-	proxyServer.locker.Lock()
-	proxyServer.sessions.PushBack(&Session{Id: "slaver-cancel", Conn: slaverConn})
-	proxyServer.locker.Unlock()
+	if !proxyServer.registerSlaverSession(&Session{Id: "slaver-cancel", Conn: slaverConn}) {
+		t.Fatal("registerSlaverSession rejected fake slaver")
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
@@ -329,5 +329,249 @@ func TestServerTokenRequiredForRegistration(t *testing.T) {
 	defer checkClose(t, "good token websocket", conn.Close)
 	if !waitForCount(1) {
 		t.Fatalf("ConnectionCount after good token = %d, want 1", proxyServer.ConnectionCount())
+	}
+}
+
+// TestClientDialThroughServerEndToEnd 回归 A1:
+// 旧实现 Server.OnConnection 不处理 MethodClientDialout (Client.Dial 发送的方法),
+// 请求落入 default 被当未知方法关闭 — Client.Dial 对自家 Server 必然失败.
+// 修复后 Client → Server → Slaver → 目标 TCP 全链路必须互通.
+func TestClientDialThroughServerEndToEnd(t *testing.T) {
+	// 目标: 本地 TCP echo.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	defer checkClose(t, "echo listener", listener.Close)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer checkClose(t, "echo conn", conn.Close)
+		buf := make([]byte, 64)
+		n, err := conn.Read(buf)
+		if err != nil {
+			return
+		}
+		if _, err := conn.Write(buf[:n]); err != nil {
+			t.Logf("echo write failed: %v", err)
+		}
+	}()
+
+	proxyServer := NewServer()
+	defer proxyServer.CloseAll()
+	upgrader := websocket.Upgrader{}
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		proxyServer.OnConnection(conn)
+	}))
+	defer wsServer.Close()
+	wsURL := "ws" + wsServer.URL[len("http"):]
+
+	// 真实 slaver 注册.
+	slaverCtx, cancelSlaver := context.WithCancel(context.Background())
+	defer cancelSlaver()
+	slaver := NewSlaver()
+	go func() {
+		if err := slaver.Run(slaverCtx, wsURL); err != nil && !errors.Is(err, context.Canceled) {
+			t.Logf("slaver run returned: %v", err)
+		}
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for proxyServer.ConnectionCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if proxyServer.ConnectionCount() == 0 {
+		t.Fatal("slaver never registered")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client := NewClient(wsURL)
+	conn, err := client.Dial(ctx, "tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("Client.Dial through Server failed: %v", err)
+	}
+	defer checkClose(t, "tunnel conn", conn.Close)
+
+	payload := []byte("hello-wsproxy")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("tunnel write failed: %v", err)
+	}
+	buf := make([]byte, 64)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("tunnel read failed: %v", err)
+	}
+	if string(buf[:n]) != string(payload) {
+		t.Fatalf("echo mismatch: got %q want %q", buf[:n], payload)
+	}
+}
+
+// TestServerRemovesSlaverDisconnectedWhilePooled 回归 D1:
+// 旧实现池内连接死了也滞留, 直到被 pop 才白费最长 30s 握手超时. 修复后 watcher
+// 在注册侧断开时立即出池, 并通过 StaleSessions 暴露 (C2).
+func TestServerRemovesSlaverDisconnectedWhilePooled(t *testing.T) {
+	proxyServer := NewServer()
+	defer proxyServer.CloseAll()
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		proxyServer.OnConnection(conn)
+	}))
+	defer server.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+server.URL[len("http"):], nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	if err := conn.WriteJSON(&connPacket{Id: "slaver-dead", Method: MethodRegisterSlaver}); err != nil {
+		t.Fatalf("register write failed: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for proxyServer.ConnectionCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if proxyServer.ConnectionCount() != 1 {
+		t.Fatalf("ConnectionCount after register = %d, want 1", proxyServer.ConnectionCount())
+	}
+
+	// slaver 注册侧断开: watcher 必须立即出池.
+	checkClose(t, "slaver websocket", conn.Close)
+	deadline = time.Now().Add(2 * time.Second)
+	for proxyServer.ConnectionCount() != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := proxyServer.ConnectionCount(); got != 0 {
+		t.Fatalf("ConnectionCount after slaver disconnect = %d, want 0 (dead entry lingering)", got)
+	}
+	if got := proxyServer.Stats().StaleSessions; got != 1 {
+		t.Fatalf("StaleSessions = %d, want 1", got)
+	}
+
+	// 池空时 DialContext 报 ErrNoConnection 并计 NoSessionDials (C2).
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := proxyServer.DialContext(ctx, "tcp", "example.com:443"); !errors.Is(err, ErrNoConnection) {
+		t.Fatalf("DialContext on empty pool = %v, want ErrNoConnection", err)
+	}
+	if got := proxyServer.Stats().NoSessionDials; got != 1 {
+		t.Fatalf("NoSessionDials = %d, want 1", got)
+	}
+}
+
+// TestServerEvictsSlaverSendingUnsolicitedPacketWhilePooled 回归 D1 补丁:
+// 池内 slaver 违反协议主动发包时, watcher 读到包后若不出池, 条目将失去看守
+// (watcher 已退出), 之后断开无人检测, 退化回"滞留到 pop 时才暴露". 修复后
+// 读到任何结果只要条目还在池内就立即驱逐并计 StaleSessions.
+func TestServerEvictsSlaverSendingUnsolicitedPacketWhilePooled(t *testing.T) {
+	proxyServer := NewServer()
+	defer proxyServer.CloseAll()
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		proxyServer.OnConnection(conn)
+	}))
+	defer server.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+server.URL[len("http"):], nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer checkClose(t, "misbehaving slaver", conn.Close)
+	if err := conn.WriteJSON(&connPacket{Id: "slaver-noisy", Method: MethodRegisterSlaver}); err != nil {
+		t.Fatalf("register write failed: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for proxyServer.ConnectionCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if proxyServer.ConnectionCount() != 1 {
+		t.Fatalf("ConnectionCount after register = %d, want 1", proxyServer.ConnectionCount())
+	}
+
+	// 入池后主动发包 (协议违例): watcher 必须立即驱逐, 不能等到 pop 才暴露.
+	if err := conn.WriteJSON(&connPacket{Id: "slaver-noisy", Method: MethodRegisterSlaver}); err != nil {
+		t.Fatalf("unsolicited write failed: %v", err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for proxyServer.ConnectionCount() != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := proxyServer.ConnectionCount(); got != 0 {
+		t.Fatalf("ConnectionCount after unsolicited packet = %d, want 0 (unwatched entry lingering)", got)
+	}
+	if got := proxyServer.Stats().StaleSessions; got != 1 {
+		t.Fatalf("StaleSessions = %d, want 1", got)
+	}
+}
+
+// TestServerMaxSessionsRejectsExcessRegistration 回归 D1: 注册池上限.
+func TestServerMaxSessionsRejectsExcessRegistration(t *testing.T) {
+	proxyServer := NewServer()
+	proxyServer.MaxSessions = 1
+	defer proxyServer.CloseAll()
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		proxyServer.OnConnection(conn)
+	}))
+	defer server.Close()
+
+	register := func(id string) *websocket.Conn {
+		conn, _, err := websocket.DefaultDialer.Dial("ws"+server.URL[len("http"):], nil)
+		if err != nil {
+			t.Fatalf("dial failed: %v", err)
+		}
+		if err := conn.WriteJSON(&connPacket{Id: id, Method: MethodRegisterSlaver}); err != nil {
+			t.Fatalf("register write failed: %v", err)
+		}
+		return conn
+	}
+	waitForCount := func(want int) bool {
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			if proxyServer.ConnectionCount() == want {
+				return true
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		return proxyServer.ConnectionCount() == want
+	}
+
+	first := register("slaver-1")
+	defer checkClose(t, "first slaver", first.Close)
+	if !waitForCount(1) {
+		t.Fatalf("ConnectionCount after first register = %d, want 1", proxyServer.ConnectionCount())
+	}
+
+	second := register("slaver-2")
+	defer checkClose(t, "second slaver", second.Close)
+	// 超限注册被拒: server 关闭连接, 第二个 conn 的读会很快报错.
+	// deadline 只是兜底; 读到的必须是 server 主动关闭, 不能是 deadline 超时 ——
+	// 否则"server 漏关被拒连接"也能靠超时蒙混过断言.
+	if err := second.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	if _, _, err := second.ReadMessage(); err == nil {
+		t.Fatal("second registration unexpectedly accepted (no close from server)")
+	} else if netErr, ok := errors.AsType[net.Error](err); ok && netErr.Timeout() {
+		t.Fatalf("server did not close rejected connection within deadline: %v", err)
+	}
+	if got := proxyServer.ConnectionCount(); got != 1 {
+		t.Fatalf("ConnectionCount after over-limit register = %d, want 1", got)
 	}
 }

@@ -2,6 +2,7 @@ package net
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -9,6 +10,9 @@ import (
 	"time"
 )
 
+// ErrNotConnected: Client 从未通过 Reset/ResetUnsafe 建立过连接.
+// ErrConnectionClosed: 曾经连接过, 但已被 Close 或底层连接断开.
+// 同一可观察状态只返回同一 sentinel; 下游用 errors.Is 区分"还没连"与"连过又断".
 var ErrNotConnected = fmt.Errorf("not connected")
 var ErrConnectionClosed = fmt.Errorf("connection closed")
 
@@ -24,7 +28,7 @@ type ClientStats struct {
 	AsynchanLen   int    // 当前 asynchan 队列长度 (高 = caller 投递快/asyncGo 处理慢)
 	AsynchanCap   int    // asynchan 容量
 	HeartCount    uint64 // 心跳累计次数 (跨 Reset 归零)
-	AsyncTimeouts uint64 // async 触发 DefaultAsyncTimeout 兜底的累计次数
+	AsyncTimeouts uint64 // async 入队等待超时 (DefaultAsyncTimeout 兜底或 caller deadline 到期) 的累计次数; 不含 caller 主动取消
 	LastError     error  // 最近一次 lastError 快照
 	Closed        bool   // 是否已 Close
 }
@@ -465,7 +469,13 @@ drainLoop:
 
 func (client *Client[M, T]) async(ctx context.Context, request *asynRequest[M, T]) error {
 	if client.asynchan == nil {
-		return ErrNotConnected
+		// stopChan 在首次 ResetUnsafe 时创建: 仍为 nil 说明从未连接过;
+		// 否则是连接后被 Close (CloseUnsafe 置 asynchan=nil) — 与下方
+		// stopChan 竞速分支同语义, 同一"已关"状态只暴露 ErrConnectionClosed.
+		if client.stopChan == nil {
+			return ErrNotConnected
+		}
+		return ErrConnectionClosed
 	}
 	// RUN-6: caller 传 ctx 无 deadline 时强加 DefaultAsyncTimeout 兜底, 防止
 	// asynchan 满 + asyncGo 卡死 = 永久阻塞. 不影响有 deadline 的 caller.
@@ -476,7 +486,11 @@ func (client *Client[M, T]) async(ctx context.Context, request *asynRequest[M, T
 	}
 	select {
 	case <-ctx.Done():
-		client.asyncTimeouts.Add(1)
+		// 只把真正的超时 (内部 DefaultAsyncTimeout 兜底或 caller deadline 到期)
+		// 计入 asyncTimeouts; caller 主动取消 (context.Canceled) 不是拥塞信号.
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			client.asyncTimeouts.Add(1)
+		}
 		return ctx.Err()
 	case client.asynchan <- request:
 		return nil

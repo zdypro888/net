@@ -176,6 +176,9 @@ func (server *Server[T]) OnConnection(conn *websocket.Conn, args any) (*Session[
 	} else {
 		session = createSessionWithBuffer[T](req.GUID, server.bufferSize)
 		session.setOnDisconnect(server.scheduleSessionCleanup)
+		// D4: 调用方直接 session.Close() (不经 RemoveSession) 时也要把表项摘除,
+		// 否则禁用 idle cleanup (WithSessionIdleTimeout<=0) 的配置下僵尸条目永不回收.
+		session.setOnClose(server.detachSession)
 		server.sessions[req.GUID] = session
 		created = true
 	}
@@ -224,6 +227,19 @@ func (server *Server[T]) GetSession(guid string) *Session[T] {
 	server.locker.Lock()
 	defer server.locker.Unlock()
 	return server.sessions[guid]
+}
+
+// detachSession 是 session.Close 触发的回调 (D4): 把自己从 sessions 表摘除并取消
+// pending 的 idle-cleanup timer. 只摘表不再调 Close (调用方正在 Close 中).
+// 与 RemoveSession / expireSession / OnConnection 错误路径并发安全: 各方都以
+// "表内身份匹配才删除"为门控, 后到者 no-op, 不会 double-remove.
+func (server *Server[T]) detachSession(session *Session[T]) {
+	server.locker.Lock()
+	if cur, ok := server.sessions[session.guid]; ok && cur == session {
+		delete(server.sessions, session.guid)
+		server.cancelSessionCleanupLocked(session.guid)
+	}
+	server.locker.Unlock()
 }
 
 // RemoveSession 移除并关闭指定会话

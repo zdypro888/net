@@ -20,6 +20,23 @@ import (
 
 const proxyConnectTimeout = 30 * time.Second
 
+// prefixConn 把 CONNECT 握手期间被 bufio.Reader 预读、滞留在缓冲里的隧道字节
+// 在交还给调用方前补回: 先吐 prefix, 耗尽后透明转发给底层 conn。仅在 br.Buffered()>0
+// 时使用, 因此常态零开销, 不改变正常路径行为。
+type prefixConn struct {
+	net.Conn
+	prefix []byte
+}
+
+func (c *prefixConn) Read(b []byte) (int, error) {
+	if len(c.prefix) > 0 {
+		n := copy(b, c.prefix)
+		c.prefix = c.prefix[n:]
+		return n, nil
+	}
+	return c.Conn.Read(b)
+}
+
 // HTTPDebugProxy 调试代理
 var HTTPDebugProxy = &Proxy{Address: "http://127.0.0.1:8888"}
 
@@ -154,6 +171,19 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return nil, errors.Join(ctxErr, conn.Close())
 			}
+		}
+		// http.ReadResponse 用 br 读 CONNECT 响应头, 若代理把响应紧跟着的隧道数据
+		// 一并发来 (合法: 服务端可在 200 后立即推流), 这些字节会滞留在 br 内部缓冲。
+		// 直接返回裸 conn 会丢掉它们 → 隧道首包数据静默丢失。Buffered()==0 (本库承载
+		// 的 TLS/HTTP 目标都是 client-speaks-first, 常态) 时返回原 conn, 行为不变。
+		if n := br.Buffered(); n > 0 {
+			peeked, peekErr := br.Peek(n)
+			if peekErr != nil {
+				return nil, errors.Join(peekErr, conn.Close())
+			}
+			prefix := make([]byte, n)
+			copy(prefix, peeked)
+			return &prefixConn{Conn: conn, prefix: prefix}, nil
 		}
 		return conn, nil
 	case "ws", "wss":

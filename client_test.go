@@ -376,3 +376,72 @@ func TestClientRequestContextCancel(t *testing.T) {
 
 	conn.readCh <- testMessage{id: "req-cancel", value: "late-response"}
 }
+
+// TestClientAsyncErrorDistinguishesNeverConnectedFromClosed 回归 A3:
+// 旧实现 Close 后 (asynchan 已置 nil) Write 返回 ErrNotConnected, 而连接刚断
+// (stopChan 已关, asynchan 未置 nil) 时返回 ErrConnectionClosed — 同一"已关"
+// 语义暴露两种 sentinel. 现在按真实状态分流: 从未 Reset → ErrNotConnected;
+// 连接过又关闭 → ErrConnectionClosed.
+func TestClientAsyncErrorDistinguishesNeverConnectedFromClosed(t *testing.T) {
+	client := NewClient[testMessage, *fakeConn]()
+	if err := client.Write(context.Background(), testMessage{value: "x"}); !errors.Is(err, ErrNotConnected) {
+		t.Fatalf("Write before first Reset = %v, want ErrNotConnected", err)
+	}
+	client.Reset(context.Background(), newFakeConn())
+	checkClose(t, "client", client.Close)
+	if err := client.Write(context.Background(), testMessage{value: "y"}); !errors.Is(err, ErrConnectionClosed) {
+		t.Fatalf("Write after Close = %v, want ErrConnectionClosed", err)
+	}
+}
+
+// TestClientAsyncTimeoutsNotIncrementedByCallerCancel 回归 C1:
+// 旧实现 async() 的 ctx.Done 分支无差别 asyncTimeouts.Add(1), caller 主动取消
+// 也被计成"超时". 现在只有 ctx.Err()==DeadlineExceeded (内部兜底或 caller
+// deadline 到期) 才计数.
+func TestClientAsyncTimeoutsNotIncrementedByCallerCancel(t *testing.T) {
+	conn := newFakeConn()
+	client := NewClient[testMessage, *fakeConn]()
+	client.Reset(context.Background(), conn)
+	t.Cleanup(func() {
+		checkClose(t, "fake conn", func() error {
+			return conn.Close(context.Background()) // 解锁卡在 conn.Write 的 asyncGo
+		})
+		checkClose(t, "client", client.Close)
+	})
+
+	// 与 TestClientAsyncRespectsCtxDeadline 同款填充: writeCh(16) + 在 conn.Write
+	// 卡住的 1 条 + asynchan(16) = 33, 第 34 条必然阻塞在 async() 的 select 上.
+	const writes = 33
+	for i := 0; i < writes; i++ {
+		ctxFill, cancel := context.WithTimeout(context.Background(), time.Second)
+		err := client.Write(ctxFill, testMessage{value: "fill"})
+		cancel()
+		if err != nil {
+			t.Logf("fill write %d unexpectedly errored %v; environment may differ", i, err)
+			break
+		}
+	}
+
+	// 基线增量断言而非绝对值: 环境慢时 fill 自身可能撞上 1s deadline 计入
+	// AsyncTimeouts, 那不是本测试要守护的行为 —— 只验证"被取消的写不产生增量".
+	baseline := client.Stats().AsyncTimeouts
+
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Write(cancelCtx, testMessage{value: "will-cancel"})
+	}()
+	time.Sleep(50 * time.Millisecond) // 让 Write 进入 select 阻塞
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Write error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Write did not return after caller cancel")
+	}
+	if got := client.Stats().AsyncTimeouts; got != baseline {
+		t.Fatalf("AsyncTimeouts after caller cancel = %d, want %d (canceled write must not increment)", got, baseline)
+	}
+}

@@ -178,8 +178,7 @@ func (slaver *Slaver) dialContext(ctx context.Context, wsConn *websocket.Conn, n
 		return
 	}
 	stopContextClose()
-	p := &pump{}
-	if err := p.copyLoop(ctx, wsConn, conn); err != nil {
+	if err := copyLoop(ctx, wsConn, conn); err != nil {
 		slog.Warn("wsproxy slaver copy loop failed", slog.Any("err", err))
 	}
 }

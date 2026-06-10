@@ -35,7 +35,7 @@ type SessionStats struct {
 	AsyncChanCap    int    // asyncChan 容量
 	HandchanLen     int    // 当前 handchan 队列长度 (高 = 上层 consume 慢)
 	HandchanCap     int    // handchan 容量
-	AsyncTimeouts   uint64 // async 写 asyncChan 触发兜底超时的累计次数
+	AsyncTimeouts   uint64 // async 写 asyncChan 等待超时 (兜底或 caller deadline 到期) 的累计次数; 不含 caller 主动取消
 	HandchanWaitNS  uint64 // handleMessageGo 写 handchan 的累计阻塞纳秒数
 	HandchanWarnCnt uint64 // handchan 阻塞超过 HandchanBlockWarnThreshold 的累计次数
 	WriteErrors     uint64 // asyncGo 调 rawconn.WriteUnsafe / RequestCallbackUnsafe 返回 err 的累计次数 (BUG-3)
@@ -63,7 +63,11 @@ type Session[T any] struct {
 	wsconn         atomic.Pointer[wsconnection[T]]
 	connGeneration atomic.Uint64
 	onDisconnect   atomic.Pointer[func(session *Session[T], generation uint64)]
-	closedSignal   atomic.Bool
+	// onClose: D4 修复. server 创建 session 时注册"从 sessions 表摘除自己", 让调用方
+	// 直接 session.Close() (不经 server.RemoveSession) 时表项也被移除 —— 否则在
+	// WithSessionIdleTimeout<=0 (禁用空闲清理) 配置下僵尸条目永不回收.
+	onClose      atomic.Pointer[func(session *Session[T])]
+	closedSignal atomic.Bool
 }
 
 // Stats 拍 session 当前队列占用 + 观察性计数器. 不持锁 — Len/Cap 是 chan
@@ -124,6 +128,16 @@ func (s *Session[T]) advanceGeneration() uint64 {
 
 func (s *Session[T]) setOnDisconnect(fn func(session *Session[T], generation uint64)) {
 	s.onDisconnect.Store(&fn)
+}
+
+func (s *Session[T]) setOnClose(fn func(session *Session[T])) {
+	s.onClose.Store(&fn)
+}
+
+func (s *Session[T]) notifyClose() {
+	if fn := s.onClose.Load(); fn != nil {
+		(*fn)(s)
+	}
 }
 
 func (s *Session[T]) notifyDisconnect(generation uint64) {
@@ -344,7 +358,11 @@ func (s *Session[T]) async(ctx context.Context, info *asyncInfo[T]) error {
 	case s.asyncChan <- info:
 		return nil
 	case <-ctx.Done():
-		s.asyncTimeouts.Add(1)
+		// 与 net.Client.async 一致: 只把真正的超时 (内部兜底或 caller deadline 到期)
+		// 计入 asyncTimeouts; caller 主动取消不是拥塞信号.
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			s.asyncTimeouts.Add(1)
+		}
 		return ctx.Err()
 	case <-s.stopChan:
 		return ErrSessionClosed
@@ -352,8 +370,7 @@ func (s *Session[T]) async(ctx context.Context, info *asyncInfo[T]) error {
 }
 
 // reset 切换 session 底层 ws 连接 (典型场景: client 断线重连). 入队 asyncCommandConn,
-// 由 asyncGo 处理. 持 WLock 是为了让连接切换命令先于后续 Write/Reply/Request
-// 入队; 否则并发调用可能把业务消息排到 reset 前面, 导致写到旧连接或未连接状态.
+// 由 asyncGo 处理.
 func (s *Session[T]) reset(ctx context.Context, conn *websocket.Conn, codec Codec) error {
 	info := &asyncInfo[T]{
 		Command: asyncCommandConn,
@@ -361,12 +378,17 @@ func (s *Session[T]) reset(ctx context.Context, conn *websocket.Conn, codec Code
 		Codec:   codec,
 		ready:   make(chan error, 1),
 	}
-	// 仅入队阶段持锁: 保证 conn 切换命令先于后续并发 Write/Reply/Request 入队。随后
-	// 释放锁再等 ready —— asyncGo 处理本命令期间(可能被卡死的旧连接写拖到 WriteTimeout)
-	// 不应阻塞其它操作。ready 缓冲为 1 故 asyncGo 发送不阻塞; stopChan 创建后不变, 锁外读安全。
-	s.locker.Lock()
+	// 入队阶段持 RLock (与 Write/Reply/Request 同款): 锁的职责只是 asyncChan 生命周期
+	// 保护 (防 Close 并发 close(asyncChan) 导致 send-on-closed panic), 不是命令排序 ——
+	// 与 reset 并发的业务消息本就无确定顺序, 排在 conn 切换命令前后都是合法时序; reset
+	// 返回后的消息则由 ready 等待保证落在新连接上。改 RLock 修 D2: asyncChan 满时 async
+	// 可阻塞至 DefaultAsyncTimeout(30s), 旧实现此间持 WLock 会把所有并发 Write/Reply/
+	// Request (RLock) 挡住 30s。等 ready 阶段不持锁 —— asyncGo 处理本命令期间 (可能被
+	// 卡死的旧连接写拖到 WriteTimeout) 不应阻塞其它操作。ready 缓冲为 1 故 asyncGo 发送
+	// 不阻塞; stopChan 创建后不变, 锁外读安全。
+	s.locker.RLock()
 	err := s.async(ctx, info)
-	s.locker.Unlock()
+	s.locker.RUnlock()
 	if err != nil {
 		return err
 	}
@@ -466,6 +488,9 @@ func (s *Session[T]) Request(ctx context.Context, data T) (T, error) {
 // Close 关闭 session. 持 WLock 跟所有 in-flight 调用 (Reset/Write/Reply/Request
 // 入队阶段持 RLock) 互斥序列化. close(asyncChan) 后 asyncGo 退出走清理路径,
 // 后续 RLock 调用会看到 s.asyncChan == nil 返 ErrSessionClosed.
+// 退出前触发 onClose 回调 (server 注册的表项摘除, 幂等), 保证直接 Close 的 session
+// 不会作为僵尸条目滞留在 server.sessions 中. 锁序安全: 回调内只取 server.locker,
+// 而所有持 server.locker 的路径都不会反向获取 s.locker.
 func (s *Session[T]) Close() error {
 	s.locker.Lock()
 	defer s.locker.Unlock()
@@ -480,5 +505,6 @@ func (s *Session[T]) Close() error {
 		}
 	}
 	s.waiter.Wait()
+	s.notifyClose()
 	return nil
 }
