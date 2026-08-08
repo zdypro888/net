@@ -362,6 +362,36 @@ oldHandleClosed:
 	}
 }
 
+func TestClientIgnoresClosedFromStaleGeneration(t *testing.T) {
+	client := NewClientWithBuffer[testPayload]("ws://unused", 4)
+	defer checkClose(t, "client", client.Close)
+
+	client.locker.RLock()
+	session := client.session
+	handleChan := client.handleChan
+	client.locker.RUnlock()
+
+	staleGeneration := session.advanceGeneration()
+	currentGeneration := session.advanceGeneration()
+	session.handchan <- &Packet[testPayload]{Generation: staleGeneration, Closed: true}
+	session.handchan <- &Packet[testPayload]{
+		Data:       testPayload{Kind: "current", Value: 2},
+		Generation: currentGeneration,
+	}
+
+	select {
+	case packet := <-handleChan:
+		if packet.Closed {
+			t.Fatalf("stale Closed packet was forwarded: %#v", packet)
+		}
+		if packet.Generation != currentGeneration || packet.Data.Kind != "current" {
+			t.Fatalf("unexpected current-generation packet: %#v", packet)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("current-generation packet blocked behind stale Closed")
+	}
+}
+
 func TestServerRemovesDisconnectedSessionAfterIdleTimeout(t *testing.T) {
 	server := NewServerWithBuffer[testPayload](64, WithSessionIdleTimeout(20*time.Millisecond))
 	upgrader := websocket.Upgrader{}
@@ -568,14 +598,16 @@ func TestServerDisconnectCoalescesBlockedClosedPacketDelivery(t *testing.T) {
 
 	session.handchan <- &Packet[testPayload]{Data: testPayload{Kind: "queued"}}
 	done := make(chan struct{}, 2)
-	for range 2 {
+	runDisconnect := func(generation uint64) {
 		msgchan := make(chan *messagechannel[testPayload])
 		close(msgchan)
 		go func() {
-			session.handleMessageGo(session.handchan, msgchan, session.stopChan, session.generation())
+			session.handleMessageGo(session.handchan, msgchan, session.stopChan, generation)
 			done <- struct{}{}
 		}()
 	}
+	firstGeneration := session.advanceGeneration()
+	runDisconnect(firstGeneration)
 
 	hasCleanupTimer := func() bool {
 		server.locker.Lock()
@@ -601,6 +633,8 @@ func TestServerDisconnectCoalescesBlockedClosedPacketDelivery(t *testing.T) {
 			t.Fatalf("disconnect did not leave a pending Closed signal while consumer was blocked: %v", ctx.Err())
 		}
 	}
+	secondGeneration := session.advanceGeneration()
+	runDisconnect(secondGeneration)
 	select {
 	case <-done:
 	case <-ctx.Done():
@@ -611,10 +645,42 @@ func TestServerDisconnectCoalescesBlockedClosedPacketDelivery(t *testing.T) {
 	if packet.Closed {
 		t.Fatalf("first queued packet should not be the synthetic Closed packet")
 	}
-	select {
-	case <-done:
-	case <-ctx.Done():
-		t.Fatalf("blocked handleMessageGo did not finish after consumer resumed: %v", ctx.Err())
+
+	completed := 1
+	closedGenerations := make([]uint64, 0, 2)
+	for completed < 2 {
+		select {
+		case packet := <-session.handchan:
+			if !packet.Closed {
+				t.Fatalf("expected synthetic Closed packet, got %#v", packet)
+			}
+			closedGenerations = append(closedGenerations, packet.Generation)
+		case <-done:
+			completed++
+		case <-ctx.Done():
+			t.Fatalf("blocked handleMessageGo did not finish after consumer resumed: %v", ctx.Err())
+		}
+	}
+drainClosed:
+	for {
+		select {
+		case packet := <-session.handchan:
+			if !packet.Closed {
+				t.Fatalf("expected synthetic Closed packet, got %#v", packet)
+			}
+			closedGenerations = append(closedGenerations, packet.Generation)
+		default:
+			break drainClosed
+		}
+	}
+	if len(closedGenerations) == 0 || len(closedGenerations) > 2 {
+		t.Fatalf("Closed packet count = %d, want 1 or 2", len(closedGenerations))
+	}
+	if closedGenerations[len(closedGenerations)-1] != secondGeneration {
+		t.Fatalf("latest Closed generation = %d, want %d", closedGenerations[len(closedGenerations)-1], secondGeneration)
+	}
+	if len(closedGenerations) == 2 && closedGenerations[0] != firstGeneration {
+		t.Fatalf("first Closed generation = %d, want %d", closedGenerations[0], firstGeneration)
 	}
 }
 
@@ -635,12 +701,12 @@ func TestServerDisconnectClosedSignalResetsAfterDelivery(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	runDisconnect := func() {
+	runDisconnect := func(generation uint64) {
 		msgchan := make(chan *messagechannel[testPayload])
 		close(msgchan)
 		done := make(chan struct{})
 		go func() {
-			session.handleMessageGo(session.handchan, msgchan, session.stopChan, session.generation())
+			session.handleMessageGo(session.handchan, msgchan, session.stopChan, generation)
 			close(done)
 		}()
 		select {
@@ -650,18 +716,26 @@ func TestServerDisconnectClosedSignalResetsAfterDelivery(t *testing.T) {
 		}
 	}
 
-	runDisconnect()
+	firstGeneration := session.advanceGeneration()
+	runDisconnect(firstGeneration)
 	first := <-session.handchan
 	if !first.Closed {
 		t.Fatalf("first disconnect should deliver a Closed packet, got %#v", first)
 	}
+	if first.Generation != firstGeneration {
+		t.Fatalf("first Closed generation = %d, want %d", first.Generation, firstGeneration)
+	}
 	// 消费掉首个 Closed 后(server 端无 client.go 那样的消费即复位钩子), 第二次断线必须仍能投递
 	// 一个新的 Closed —— 若 closedSignal 卡在 true, forwardClosed 的 CAS 会失败而静默丢弃。
-	runDisconnect()
+	secondGeneration := session.advanceGeneration()
+	runDisconnect(secondGeneration)
 	select {
 	case second := <-session.handchan:
 		if !second.Closed {
 			t.Fatalf("second disconnect should deliver a Closed packet, got %#v", second)
+		}
+		if second.Generation != secondGeneration {
+			t.Fatalf("second Closed generation = %d, want %d", second.Generation, secondGeneration)
 		}
 	case <-time.After(200 * time.Millisecond):
 		t.Fatalf("second disconnect delivered no Closed packet: closedSignal stuck true after first delivery")

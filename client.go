@@ -460,10 +460,16 @@ drainLoop:
 	notifyRemaining := len(asyncNotifys)
 
 	// 通知 Write/Request 连接已关闭. signalStop 用 sync.Once, 与 CloseUnsafe 已经
-	// signalStop 过的场景幂等. OPS-2: 记一行 warn 让运维知道 client 因什么退出.
-	slog.Warn("net.Client closed",
-		slog.Any("lastError", lastErr),
-		slog.Int("notifyRemaining", notifyRemaining))
+	// signalStop 过的场景幂等. 主动关闭属于正常生命周期，只把意外断线记为 warn.
+	if client.closed.Load() {
+		slog.Debug("net.Client closed",
+			slog.Any("lastError", lastErr),
+			slog.Int("notifyRemaining", notifyRemaining))
+	} else {
+		slog.Warn("net.Client closed unexpectedly",
+			slog.Any("lastError", lastErr),
+			slog.Int("notifyRemaining", notifyRemaining))
+	}
 	client.signalStop()
 }
 

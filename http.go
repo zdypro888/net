@@ -295,6 +295,14 @@ func (h *HTTP) ConfigureTimeout(timeout time.Duration) {
 	h.client.Timeout = timeout
 }
 
+// ConfigureResponseHeaderTimeout 设置等待响应头的超时。
+// 调用方应在发起请求前完成配置，后续请求只读该值。
+func (h *HTTP) ConfigureResponseHeaderTimeout(timeout time.Duration) {
+	if transport, ok := h.transport.(*http.Transport); ok {
+		transport.ResponseHeaderTimeout = timeout
+	}
+}
+
 func (h *HTTP) ConfigureRedirect(checkRedirect func(req *http.Request, via []*http.Request) error) {
 	h.client.CheckRedirect = checkRedirect
 }

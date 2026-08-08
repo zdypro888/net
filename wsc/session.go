@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	stdnet "net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,9 +25,10 @@ const DefaultAsyncTimeout = 30 * time.Second
 const HandchanBlockWarnThreshold = 5 * time.Second
 
 type Packet[T any] struct {
-	ID     string // 请求 ID (用于回复)
-	Data   T
-	Closed bool
+	ID         string // 请求 ID (用于回复)
+	Data       T
+	Generation uint64 // 收到该包的底层连接代次
+	Closed     bool
 }
 
 // SessionStats 给运维查 wsc 健康度.
@@ -66,8 +68,10 @@ type Session[T any] struct {
 	// onClose: D4 修复. server 创建 session 时注册"从 sessions 表摘除自己", 让调用方
 	// 直接 session.Close() (不经 server.RemoveSession) 时表项也被移除 —— 否则在
 	// WithSessionIdleTimeout<=0 (禁用空闲清理) 配置下僵尸条目永不回收.
-	onClose      atomic.Pointer[func(session *Session[T])]
-	closedSignal atomic.Bool
+	onClose          atomic.Pointer[func(session *Session[T])]
+	closedSignal     atomic.Bool
+	closedGeneration atomic.Uint64
+	closedDelivered  atomic.Uint64
 }
 
 // Stats 拍 session 当前队列占用 + 观察性计数器. 不持锁 — Len/Cap 是 chan
@@ -209,23 +213,46 @@ func (s *Session[T]) handleMessageGo(handchan chan *Packet[T], msgchan <-chan *m
 			s.notifyDisconnect(generation)
 		}
 	}
-	// forwardClosed 用 closedSignal 把"正在补发的 Closed 包"合并为最多一个: client 的重连
-	// 循环依赖 handchan 上的 Closed 包触发重连, 但 server 端若禁用 idle cleanup 且上层永久不
-	// 消费, 每个断线 generation 都阻塞补发会无界堆 goroutine。CAS 抢到信号者才阻塞投递, 其余
-	// 直接返回(被合并, 不 park), 因此任一时刻至多一个 goroutine 卡在投递上。
-	// 投递成功(或整体关闭走 stopChan)后必须无条件清掉信号: 否则 server 端没有"消费即复位"的
-	// 钩子(只有 client.go 在读到 Closed 时复位), 一旦投递完成时 handchan 恰满, 信号会永久卡在
-	// true → 该 session 后续所有断线的 Closed 都被合并丢弃(小 buffer 下首次断线即触发)。复位后
-	// 后续断线可再次投递, 与上面注释"至少给恢复后的 consumer 留一个 Closed"的本意一致。
+	// forwardClosed 保证任一时刻至多一个 goroutine 阻塞投递 Closed。若阻塞期间又有连接断开，
+	// closedGeneration 会保留最新代次，投递者恢复后继续补发；中间代次可合并，因为最新代次的
+	// Closed 同时代表更早连接均已断开。代次加一编码，使尚未建连时的 generation=0 也可记录。
 	forwardClosed := func() {
+		encodedGeneration := generation + 1
+		for {
+			if encodedGeneration <= s.closedDelivered.Load() {
+				return
+			}
+			pending := s.closedGeneration.Load()
+			if encodedGeneration <= pending || s.closedGeneration.CompareAndSwap(pending, encodedGeneration) {
+				break
+			}
+		}
 		if !s.closedSignal.CompareAndSwap(false, true) {
 			return
 		}
-		select {
-		case handchan <- &Packet[T]{Closed: true}:
-		case <-stopChan:
+		for {
+			pending := s.closedGeneration.Load()
+			delivered := s.closedDelivered.Load()
+			if pending <= delivered {
+				s.closedSignal.Store(false)
+				if s.closedGeneration.Load() <= s.closedDelivered.Load() || !s.closedSignal.CompareAndSwap(false, true) {
+					return
+				}
+				continue
+			}
+			select {
+			case handchan <- &Packet[T]{Generation: pending - 1, Closed: true}:
+			case <-stopChan:
+				s.closedSignal.Store(false)
+				return
+			}
+			for {
+				delivered = s.closedDelivered.Load()
+				if pending <= delivered || s.closedDelivered.CompareAndSwap(delivered, pending) {
+					break
+				}
+			}
 		}
-		s.closedSignal.Store(false)
 	}
 	defer notifyDisconnect()
 	for running {
@@ -247,6 +274,7 @@ func (s *Session[T]) handleMessageGo(handchan chan *Packet[T], msgchan <-chan *m
 					continue
 				}
 				packet := msg.ToPacket()
+				packet.Generation = generation
 				// 快路径: handchan 有空位立即写入.
 				select {
 				case handchan <- packet:
@@ -329,7 +357,7 @@ func (s *Session[T]) asyncGo(asyncChan <-chan *asyncInfo[T], handchan chan *Pack
 		}
 	}
 	if err := rawconn.Close(); err != nil {
-		if !errors.Is(err, net.ErrConnectionClosed) {
+		if !errors.Is(err, net.ErrConnectionClosed) && !errors.Is(err, stdnet.ErrClosed) {
 			slog.Warn("wsc Session async raw connection close failed",
 				slog.String("guid", s.guid), slog.Any("err", err))
 		}

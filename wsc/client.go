@@ -130,7 +130,9 @@ func (c *Client[T]) handleMessageGo(session *Session[T], msgchan <-chan *Packet[
 			if !ok {
 				running = false
 			} else if msg.Closed {
-				session.closedSignal.Store(false)
+				if msg.Generation < session.generation() {
+					continue
+				}
 				select {
 				case <-stopChan:
 					running = false
