@@ -20,6 +20,14 @@ import (
 
 const proxyConnectTimeout = 30 * time.Second
 
+func deadlineWithin(ctx context.Context, timeout time.Duration) time.Time {
+	deadline := time.Now().Add(timeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	return deadline
+}
+
 // prefixConn 把 CONNECT 握手期间被 bufio.Reader 预读、滞留在缓冲里的隧道字节
 // 在交还给调用方前补回: 先吐 prefix, 耗尽后透明转发给底层 conn。仅在 br.Buffered()>0
 // 时使用, 因此常态零开销, 不改变正常路径行为。
@@ -28,6 +36,7 @@ type prefixConn struct {
 	prefix []byte
 }
 
+// Read 先返回 CONNECT 握手期间预读的隧道数据，再转发到底层连接。
 func (c *prefixConn) Read(b []byte) (int, error) {
 	if len(c.prefix) > 0 {
 		n := copy(b, c.prefix)
@@ -66,7 +75,7 @@ func (proxy *Proxy) ProxyURL(req *http.Request) (*url.URL, error) {
 	return proxy.resolve()
 }
 
-// Dial 拨号
+// DialContext 使用配置的代理地址建立连接，并服从 ctx 的取消与截止时间。
 func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	proxyURL, err := proxy.resolve()
 	if err != nil {
@@ -90,7 +99,7 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 		}
 		return d.DialContext(ctx, network, address)
 	case "http", "https":
-		dialer := &net.Dialer{}
+		dialer := &net.Dialer{Timeout: proxyConnectTimeout}
 		conn, err := dialer.DialContext(ctx, "tcp", proxyURL.Host)
 		if err != nil {
 			return nil, err
@@ -113,6 +122,10 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 			}
 			return errors.Join(err, closeErr)
 		}
+		deadline := deadlineWithin(ctx, proxyConnectTimeout)
+		if err := conn.SetDeadline(deadline); err != nil {
+			return nil, closeWithContextError(err)
+		}
 		if proxyURL.Scheme == "https" {
 			host := proxyURL.Hostname()
 			tlsCfg := proxy.TLSConfig
@@ -129,13 +142,6 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 				return nil, closeWithContextError(err)
 			}
 			conn = tlsConn
-		}
-		deadline := time.Now().Add(proxyConnectTimeout)
-		if ctxDeadline, ok := ctx.Deadline(); ok {
-			deadline = ctxDeadline
-		}
-		if err := conn.SetDeadline(deadline); err != nil {
-			return nil, closeWithContextError(err)
 		}
 		connectReq := (&http.Request{
 			Method: "CONNECT",
@@ -198,6 +204,7 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 	return nil, fmt.Errorf("type: %s not supported", proxyURL.Scheme)
 }
 
+// WithWSServer 绑定可复用的 WebSocket 代理服务端，用于本地反向拨号。
 func (proxy *Proxy) WithWSServer(server *wsproxy.Server) {
 	proxy.server = server
 }

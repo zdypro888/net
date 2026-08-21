@@ -24,11 +24,18 @@ const DefaultAsyncTimeout = 30 * time.Second
 // 不丢帧, 仅观察.
 const HandchanBlockWarnThreshold = 5 * time.Second
 
+// Packet 表示会话收到的数据及其请求 ID、连接代次和关闭状态。
 type Packet[T any] struct {
 	ID         string // 请求 ID (用于回复)
 	Data       T
 	Generation uint64 // 收到该包的底层连接代次
 	Closed     bool
+}
+
+type connectionArgsState struct {
+	value     any
+	pending   int
+	receiving bool
 }
 
 // SessionStats 给运维查 wsc 健康度.
@@ -51,6 +58,7 @@ type Session[T any] struct {
 	bufferSize int
 	locker     sync.RWMutex
 	stopChan   chan struct{}
+	stopOnce   sync.Once
 	asyncChan  chan *asyncInfo[T]
 	waiter     sync.WaitGroup
 	// 观察性计数器, atomic 读写.
@@ -72,6 +80,8 @@ type Session[T any] struct {
 	closedSignal     atomic.Bool
 	closedGeneration atomic.Uint64
 	closedDelivered  atomic.Uint64
+	connectionMu     sync.Mutex
+	connectionArgs   map[uint64]*connectionArgsState
 }
 
 // Stats 拍 session 当前队列占用 + 观察性计数器. 不持锁 — Len/Cap 是 chan
@@ -110,6 +120,7 @@ func (s *Session[T]) GUID() string {
 	return s.guid
 }
 
+// Handle 返回会话的入站数据通道；会话结束时该通道会关闭。
 func (s *Session[T]) Handle() <-chan *Packet[T] {
 	s.locker.RLock()
 	defer s.locker.RUnlock()
@@ -130,6 +141,60 @@ func (s *Session[T]) advanceGeneration() uint64 {
 	return s.connGeneration.Add(1)
 }
 
+func (s *Session[T]) setConnectionArgs(generation uint64, args any) {
+	if args == nil {
+		return
+	}
+	s.connectionMu.Lock()
+	if s.connectionArgs == nil {
+		s.connectionArgs = make(map[uint64]*connectionArgsState)
+	}
+	s.connectionArgs[generation] = &connectionArgsState{value: args, receiving: true}
+	s.connectionMu.Unlock()
+}
+
+func (s *Session[T]) retainConnectionArgs(generation uint64) {
+	s.connectionMu.Lock()
+	if state := s.connectionArgs[generation]; state != nil {
+		state.pending++
+	}
+	s.connectionMu.Unlock()
+}
+
+func (s *Session[T]) releaseConnectionArgs(generation uint64) any {
+	s.connectionMu.Lock()
+	defer s.connectionMu.Unlock()
+	state := s.connectionArgs[generation]
+	if state == nil {
+		return nil
+	}
+	value := state.value
+	if state.pending > 0 {
+		state.pending--
+	}
+	if !state.receiving && state.pending == 0 {
+		delete(s.connectionArgs, generation)
+	}
+	return value
+}
+
+func (s *Session[T]) finishConnectionArgs(generation uint64) {
+	s.connectionMu.Lock()
+	if state := s.connectionArgs[generation]; state != nil {
+		state.receiving = false
+		if state.pending == 0 {
+			delete(s.connectionArgs, generation)
+		}
+	}
+	s.connectionMu.Unlock()
+}
+
+// TakeConnectionArgs 返回指定连接代次绑定的参数，并标记一个已收到的数据包已领取。
+// 每个非关闭 Packet 应调用一次；最后一个包领取且接收协程退出后，对应参数会被释放。
+func (s *Session[T]) TakeConnectionArgs(generation uint64) any {
+	return s.releaseConnectionArgs(generation)
+}
+
 func (s *Session[T]) setOnDisconnect(fn func(session *Session[T], generation uint64)) {
 	s.onDisconnect.Store(&fn)
 }
@@ -148,6 +213,10 @@ func (s *Session[T]) notifyDisconnect(generation uint64) {
 	if fn := s.onDisconnect.Load(); fn != nil {
 		(*fn)(s, generation)
 	}
+}
+
+func (s *Session[T]) signalStop() {
+	s.stopOnce.Do(func() { close(s.stopChan) })
 }
 
 func createSessionWithBuffer[T any](guid string, bufferSize int) *Session[T] {
@@ -183,27 +252,33 @@ type asyncMsgErr[T any] struct {
 }
 
 type asyncInfo[T any] struct {
-	Command asyncCommand
-	Conn    *websocket.Conn
-	Codec   Codec // 仅 asyncCommandConn 使用: 本次连接握手协商出的 codec
-	Request *Message[T]
+	Command    asyncCommand
+	Conn       *websocket.Conn
+	Codec      Codec // 仅 asyncCommandConn 使用: 本次连接握手协商出的 codec
+	Args       any   // 仅 asyncCommandConn 使用: 随该连接收到的 Packet 传递
+	Generation uint64
+	Request    *Message[T]
+	Context    context.Context
 
-	response chan *asyncMsgErr[T]
-	ready    chan error
+	response     chan *asyncMsgErr[T]
+	responseOnce sync.Once
+	ready        chan error
 }
 
 // Response 处理响应数据或错误
 func (info *asyncInfo[T]) Response(msg *Message[T], err error) {
-	if info.response != nil {
-		select {
-		case info.response <- &asyncMsgErr[T]{Message: msg, Error: err}:
-		default:
+	info.responseOnce.Do(func() {
+		if info.response != nil {
+			select {
+			case info.response <- &asyncMsgErr[T]{Message: msg, Error: err}:
+			default:
+			}
+			close(info.response)
 		}
-		close(info.response)
-	}
+	})
 }
 
-func (s *Session[T]) handleMessageGo(handchan chan *Packet[T], msgchan <-chan *messagechannel[T], stopChan chan struct{}, generation uint64) {
+func (s *Session[T]) handleMessageGo(handchan chan *Packet[T], msgchan <-chan *messagechannel[T], stopChan chan struct{}, generation uint64, hasConnectionArgs bool) {
 	running := true
 	disconnected := false
 	notifiedDisconnect := false
@@ -255,6 +330,9 @@ func (s *Session[T]) handleMessageGo(handchan chan *Packet[T], msgchan <-chan *m
 		}
 	}
 	defer notifyDisconnect()
+	if hasConnectionArgs {
+		defer s.finishConnectionArgs(generation)
+	}
 	for running {
 		select {
 		case <-stopChan:
@@ -275,45 +353,48 @@ func (s *Session[T]) handleMessageGo(handchan chan *Packet[T], msgchan <-chan *m
 				}
 				packet := msg.ToPacket()
 				packet.Generation = generation
-				// 快路径: handchan 有空位立即写入.
-				select {
-				case handchan <- packet:
-					continue
-				case <-stopChan:
-					running = false
-					continue
-				default:
+				if hasConnectionArgs {
+					s.retainConnectionArgs(generation)
 				}
-				// 慢路径: handchan 满, 上层 consume goroutine 没及时 read.
-				// 加观察性计数 + 阻塞写; 不丢帧 (协议帧丢一条可能让 wire 状态
-				// 不一致). 超过阈值 log warn 提示运维: 要么上层 consume 卡了,
-				// 要么 bufferSize 配小了.
-				start := time.Now()
-				warnTimer := time.NewTimer(HandchanBlockWarnThreshold)
-				warned := false
-			blockLoop:
-				for {
-					select {
-					case handchan <- packet:
-						break blockLoop
-					case <-stopChan:
-						running = false
-						break blockLoop
-					case <-warnTimer.C:
-						if !warned {
-							warned = true
-							s.handchanWarnCnt.Add(1)
-							slog.Warn("wsc handchan blocked; upstream consume slow",
-								slog.String("guid", s.guid),
-								slog.Duration("waited", time.Since(start)),
-								slog.Int("cap", cap(handchan)))
-						}
-						warnTimer.Reset(HandchanBlockWarnThreshold)
+				if !s.forwardPacket(handchan, packet, stopChan) {
+					if hasConnectionArgs {
+						s.releaseConnectionArgs(generation)
 					}
+					running = false
 				}
-				warnTimer.Stop()
-				s.handchanWaitNS.Add(uint64(time.Since(start)))
 			}
+		}
+	}
+}
+
+func (s *Session[T]) forwardPacket(handchan chan<- *Packet[T], packet *Packet[T], stopChan <-chan struct{}) bool {
+	select {
+	case handchan <- packet:
+		return true
+	case <-stopChan:
+		return false
+	default:
+	}
+
+	// handchan 满时必须施加背压，丢失协议帧会造成连接状态不一致。
+	start := time.Now()
+	warnTimer := time.NewTimer(HandchanBlockWarnThreshold)
+	defer warnTimer.Stop()
+	defer func() { s.handchanWaitNS.Add(uint64(time.Since(start))) }()
+	warn := warnTimer.C
+	for {
+		select {
+		case handchan <- packet:
+			return true
+		case <-stopChan:
+			return false
+		case <-warn:
+			warn = nil
+			s.handchanWarnCnt.Add(1)
+			slog.Warn("wsc handchan blocked; upstream consume slow",
+				slog.String("guid", s.guid),
+				slog.Duration("waited", time.Since(start)),
+				slog.Int("cap", cap(handchan)))
 		}
 	}
 }
@@ -328,15 +409,33 @@ func (s *Session[T]) asyncGo(asyncChan <-chan *asyncInfo[T], handchan chan *Pack
 			// wsConn 所有权转移到 rawconn, rawconn.Close 时会关闭连接
 			wsConn := createWSConnection[T](info.Conn, s.bufferSize, info.Codec)
 			generation := s.advanceGeneration()
+			s.setConnectionArgs(generation, info.Args)
+			hasConnectionArgs := info.Args != nil
 			s.wsconn.Store(wsConn)
 			// Go 1.25 WaitGroup.Go.
-			recvWaiter.Go(func() { s.handleMessageGo(handchan, wsConn.channel(), stopChan, generation) })
+			recvWaiter.Go(func() {
+				s.handleMessageGo(handchan, wsConn.channel(), stopChan, generation, hasConnectionArgs)
+			})
 			rawconn.ResetUnsafe(context.Background(), wsConn)
 			if info.ready != nil {
 				info.ready <- nil
 				close(info.ready)
 			}
 		case asyncCommandWrite: // 发送通知
+			if info.Generation != 0 && info.Generation != s.generation() {
+				if info.ready != nil {
+					info.ready <- net.ErrConnectionClosed
+					close(info.ready)
+				}
+				continue
+			}
+			if info.Context != nil && info.Context.Err() != nil {
+				if info.ready != nil {
+					info.ready <- info.Context.Err()
+					close(info.ready)
+				}
+				continue
+			}
 			// BUG-3: 旧实现吞掉 err, 上层 Reply/Write 拿到 nil 误以为消息已上线.
 			// 现在保留 fire-and-forget 语义 (Reply/Write 早返回), 但把错误记到
 			// Session.lastWriteError + writeErrors 计数 + slog.Warn 提示一次,
@@ -346,11 +445,22 @@ func (s *Session[T]) asyncGo(asyncChan <-chan *asyncInfo[T], handchan chan *Pack
 				s.lastWriteError.Store(&err)
 				slog.Warn("wsc Session async write failed",
 					slog.String("guid", s.guid), slog.Any("err", err))
+				if info.ready != nil {
+					info.ready <- err
+					close(info.ready)
+				}
+			} else if info.ready != nil {
+				info.ready <- nil
+				close(info.ready)
 			}
 		case asyncCommandRequest: // 发送请求并等待响应; 断线由 info.Response 直接通知 caller, 不在此处重试
 			// RequestCallbackUnsafe 内部 async() 失败时会同步通过 info.Response
 			// 通知 caller, 这里仍然记 lastWriteError 用作运维观察 (不重复通知 caller).
-			if err := rawconn.RequestCallbackUnsafe(context.Background(), info.Request, info.Response); err != nil {
+			requestCtx := info.Context
+			if requestCtx == nil {
+				requestCtx = context.Background()
+			}
+			if err := rawconn.RequestCallbackUnsafe(requestCtx, info.Request, info.Response); err != nil {
 				s.writeErrors.Add(1)
 				s.lastWriteError.Store(&err)
 			}
@@ -363,8 +473,7 @@ func (s *Session[T]) asyncGo(asyncChan <-chan *asyncInfo[T], handchan chan *Pack
 		}
 	}
 	s.wsconn.Store(nil)
-	// stopChan 关闭（特意设计,其它地方不会关闭 stopChan）
-	close(stopChan)
+	s.signalStop()
 	recvWaiter.Wait()
 	close(handchan)
 }
@@ -399,11 +508,12 @@ func (s *Session[T]) async(ctx context.Context, info *asyncInfo[T]) error {
 
 // reset 切换 session 底层 ws 连接 (典型场景: client 断线重连). 入队 asyncCommandConn,
 // 由 asyncGo 处理.
-func (s *Session[T]) reset(ctx context.Context, conn *websocket.Conn, codec Codec) error {
+func (s *Session[T]) reset(ctx context.Context, conn *websocket.Conn, codec Codec, args any) error {
 	info := &asyncInfo[T]{
 		Command: asyncCommandConn,
 		Conn:    conn,
 		Codec:   codec,
+		Args:    args,
 		ready:   make(chan error, 1),
 	}
 	// 入队阶段持 RLock (与 Write/Reply/Request 同款): 锁的职责只是 asyncChan 生命周期
@@ -437,7 +547,7 @@ func (s *Session[T]) reset(ctx context.Context, conn *websocket.Conn, codec Code
 // SetReadLimit(读上限持久生效于该 conn 全生命周期)。直接调用本方法的高级调用方若需
 // 限制入站消息大小防 OOM, 应自行在传入的 conn 上调用 SetReadLimit。
 func (s *Session[T]) Reset(ctx context.Context, conn *websocket.Conn) error {
-	return s.reset(ctx, conn, defaultCodec)
+	return s.reset(ctx, conn, defaultCodec, nil)
 }
 
 // enqueueWrite 发送通知, id 非空表示是对请求的 Reply. Write / Reply 共用底层
@@ -465,10 +575,42 @@ func (s *Session[T]) Reply(ctx context.Context, id string, data T) error {
 	return s.enqueueWrite(ctx, id, data)
 }
 
+// ReplyGeneration 仅在请求来源连接仍为当前代次时回复。代次校验在 asyncGo
+// 实际写入前执行，确保已经入队的 Reset 不会把旧请求 ID 带到新连接。
+func (s *Session[T]) ReplyGeneration(ctx context.Context, generation uint64, id string, data T) error {
+	info := &asyncInfo[T]{
+		Command:    asyncCommandWrite,
+		Generation: generation,
+		Request:    &Message[T]{ID: id, Data: data},
+		Context:    ctx,
+		ready:      make(chan error, 1),
+	}
+	s.locker.RLock()
+	err := s.async(ctx, info)
+	s.locker.RUnlock()
+	if err != nil {
+		return err
+	}
+	select {
+	case err := <-info.ready:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.stopChan:
+		return ErrSessionClosed
+	}
+}
+
+// Generation 返回当前底层连接代次。
+func (s *Session[T]) Generation() uint64 {
+	return s.generation()
+}
+
 func (s *Session[T]) enqueueRequest(ctx context.Context, data T) (*asyncInfo[T], error) {
 	request := &asyncInfo[T]{
 		Command:  asyncCommandRequest,
 		Request:  &Message[T]{ID: uuid.New().String(), Data: data},
+		Context:  ctx,
 		response: make(chan *asyncMsgErr[T], 0x01),
 	}
 	if err := s.async(ctx, request); err != nil {
@@ -526,6 +668,9 @@ func (s *Session[T]) Close() error {
 		close(s.asyncChan)
 		s.asyncChan = nil
 	}
+	// 先解除所有接收转发对 handchan 的阻塞，再等待 asyncGo。否则业务消费者
+	// 在调用 Close 时若 handchan 已满，会与 recvWaiter 形成环形等待。
+	s.signalStop()
 	if wsConn := s.wsconn.Load(); wsConn != nil {
 		if err := wsConn.Close(context.Background()); err != nil && !errors.Is(err, net.ErrConnectionClosed) {
 			slog.Warn("wsc Session close websocket failed",

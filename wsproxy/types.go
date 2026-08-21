@@ -8,12 +8,23 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
 
+// MaxMessageSize 是代理允许读取的单条 WebSocket 消息大小上限。
 const MaxMessageSize = 32 << 20
 
+func handshakeDeadline(ctx context.Context) time.Time {
+	deadline := time.Now().Add(dialHandshakeTimeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	return deadline
+}
+
+// MethodType 表示 WebSocket 代理握手包的操作类型。
 type MethodType int
 
 // Method 常量每个只承担一个方向/一种含义 (A1 修复时确立的约定, wire 值不变):

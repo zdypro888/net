@@ -44,6 +44,64 @@ func TestClientDialHandshakeHonorsContextDeadline(t *testing.T) {
 	}
 }
 
+func TestHandshakeDeadlineKeepsInternalTimeoutWhenContextIsLonger(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel()
+
+	deadline := handshakeDeadline(ctx)
+	ctxDeadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("context has no deadline")
+	}
+	if !deadline.Before(ctxDeadline) {
+		t.Fatalf("handshake deadline %s did not cap context deadline %s", deadline, ctxDeadline)
+	}
+}
+
+func TestSessionExpiredWriteDeadlineDoesNotCloseRead(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	serverConn := make(chan *websocket.Conn, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		serverConn <- conn
+	}))
+	defer server.Close()
+
+	clientConn, _, err := websocket.DefaultDialer.Dial("ws"+server.URL[len("http"):], nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &Session{Conn: clientConn}
+	defer checkClose(t, "client session", session.Close)
+	peer := <-serverConn
+	defer checkClose(t, "server websocket", peer.Close)
+
+	if err := session.SetWriteDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if err := peer.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := peer.WriteMessage(websocket.BinaryMessage, []byte("still-readable")); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 32)
+	n, err := session.Read(buffer)
+	if err != nil {
+		t.Fatalf("read after expired write deadline failed: %v", err)
+	}
+	if got := string(buffer[:n]); got != "still-readable" {
+		t.Fatalf("read payload = %q", got)
+	}
+}
+
 func TestCopyLoopReturnsWhenWebSocketSideCloses(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	serverConn := make(chan *websocket.Conn, 1)
@@ -573,5 +631,72 @@ func TestServerMaxSessionsRejectsExcessRegistration(t *testing.T) {
 	}
 	if got := proxyServer.ConnectionCount(); got != 1 {
 		t.Fatalf("ConnectionCount after over-limit register = %d, want 1", got)
+	}
+}
+
+func TestServerCloseAllClosesReturnedDialContextSession(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	defer checkClose(t, "target listener", listener.Close)
+	targetAccepted := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			targetAccepted <- conn
+		}
+	}()
+
+	proxyServer := NewServer()
+	upgrader := websocket.Upgrader{}
+	webServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, upgradeErr := upgrader.Upgrade(w, r, nil)
+		if upgradeErr == nil {
+			proxyServer.OnConnection(conn)
+		}
+	}))
+	defer webServer.Close()
+
+	slaverCtx, cancelSlaver := context.WithCancel(context.Background())
+	slaverDone := make(chan error, 1)
+	go func() {
+		slaverDone <- NewSlaver().Run(slaverCtx, "ws"+webServer.URL[len("http"):])
+	}()
+	defer func() {
+		cancelSlaver()
+		select {
+		case runErr := <-slaverDone:
+			if runErr != nil && !errors.Is(runErr, context.Canceled) {
+				t.Errorf("Slaver.Run returned %v", runErr)
+			}
+		case <-time.After(time.Second):
+			t.Error("Slaver.Run did not stop after cancellation")
+		}
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for proxyServer.ConnectionCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if proxyServer.ConnectionCount() == 0 {
+		t.Fatal("slaver never registered")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, err := proxyServer.DialContext(ctx, "tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("DialContext failed: %v", err)
+	}
+	var target net.Conn
+	select {
+	case target = <-targetAccepted:
+		defer checkClose(t, "target conn", target.Close)
+	case <-time.After(time.Second):
+		t.Fatal("target connection was not accepted")
+	}
+	proxyServer.CloseAll()
+	if _, err := conn.Write([]byte("after-close")); err == nil {
+		t.Fatal("returned DialContext session remained writable after CloseAll")
 	}
 }

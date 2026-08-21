@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// 协议常量
+// WebSocket 会话协议的版本、队列容量、读写限制及会话保留参数。
 const (
 	ProtocolVersion   = "2.0.1"
 	HeartbeatInterval = 30 * time.Second
@@ -32,8 +32,11 @@ const (
 	ReadIdleTimeout = 2 * HeartbeatInterval
 )
 
-// 错误定义
+// ErrSessionClosed 表示 WebSocket 会话已经关闭。
 var ErrSessionClosed = errors.New("session closed")
+
+// ErrServerClosed 表示 WebSocket 服务已经关闭。
+var ErrServerClosed = errors.New("server closed")
 
 // HandshakeRequest 握手请求
 type HandshakeRequest struct {
@@ -84,12 +87,22 @@ type Envelope interface {
 	SetEnvelopePayload(payload any) error
 }
 
-func (m *Message[T]) EnvelopeID() string          { return m.ID }
-func (m *Message[T]) EnvelopeHeart() bool         { return m.IsHeart }
-func (m *Message[T]) EnvelopePayload() any        { return m.Data }
-func (m *Message[T]) SetEnvelopeID(id string)     { m.ID = id }
+// EnvelopeID 返回请求或响应的关联 ID。
+func (m *Message[T]) EnvelopeID() string { return m.ID }
+
+// EnvelopeHeart 报告当前信封是否为心跳消息。
+func (m *Message[T]) EnvelopeHeart() bool { return m.IsHeart }
+
+// EnvelopePayload 返回信封中保存的业务载荷。
+func (m *Message[T]) EnvelopePayload() any { return m.Data }
+
+// SetEnvelopeID 设置请求或响应的关联 ID。
+func (m *Message[T]) SetEnvelopeID(id string) { m.ID = id }
+
+// SetEnvelopeHeart 设置当前信封的心跳标记。
 func (m *Message[T]) SetEnvelopeHeart(heart bool) { m.IsHeart = heart }
 
+// SetEnvelopePayload 校验载荷类型后写入信封。
 func (m *Message[T]) SetEnvelopePayload(payload any) error {
 	data, ok := payload.(T)
 	if !ok {

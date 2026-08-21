@@ -14,7 +14,11 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// ErrNoConnection 表示当前没有可用于拨号的代理连接。
 var ErrNoConnection = errors.New("no available connection")
+
+// ErrServerClosed 表示代理服务器已经关闭。
+var ErrServerClosed = errors.New("proxy server closed")
 
 // DefaultMaxSessions 是注册池的默认容量上限 (Server.MaxSessions<=0 时生效).
 // 每个池条目占一条 TCP + 一个 watcher goroutine, 上限防止异常 slaver 无界堆积.
@@ -45,7 +49,6 @@ type slaverRead struct {
 type slaverEntry struct {
 	session *Session
 	reply   chan slaverRead // cap 1; watcher 交付一次后退出, 投递永不阻塞
-	done    chan struct{}   // watcher 退出时 close; CloseAll 以此 join 池内 watcher
 	popped  bool            // 由 server.locker 保护: 已出池 (popSession/CloseAll), watcher 不再负责回收与计数
 }
 
@@ -53,6 +56,7 @@ type slaverEntry struct {
 type Server struct {
 	locker   sync.Mutex
 	sessions *list.List // 使用 list 保持顺序，FIFO 方式使用连接; 元素类型 *slaverEntry
+	active   map[*Session]struct{}
 	Token    string
 
 	// MaxSessions 限制注册池容量, <=0 时用 DefaultMaxSessions. 超限的注册被拒绝
@@ -60,13 +64,11 @@ type Server struct {
 	MaxSessions int
 
 	// 生命周期管理: ctx 用于让 in-flight onClientDialout / copyLoop 在 CloseAll
-	// 时被 cancel. activeWG 等待所有在飞 dialout goroutine 退出.
+	// 时被 cancel. workerWG 等待所有 watcher 和 dialout goroutine 退出.
 	// ctx/cancel 一次性创建, 之后只读 — 不是同步原语, 是 cancel 协议.
-	// activeWG 必须加: CloseAll 要 wait 所有 onClientDialout 退出, sync.WaitGroup
-	// 是经典语义无替代.
 	ctx            context.Context
 	cancel         context.CancelFunc
-	activeWG       sync.WaitGroup
+	workerWG       sync.WaitGroup
 	activeDialouts atomic.Int32 // 正在执行 copyLoop 的 dialout 数; 多 goroutine 增减, atomic 最轻.
 	tokenRejects   atomic.Uint64
 	badHandshakes  atomic.Uint64
@@ -81,6 +83,7 @@ func NewServer() *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
 		sessions: list.New(),
+		active:   make(map[*Session]struct{}),
 		ctx:      ctx,
 		cancel:   cancel,
 	}
@@ -157,7 +160,7 @@ func (server *Server) OnConnection(conn *websocket.Conn) {
 			}
 			return
 		}
-		server.activeWG.Go(func() {
+		server.workerWG.Go(func() {
 			server.onClientDialout(server.ctx, conn, &incoming)
 		})
 		server.locker.Unlock()
@@ -192,10 +195,10 @@ func (server *Server) registerSlaverSession(session *Session) bool {
 			slog.Int("limit", limit))
 		return false
 	}
-	entry := &slaverEntry{session: session, reply: make(chan slaverRead, 1), done: make(chan struct{})}
+	entry := &slaverEntry{session: session, reply: make(chan slaverRead, 1)}
 	elem := server.sessions.PushBack(entry)
+	server.workerWG.Go(func() { server.watchSlaver(entry, elem) })
 	server.locker.Unlock()
-	go server.watchSlaver(entry, elem)
 	return true
 }
 
@@ -208,7 +211,6 @@ func (server *Server) registerSlaverSession(session *Session) bool {
 //
 // list.Remove 对已移除元素是 no-op, popped 标记保证出池责任(回收+计数)只归一方.
 func (server *Server) watchSlaver(entry *slaverEntry, elem *list.Element) {
-	defer close(entry.done)
 	var packet connPacket
 	err := entry.session.Conn.ReadJSON(&packet)
 	entry.reply <- slaverRead{packet: packet, err: err}
@@ -235,17 +237,26 @@ func (server *Server) watchSlaver(entry *slaverEntry, elem *list.Element) {
 	}
 }
 
-// popSession 从连接池中取出第一个可用会话（FIFO）, 跳过 watcher 已判死的僵尸条目.
-func (server *Server) popSession() *slaverEntry {
-	server.locker.Lock()
-	defer server.locker.Unlock()
-	for server.sessions.Len() > 0 {
+// popSession 从连接池中取出第一个可用会话（FIFO），并在同一个临界区把它
+// 转移到 active 集合，避免 CloseAll 在两种所有权状态之间漏掉连接。
+func (server *Server) popSession() (*slaverEntry, error) {
+	for {
+		server.locker.Lock()
+		if server.closed.Load() {
+			server.locker.Unlock()
+			return nil, ErrServerClosed
+		}
+		if server.sessions.Len() == 0 {
+			server.locker.Unlock()
+			return nil, ErrNoConnection
+		}
 		front := server.sessions.Front()
 		server.sessions.Remove(front)
 		entry := front.Value.(*slaverEntry)
 		entry.popped = true
 		select {
 		case read := <-entry.reply:
+			server.locker.Unlock()
 			// watcher 在池内就交付了结果: 要么读错误 (死连接), 要么 slaver 违反
 			// 协议主动发包. 两者都按僵尸丢弃, 继续取下一个.
 			server.staleSessions.Add(1)
@@ -255,10 +266,18 @@ func (server *Server) popSession() *slaverEntry {
 				slog.Debug("wsproxy popSession close stale slaver failed", slog.Any("err", err))
 			}
 		default:
-			return entry
+			entry.session.setOnClose(server.untrackSession)
+			server.active[entry.session] = struct{}{}
+			server.locker.Unlock()
+			return entry, nil
 		}
 	}
-	return nil
+}
+
+func (server *Server) untrackSession(session *Session) {
+	server.locker.Lock()
+	delete(server.active, session)
+	server.locker.Unlock()
 }
 
 // DialContext 通过代理连接到目标地址
@@ -267,11 +286,16 @@ func (server *Server) DialContext(ctx context.Context, network, address string) 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if server.closed.Load() {
+		return nil, ErrServerClosed
+	}
 	// popSession 已经从池中移除了会话，每个连接只用一次
-	entry := server.popSession()
-	if entry == nil {
-		server.noSessionDials.Add(1)
-		return nil, ErrNoConnection
+	entry, err := server.popSession()
+	if err != nil {
+		if errors.Is(err, ErrNoConnection) {
+			server.noSessionDials.Add(1)
+		}
+		return nil, err
 	}
 	session := entry.session
 	stopContextClose := closeWebSocketOnContextDone(ctx, session.Conn)
@@ -291,10 +315,7 @@ func (server *Server) DialContext(ctx context.Context, network, address string) 
 
 	// 设置写超时，防止阻塞。与 client.Dial 一致直接用 deadline，不经 now+Until —
 	// 否则 ctx 即将到期时算出的负 timeout 会把可用连接的 deadline 设成过去 → 立即超时。
-	deadline := time.Now().Add(dialHandshakeTimeout)
-	if d, ok := ctx.Deadline(); ok {
-		deadline = d
-	}
+	deadline := handshakeDeadline(ctx)
 	if err := session.Conn.SetWriteDeadline(deadline); err != nil {
 		return nil, closeWithContextError(err)
 	}
@@ -351,8 +372,15 @@ func (server *Server) DialContext(ctx context.Context, network, address string) 
 	// 迟到关闭已返回的连接, 让调用方拿到 (已关闭conn, nil)。与 proxy.go 目的相同但机制不同:
 	// proxy.go 用 context.AfterFunc(stop 不 join) 故靠末尾复查 ctx 兜底, 此处 helper 自带 join。
 	stopContextClose()
-	if ctxErr := ctx.Err(); ctxErr != nil {
+	server.locker.Lock()
+	ctxErr := ctx.Err()
+	closed := server.closed.Load()
+	server.locker.Unlock()
+	if ctxErr != nil {
 		return nil, errors.Join(ctxErr, session.Close())
+	}
+	if closed {
+		return nil, errors.Join(ErrServerClosed, session.Close())
 	}
 
 	return session, nil
@@ -362,10 +390,7 @@ func (server *Server) onClientDialout(ctx context.Context, conn *websocket.Conn,
 	stopContextClose := closeWebSocketOnContextDone(ctx, conn)
 	defer stopContextClose()
 	writeHandshake := func(packet *connPacket) error {
-		deadline := time.Now().Add(dialHandshakeTimeout)
-		if d, ok := ctx.Deadline(); ok {
-			deadline = d
-		}
+		deadline := handshakeDeadline(ctx)
 		if err := conn.SetWriteDeadline(deadline); err != nil {
 			return err
 		}
@@ -438,15 +463,17 @@ func (server *Server) Stats() ServerStats {
 	}
 }
 
-// CloseAll 关闭所有连接并取消在飞 dialout. 返回时所有 copyLoop goroutine 与
-// 池内 watcher goroutine 已退出; 被 pop 走的 watcher 属于在飞 dialout 握手,
-// 由各自的 handshakeTimer 兜底退出, 不在此处等待 (避免给 CloseAll 引入最长
-// 一次握手超时的停机阻塞).
+// CloseAll 关闭池内、握手中及已经返回给调用方的全部 session，并取消在飞
+// client dialout。取出池时 session 会进入 active 表，因而不会逃逸停机管理。
 // 多次调用幂等: 首次调用 cancel(), 之后调用是 no-op (cancel 函数本身可重复调用).
 func (server *Server) CloseAll() {
 	server.locker.Lock()
 	server.closed.Store(true)
 	var drained []*slaverEntry
+	active := make([]*Session, 0, len(server.active))
+	for session := range server.active {
+		active = append(active, session)
+	}
 	for server.sessions.Len() > 0 {
 		front := server.sessions.Front()
 		server.sessions.Remove(front)
@@ -454,22 +481,24 @@ func (server *Server) CloseAll() {
 		// 标记已出池: watcher 随后因连接被关而读错误时不再自行回收/计 StaleSessions
 		// (停机关闭不是僵尸).
 		entry.popped = true
-		if err := entry.session.Close(); err != nil {
-			slog.Warn("wsproxy CloseAll session close failed", slog.Any("err", err))
-		}
 		drained = append(drained, entry)
 	}
 	server.locker.Unlock()
 
 	// 取消 ctx 让在飞 onClientDialout 退出 (copyLoop 内的 ctx-watcher 关闭两端 conn).
 	server.cancel()
-	// 等所有在飞 goroutine 退出后才返回, 给 caller 一个干净的 drain 承诺.
-	server.activeWG.Wait()
-	// join 池内 watcher: 它们的连接已在上面关闭, ReadJSON 立即出错返回, 等待有界;
-	// 必须在释放 locker 之后等 —— watcher 退出路径要取 server.locker.
 	for _, entry := range drained {
-		<-entry.done
+		if err := entry.session.Close(); err != nil {
+			slog.Warn("wsproxy CloseAll pooled session close failed", slog.Any("err", err))
+		}
 	}
+	for _, session := range active {
+		if err := session.Close(); err != nil {
+			slog.Warn("wsproxy CloseAll active session close failed", slog.Any("err", err))
+		}
+	}
+	// 等所有在飞 goroutine 退出后才返回, 给 caller 一个干净的 drain 承诺.
+	server.workerWG.Wait()
 }
 
 // DefaultServer 全局共享代理服务器实例.

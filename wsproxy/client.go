@@ -12,12 +12,14 @@ import (
 
 const dialHandshakeTimeout = 30 * time.Second
 
+// Client 保存 WebSocket 代理客户端的会话标识、服务地址和鉴权令牌。
 type Client struct {
 	Id     string
 	WSAddr string
 	Token  string
 }
 
+// NewClient 创建使用指定 WebSocket 服务地址的代理客户端。
 func NewClient(wsAddr string) *Client {
 	return &Client{
 		Id:     uuid.New().String(),
@@ -25,6 +27,7 @@ func NewClient(wsAddr string) *Client {
 	}
 }
 
+// Dial 通过 WebSocket 代理建立到目标地址的连接。
 func (client *Client) Dial(ctx context.Context, network, address string) (net.Conn, error) {
 	wsConn, _, err := websocket.DefaultDialer.DialContext(ctx, client.WSAddr, nil)
 	if err != nil {
@@ -33,10 +36,7 @@ func (client *Client) Dial(ctx context.Context, network, address string) (net.Co
 	stopContextClose := closeWebSocketOnContextDone(ctx, wsConn)
 	defer stopContextClose()
 	wsConn.SetReadLimit(MaxMessageSize)
-	deadline := time.Now().Add(dialHandshakeTimeout)
-	if ctxDeadline, ok := ctx.Deadline(); ok {
-		deadline = ctxDeadline
-	}
+	deadline := handshakeDeadline(ctx)
 	closeWithContextError := func(err error) error {
 		closeErr := wsConn.Close()
 		if ctxErr := ctx.Err(); ctxErr != nil {

@@ -15,11 +15,13 @@ import (
 type Server[T any] struct {
 	locker             sync.Mutex
 	sessions           map[string]*Session[T]
+	handshakes         map[*websocket.Conn]struct{}
 	cleanupTimers      map[string]cleanupTimer
 	bufferSize         int
 	codecs             *codecSet
 	maxMessageSize     int64
 	sessionIdleTimeout time.Duration
+	closed             bool
 }
 
 type cleanupTimer struct {
@@ -47,6 +49,7 @@ func NewServerWithBuffer[T any](bufferSize int, opts ...Option) *Server[T] {
 	}
 	return &Server[T]{
 		sessions:           make(map[string]*Session[T]),
+		handshakes:         make(map[*websocket.Conn]struct{}),
 		cleanupTimers:      make(map[string]cleanupTimer),
 		bufferSize:         bufferSize,
 		codecs:             newCodecSet(o.codecs),
@@ -117,9 +120,21 @@ func (server *Server[T]) expireSession(session *Session[T], generation uint64) {
 }
 
 // OnConnection 处理新连接
-// args 是可选的额外参数
+// args 是可选的连接参数，会原样附加到该连接产生的每个非关闭 Packet。
 // 返回 Session，通过 session.Handle() 获取消息通道
 func (server *Server[T]) OnConnection(conn *websocket.Conn, args any) (*Session[T], error) {
+	server.locker.Lock()
+	if server.closed {
+		server.locker.Unlock()
+		return nil, errors.Join(ErrServerClosed, conn.Close())
+	}
+	server.handshakes[conn] = struct{}{}
+	server.locker.Unlock()
+	defer func() {
+		server.locker.Lock()
+		delete(server.handshakes, conn)
+		server.locker.Unlock()
+	}()
 	conn.SetReadLimit(server.maxMessageSize)
 	if err := conn.SetReadDeadline(time.Now().Add(HandshakeTimeout)); err != nil {
 		return nil, errors.Join(err, conn.Close())
@@ -167,6 +182,11 @@ func (server *Server[T]) OnConnection(conn *websocket.Conn, args any) (*Session[
 	var created bool
 	hadIdleCleanup := server.cancelSessionCleanup(req.GUID)
 	server.locker.Lock()
+	if server.closed {
+		server.locker.Unlock()
+		return nil, errors.Join(ErrServerClosed, conn.Close())
+	}
+	delete(server.handshakes, conn)
 	if existing, exists := server.sessions[req.GUID]; exists {
 		// 复用同 GUID 的已存在 session 重连。真正的 generation 推进只发生在 reset 成功后的
 		// asyncGo 里, 这里不预推进 —— 已触发但尚未执行的旧 idle-cleanup 回调由 expireSession
@@ -183,7 +203,7 @@ func (server *Server[T]) OnConnection(conn *websocket.Conn, args any) (*Session[
 		created = true
 	}
 	server.locker.Unlock()
-	if err := session.reset(context.Background(), conn, codec); err != nil {
+	if err := session.reset(context.Background(), conn, codec, args); err != nil {
 		closeErr := conn.Close()
 		if created {
 			server.locker.Lock()
@@ -208,6 +228,12 @@ func (server *Server[T]) OnConnection(conn *websocket.Conn, args any) (*Session[
 // Close 关闭服务器，断开所有会话
 func (server *Server[T]) Close() error {
 	server.locker.Lock()
+	server.closed = true
+	handshakes := make([]*websocket.Conn, 0, len(server.handshakes))
+	for conn := range server.handshakes {
+		delete(server.handshakes, conn)
+		handshakes = append(handshakes, conn)
+	}
 	sessions := make([]*Session[T], 0, len(server.sessions))
 	for guid, session := range server.sessions {
 		server.cancelSessionCleanupLocked(guid)
@@ -216,6 +242,9 @@ func (server *Server[T]) Close() error {
 	}
 	server.locker.Unlock()
 	var err error
+	for _, conn := range handshakes {
+		err = errors.Join(err, conn.Close())
+	}
 	for _, session := range sessions {
 		err = errors.Join(err, session.Close())
 	}
@@ -257,4 +286,26 @@ func (server *Server[T]) RemoveSession(guid string) {
 				slog.String("guid", guid), slog.Any("err", err))
 		}
 	}
+}
+
+// RemoveSessionIf 仅在表内仍是 expected 实例时移除会话。用于同一 GUID 的旧消费者
+// 延迟退出时，避免误删已经替换的新 Session。
+func (server *Server[T]) RemoveSessionIf(guid string, expected *Session[T]) bool {
+	if expected == nil {
+		return false
+	}
+	server.locker.Lock()
+	session, ok := server.sessions[guid]
+	if !ok || session != expected {
+		server.locker.Unlock()
+		return false
+	}
+	server.cancelSessionCleanupLocked(guid)
+	delete(server.sessions, guid)
+	server.locker.Unlock()
+	if err := session.Close(); err != nil {
+		slog.Warn("wsc server conditional session close failed",
+			slog.String("guid", guid), slog.Any("err", err))
+	}
+	return true
 }

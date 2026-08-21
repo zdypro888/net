@@ -198,23 +198,17 @@ func TestClientAsyncRespectsCtxDeadline(t *testing.T) {
 		checkClose(t, "client", client.Close)
 	})
 
-	// 1. 灌满 conn.writeCh (cap=16): 触发 asyncGo 取出第 17 条时卡 conn.Write.
-	// 2. 同时 asynchan (cap=16) 一直被填.
-	// 总能填多少 = 16(writeCh) + 1(在 conn.Write 卡的) + 16(asynchan) = 33. 第 34 条必须超时.
 	const writes = 33
 	for i := 0; i < writes; i++ {
-		// 长 ctx 让前面的 Write 都成功入队. asyncGo 自己取走时不阻塞 caller.
 		ctxFill, cancel := context.WithTimeout(context.Background(), time.Second)
 		err := client.Write(ctxFill, testMessage{value: "fill"})
 		cancel()
 		if err != nil {
-			// 在到第 writes 条之前出错说明我们的容量估算不对; 这种环境下用 Logf 跳过.
 			t.Logf("fill write %d unexpectedly errored %v; environment may differ", i, err)
 			break
 		}
 	}
 
-	// 现在所有队列满, asyncGo 卡在 conn.Write — 下次 Write 短 ctx 必走 ctx.Done.
 	timeoutCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	err := client.Write(timeoutCtx, testMessage{value: "must-time-out"})
@@ -271,6 +265,8 @@ type blockingHandleConn struct {
 	once        sync.Once
 	handleEnter chan struct{} // Handle 进入时关闭一次, 让测试确认分发已开始
 	enterOnce   sync.Once
+	writeEnter  chan struct{}
+	writeOnce   sync.Once
 }
 
 func newBlockingHandleConn() *blockingHandleConn {
@@ -278,6 +274,7 @@ func newBlockingHandleConn() *blockingHandleConn {
 		readCh:      make(chan testMessage, DefaultBufferSize),
 		closed:      make(chan struct{}),
 		handleEnter: make(chan struct{}),
+		writeEnter:  make(chan struct{}),
 	}
 }
 
@@ -298,11 +295,41 @@ func (c *blockingHandleConn) Read(ctx context.Context) (testMessage, error) {
 }
 
 func (c *blockingHandleConn) Write(ctx context.Context, msg testMessage) error {
+	c.writeOnce.Do(func() { close(c.writeEnter) })
 	select {
 	case <-c.closed:
 		return ErrConnectionClosed
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+func TestClientConnectionCancelUnblocksRequestWrite(t *testing.T) {
+	conn := newBlockingHandleConn()
+	connectionCtx, cancelConnection := context.WithCancel(context.Background())
+	client := NewClient[testMessage, *blockingHandleConn]()
+	client.Reset(connectionCtx, conn)
+	defer checkClose(t, "client", client.Close)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.Request(context.Background(), testMessage{id: "blocked-write", value: "request"})
+		done <- err
+	}()
+	select {
+	case <-conn.writeEnter:
+	case <-time.After(time.Second):
+		t.Fatal("request write did not start")
+	}
+
+	cancelConnection()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, ErrConnectionClosed) {
+			t.Fatalf("Request after connection cancel = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("connection cancellation did not interrupt request write")
 	}
 }
 
@@ -344,6 +371,152 @@ func TestClientCloseUnblocksBlockedHandle(t *testing.T) {
 	}
 }
 
+func TestClientRejectsDuplicateRequestID(t *testing.T) {
+	conn := newFakeConn()
+	client := NewClient[testMessage, *fakeConn]()
+	client.Reset(context.Background(), conn)
+	defer checkClose(t, "client", client.Close)
+
+	firstDone := make(chan error, 1)
+	go func() {
+		resp, err := client.Request(context.Background(), testMessage{id: "same", value: "first"})
+		if err == nil && resp.value != "response" {
+			err = errors.New("first request received the wrong response")
+		}
+		firstDone <- err
+	}()
+
+	select {
+	case msg := <-conn.writeCh:
+		if msg.value != "first" {
+			t.Fatalf("first wire message = %#v", msg)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first request was not written")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := client.Request(ctx, testMessage{id: "same", value: "second"})
+	if !errors.Is(err, ErrDuplicateRequestID) {
+		t.Fatalf("duplicate Request error = %v, want ErrDuplicateRequestID", err)
+	}
+	var duplicate interface{ IsDuplicateRequestID() bool }
+	if !errors.As(err, &duplicate) || !duplicate.IsDuplicateRequestID() {
+		t.Fatalf("duplicate Request error does not expose its semantic marker: %v", err)
+	}
+	select {
+	case msg := <-conn.writeCh:
+		t.Fatalf("duplicate request reached the wire: %#v", msg)
+	default:
+	}
+
+	conn.readCh <- testMessage{id: "same", value: "response"}
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first Request failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first Request did not receive its response")
+	}
+}
+
+func TestClientReusesCanceledRequestIDAfterLateResponse(t *testing.T) {
+	conn := newFakeConn()
+	client := NewClient[testMessage, *fakeConn]()
+	client.Reset(context.Background(), conn)
+	defer checkClose(t, "client", client.Close)
+
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := client.Request(firstCtx, testMessage{id: "same", value: "first"})
+		firstDone <- err
+	}()
+
+	select {
+	case <-conn.writeCh:
+	case <-time.After(time.Second):
+		t.Fatal("first request was not written")
+	}
+	cancelFirst()
+	select {
+	case err := <-firstDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("first Request error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled request did not return")
+	}
+
+	secondCtx, cancelSecond := context.WithTimeout(context.Background(), time.Second)
+	_, secondErr := client.Request(secondCtx, testMessage{id: "same", value: "second"})
+	cancelSecond()
+	if !errors.Is(secondErr, ErrDuplicateRequestID) {
+		t.Fatalf("immediate reuse error = %v, want ErrDuplicateRequestID", secondErr)
+	}
+	select {
+	case message := <-conn.writeCh:
+		t.Fatalf("immediate reuse reached the wire: %#v", message)
+	default:
+	}
+
+	conn.readCh <- testMessage{id: "same", value: "late-first-response"}
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		message := <-conn.writeCh
+		if message.value != "third" {
+			t.Errorf("replacement wire message = %#v", message)
+			return
+		}
+		conn.readCh <- testMessage{id: "same", value: "third-response"}
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		requestCtx, cancelRequest := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		response, err := client.Request(requestCtx, testMessage{id: "same", value: "third"})
+		cancelRequest()
+		if errors.Is(err, ErrDuplicateRequestID) && time.Now().Before(deadline) {
+			continue
+		}
+		if err != nil {
+			t.Fatalf("replacement Request failed: %v", err)
+		}
+		if response.value != "third-response" {
+			t.Fatalf("replacement response = %#v", response)
+		}
+		break
+	}
+	<-serverDone
+}
+
+func TestClientRejectsWritesAfterUnexpectedDisconnect(t *testing.T) {
+	conn := newFakeConn()
+	client := NewClient[testMessage, *fakeConn]()
+	client.Reset(context.Background(), conn)
+	defer checkClose(t, "client", client.Close)
+
+	if err := conn.Close(context.Background()); err != nil {
+		t.Fatalf("close underlying connection: %v", err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for client.Stats().LastError == nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+
+	for i := 0; i < 100; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		err := client.Write(ctx, testMessage{value: "after-close"})
+		cancel()
+		if !errors.Is(err, ErrConnectionClosed) {
+			t.Fatalf("Write %d after disconnect = %v, want ErrConnectionClosed", i, err)
+		}
+	}
+}
+
 func TestClientRequestContextCancel(t *testing.T) {
 	conn := newFakeConn()
 	client := NewClient[testMessage, *fakeConn]()
@@ -375,6 +548,40 @@ func TestClientRequestContextCancel(t *testing.T) {
 	}
 
 	conn.readCh <- testMessage{id: "req-cancel", value: "late-response"}
+}
+
+func TestClientRequestCallbackRejectsResponseAfterContextCancel(t *testing.T) {
+	conn := newFakeConn()
+	client := NewClient[testMessage, *fakeConn]()
+	client.Reset(context.Background(), conn)
+	defer checkClose(t, "client", client.Close)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	callback := make(chan *messageError[testMessage], 1)
+	if err := client.RequestCallbackUnsafe(ctx, testMessage{id: "callback-cancel", value: "request"}, func(response testMessage, err error) {
+		callback <- &messageError[testMessage]{Response: response, Error: err}
+	}); err != nil {
+		t.Fatalf("RequestCallbackUnsafe: %v", err)
+	}
+	select {
+	case <-conn.writeCh:
+	case <-time.After(time.Second):
+		t.Fatal("callback request was not written")
+	}
+
+	cancel()
+	conn.readCh <- testMessage{id: "callback-cancel", value: "late-response"}
+	select {
+	case result := <-callback:
+		if !errors.Is(result.Error, context.Canceled) {
+			t.Fatalf("callback error = %v, want context.Canceled", result.Error)
+		}
+		if result.Response != (testMessage{}) {
+			t.Fatalf("callback response = %#v, want zero value", result.Response)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled callback was not completed")
+	}
 }
 
 // TestClientAsyncErrorDistinguishesNeverConnectedFromClosed 回归 A3:
@@ -409,8 +616,6 @@ func TestClientAsyncTimeoutsNotIncrementedByCallerCancel(t *testing.T) {
 		checkClose(t, "client", client.Close)
 	})
 
-	// 与 TestClientAsyncRespectsCtxDeadline 同款填充: writeCh(16) + 在 conn.Write
-	// 卡住的 1 条 + asynchan(16) = 33, 第 34 条必然阻塞在 async() 的 select 上.
 	const writes = 33
 	for i := 0; i < writes; i++ {
 		ctxFill, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -443,5 +648,26 @@ func TestClientAsyncTimeoutsNotIncrementedByCallerCancel(t *testing.T) {
 	}
 	if got := client.Stats().AsyncTimeouts; got != baseline {
 		t.Fatalf("AsyncTimeouts after caller cancel = %d, want %d (canceled write must not increment)", got, baseline)
+	}
+}
+
+func TestRequestTrackerBoundsCanceledIDs(t *testing.T) {
+	tracker := newRequestTracker[testMessage]()
+	for id := 0; id < maxCanceledRequestIDs; id++ {
+		request := &asyncMessage[testMessage]{}
+		if !tracker.cancel(id, request, testMessage{}, context.Canceled) {
+			t.Fatalf("cancel(%d) reached the retention limit early", id)
+		}
+	}
+
+	request := &asyncMessage[testMessage]{}
+	if tracker.cancel(maxCanceledRequestIDs, request, testMessage{}, context.Canceled) {
+		t.Fatal("canceled request IDs grew past the retention limit")
+	}
+	if !tracker.handleResponse(0, testMessage{id: "late"}) {
+		t.Fatal("late response did not consume its canceled request ID")
+	}
+	if !tracker.cancel(maxCanceledRequestIDs, request, testMessage{}, context.Canceled) {
+		t.Fatal("released canceled request ID did not restore tracker capacity")
 	}
 }

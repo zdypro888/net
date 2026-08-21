@@ -44,6 +44,7 @@ func NewClientWithBuffer[T any](serverURL string, bufferSize int, opts ...Option
 	return client
 }
 
+// Handle 返回当前会话的入站数据通道；会话结束时该通道会关闭。
 func (c *Client[T]) Handle() <-chan *Packet[T] {
 	c.locker.RLock()
 	defer c.locker.RUnlock()
@@ -76,42 +77,64 @@ func (c *Client[T]) dial(ctx context.Context, guid string) (*websocket.Conn, Cod
 		return nil, nil, err
 	}
 	conn.SetReadLimit(c.maxMessageSize)
+	stopContextClose := context.AfterFunc(ctx, func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			slog.Debug("wsc client close canceled handshake failed", slog.Any("err", closeErr))
+		}
+	})
+	defer stopContextClose()
+	closeWithContextError := func(err error) error {
+		closeErr := conn.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return errors.Join(ctxErr, closeErr)
+		}
+		return errors.Join(err, closeErr)
+	}
+	deadline := time.Now().Add(HandshakeTimeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
 	// 握手
-	if err := conn.SetWriteDeadline(time.Now().Add(HandshakeTimeout)); err != nil {
-		return nil, nil, errors.Join(err, conn.Close())
+	if err := conn.SetWriteDeadline(deadline); err != nil {
+		return nil, nil, closeWithContextError(err)
 	}
 	if err := conn.WriteJSON(HandshakeRequest{
 		GUID:    guid,
 		Version: ProtocolVersion,
 		Codecs:  c.codecs.names(),
 	}); err != nil {
-		return nil, nil, errors.Join(err, conn.Close())
+		return nil, nil, closeWithContextError(err)
 	}
-	if err := conn.SetReadDeadline(time.Now().Add(HandshakeTimeout)); err != nil {
-		return nil, nil, errors.Join(err, conn.Close())
+	if err := conn.SetReadDeadline(deadline); err != nil {
+		return nil, nil, closeWithContextError(err)
 	}
 	var resp HandshakeResponse
 	if err := conn.ReadJSON(&resp); err != nil {
-		return nil, nil, errors.Join(err, conn.Close())
+		return nil, nil, closeWithContextError(err)
 	}
 	if resp.Status != 200 {
-		return nil, nil, errors.Join(fmt.Errorf("dial failed: %s", resp.Message), conn.Close())
+		return nil, nil, closeWithContextError(fmt.Errorf("dial failed: %s", resp.Message))
 	}
 	// 解析协商结果: 空 = 旧服务端, 回退默认 JSON; 非空必须是本端支持的 codec。
 	codec := defaultCodec
 	if resp.Codec != "" {
 		selected, ok := c.codecs.get(resp.Codec)
 		if !ok {
-			return nil, nil, errors.Join(fmt.Errorf("dial failed: server selected unsupported codec %q", resp.Codec), conn.Close())
+			return nil, nil, closeWithContextError(fmt.Errorf("dial failed: server selected unsupported codec %q", resp.Codec))
 		}
 		codec = selected
 	}
 	// 清除 deadline
 	if err := conn.SetReadDeadline(time.Time{}); err != nil {
-		return nil, nil, errors.Join(err, conn.Close())
+		return nil, nil, closeWithContextError(err)
 	}
 	if err := conn.SetWriteDeadline(time.Time{}); err != nil {
-		return nil, nil, errors.Join(err, conn.Close())
+		return nil, nil, closeWithContextError(err)
+	}
+	if !stopContextClose() {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, nil, errors.Join(ctxErr, conn.Close())
+		}
 	}
 	return conn, codec, nil
 }
@@ -162,7 +185,7 @@ func (c *Client[T]) handleMessageGo(session *Session[T], msgchan <-chan *Packet[
 					}
 					// 重置连接. 用 Session.Reset 封装连接切换串行化, 不越界调用
 					// 内部 helper 或操作 session.locker.
-					if err := session.reset(context.Background(), conn, codec); err != nil {
+					if err := session.reset(context.Background(), conn, codec, nil); err != nil {
 						if closeErr := conn.Close(); closeErr != nil {
 							slog.Warn("wsc client reconnect close failed",
 								slog.Any("reset_err", err), slog.Any("close_err", closeErr))
@@ -200,12 +223,13 @@ func (c *Client[T]) Connect(ctx context.Context) error {
 		return err
 	}
 	// 用 Session.Reset 而非越界拿 session.locker; Reset 内部负责连接切换串行化.
-	if err := session.reset(ctx, conn, codec); err != nil {
+	if err := session.reset(ctx, conn, codec, nil); err != nil {
 		return errors.Join(err, conn.Close())
 	}
 	return nil
 }
 
+// Write 向当前 WebSocket 会话发送一条无需响应的数据。
 func (c *Client[T]) Write(ctx context.Context, data T) error {
 	c.locker.RLock()
 	session := c.session
@@ -216,6 +240,7 @@ func (c *Client[T]) Write(ctx context.Context, data T) error {
 	return session.Write(ctx, data)
 }
 
+// Request 向当前 WebSocket 会话发送请求并等待对应响应。
 func (c *Client[T]) Request(ctx context.Context, data T) (T, error) {
 	c.locker.RLock()
 	session := c.session
@@ -236,6 +261,29 @@ func (c *Client[T]) Reply(ctx context.Context, id string, data T) error {
 		return ErrSessionClosed
 	}
 	return session.Reply(ctx, id, data)
+}
+
+// ReplyGeneration 仅在请求来源连接仍为当前代次时回复，避免重连后把旧请求 ID
+// 写入新连接。
+func (c *Client[T]) ReplyGeneration(ctx context.Context, generation uint64, id string, data T) error {
+	c.locker.RLock()
+	session := c.session
+	c.locker.RUnlock()
+	if session == nil {
+		return ErrSessionClosed
+	}
+	return session.ReplyGeneration(ctx, generation, id, data)
+}
+
+// Generation 返回当前底层连接代次。
+func (c *Client[T]) Generation() uint64 {
+	c.locker.RLock()
+	session := c.session
+	c.locker.RUnlock()
+	if session == nil {
+		return 0
+	}
+	return session.Generation()
 }
 
 // Close 关闭连接

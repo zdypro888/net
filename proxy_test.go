@@ -101,6 +101,16 @@ func TestProxyDialContextCancelWhileWaitingForConnectResponse(t *testing.T) {
 	}
 }
 
+func TestDeadlineWithinKeepsInternalTimeoutWhenContextIsLonger(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel()
+
+	deadline := deadlineWithin(ctx, 20*time.Millisecond)
+	if remaining := time.Until(deadline); remaining <= 0 || remaining > time.Second {
+		t.Fatalf("deadline remaining = %s, want internal timeout", remaining)
+	}
+}
+
 func TestProxyDialContextHTTPSProxyStrictRejectsSelfSigned(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

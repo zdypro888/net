@@ -24,11 +24,26 @@ func checkClose(t *testing.T, name string, closeFn func() error) {
 	}
 }
 
+func TestReplyGenerationRejectsStaleConnection(t *testing.T) {
+	session := createSessionWithBuffer[testPayload]("stale-reply", 1)
+	t.Cleanup(func() { checkClose(t, "session", session.Close) })
+	staleGeneration := session.advanceGeneration()
+	session.advanceGeneration()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := session.ReplyGeneration(ctx, staleGeneration, "old-request", testPayload{})
+	if !errors.Is(err, net.ErrConnectionClosed) {
+		t.Fatalf("stale generation reply error = %v, want connection closed", err)
+	}
+}
+
 func TestClientServerWriteAndRequest(t *testing.T) {
 	server := NewServerWithBuffer[testPayload](64)
 	upgrader := websocket.Upgrader{}
 	sessionCh := make(chan *Session[testPayload], 1)
 	errCh := make(chan error, 1)
+	connectionArgs := &struct{ tenant string }{tenant: "tenant-a"}
 
 	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -36,7 +51,7 @@ func TestClientServerWriteAndRequest(t *testing.T) {
 			errCh <- err
 			return
 		}
-		session, err := server.OnConnection(conn, nil)
+		session, err := server.OnConnection(conn, connectionArgs)
 		if err != nil {
 			errCh <- err
 			return
@@ -69,6 +84,9 @@ func TestClientServerWriteAndRequest(t *testing.T) {
 	}
 	select {
 	case packet := <-session.Handle():
+		if got := session.TakeConnectionArgs(packet.Generation); got != connectionArgs {
+			t.Fatalf("packet args = %#v, want connection args %#v", got, connectionArgs)
+		}
 		if packet.ID != "" {
 			t.Fatalf("notification should not have request id: %q", packet.ID)
 		}
@@ -83,6 +101,10 @@ func TestClientServerWriteAndRequest(t *testing.T) {
 	go func() {
 		defer close(replyDone)
 		packet := <-session.Handle()
+		if got := session.TakeConnectionArgs(packet.Generation); got != connectionArgs {
+			t.Errorf("request packet args = %#v, want connection args %#v", got, connectionArgs)
+			return
+		}
 		if packet.ID == "" {
 			t.Errorf("request missing id")
 			return
@@ -103,6 +125,29 @@ func TestClientServerWriteAndRequest(t *testing.T) {
 	case <-replyDone:
 	case <-ctx.Done():
 		t.Fatalf("timed out waiting for reply goroutine: %v", ctx.Err())
+	}
+
+	checkClose(t, "client", client.Close)
+	select {
+	case packet := <-session.Handle():
+		if !packet.Closed {
+			t.Fatalf("packet after client close = %#v, want closed packet", packet)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for closed packet: %v", ctx.Err())
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		session.connectionMu.Lock()
+		remaining := len(session.connectionArgs)
+		session.connectionMu.Unlock()
+		if remaining == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("connection args retained after all packets were consumed: %d", remaining)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -602,7 +647,7 @@ func TestServerDisconnectCoalescesBlockedClosedPacketDelivery(t *testing.T) {
 		msgchan := make(chan *messagechannel[testPayload])
 		close(msgchan)
 		go func() {
-			session.handleMessageGo(session.handchan, msgchan, session.stopChan, generation)
+			session.handleMessageGo(session.handchan, msgchan, session.stopChan, generation, false)
 			done <- struct{}{}
 		}()
 	}
@@ -706,7 +751,7 @@ func TestServerDisconnectClosedSignalResetsAfterDelivery(t *testing.T) {
 		close(msgchan)
 		done := make(chan struct{})
 		go func() {
-			session.handleMessageGo(session.handchan, msgchan, session.stopChan, generation)
+			session.handleMessageGo(session.handchan, msgchan, session.stopChan, generation, false)
 			close(done)
 		}()
 		select {
@@ -828,5 +873,66 @@ func TestServerSessionDirectCloseRemovesTableEntry(t *testing.T) {
 	checkClose(t, "session", session.Close)
 	if got := server.GetSession(guid); got != nil {
 		t.Fatalf("server table still holds session %q after direct Close; zombie entry", guid)
+	}
+}
+
+func TestServerRejectsConnectionsAfterClose(t *testing.T) {
+	server := NewServerWithBuffer[testPayload](8)
+	if err := server.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	upgrader := websocket.Upgrader{}
+	onConnectionErr := make(chan error, 1)
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			onConnectionErr <- err
+			return
+		}
+		_, err = server.OnConnection(conn, nil)
+		onConnectionErr <- err
+	}))
+	defer httpServer.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+httpServer.URL[len("http"):], nil)
+	if err != nil {
+		t.Fatalf("Dial failed: %v", err)
+	}
+	defer checkClose(t, "client websocket", conn.Close)
+
+	select {
+	case err := <-onConnectionErr:
+		if !errors.Is(err, ErrServerClosed) {
+			t.Fatalf("OnConnection error = %v, want ErrServerClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("closed server did not reject the connection")
+	}
+	if got := server.GetSession("late-guid"); got != nil {
+		t.Fatal("closed server retained a late session")
+	}
+}
+
+func TestServerRemoveSessionIfPreservesReplacement(t *testing.T) {
+	server := NewServerWithBuffer[testPayload](4)
+	defer checkClose(t, "server", server.Close)
+
+	oldSession := createSessionWithBuffer[testPayload]("shared-guid", 4)
+	defer checkClose(t, "old session", oldSession.Close)
+	replacement := createSessionWithBuffer[testPayload]("shared-guid", 4)
+	server.sessions[replacement.guid] = replacement
+
+	if server.RemoveSessionIf(replacement.guid, oldSession) {
+		t.Fatal("RemoveSessionIf removed a replacement session")
+	}
+	if got := server.GetSession(replacement.guid); got != replacement {
+		t.Fatalf("server session = %p, want replacement %p", got, replacement)
+	}
+	if !server.RemoveSessionIf(replacement.guid, replacement) {
+		t.Fatal("RemoveSessionIf did not remove the matching session")
+	}
+	if got := server.GetSession(replacement.guid); got != nil {
+		t.Fatalf("server retained matching session %p", got)
 	}
 }
