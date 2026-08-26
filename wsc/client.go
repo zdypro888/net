@@ -4,13 +4,62 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
+
+const maxHandshakeErrorBody = 4 << 10
+
+// HTTPHandshakeError 表示 WebSocket 在 HTTP 升级阶段被服务端拒绝。
+// StatusCode 可供上层区分鉴权失败与临时服务故障，Body 仅保留有限长度用于诊断。
+type HTTPHandshakeError struct {
+	StatusCode int
+	Status     string
+	Body       string
+	err        error
+}
+
+// Error 返回包含 HTTP 状态和服务端响应的握手错误。
+func (err *HTTPHandshakeError) Error() string {
+	if body := strings.TrimSpace(err.Body); body != "" {
+		return fmt.Sprintf("websocket handshake failed: %s: %s", err.Status, body)
+	}
+	return fmt.Sprintf("websocket handshake failed: %s", err.Status)
+}
+
+// Unwrap 返回 Gorilla WebSocket 的原始握手错误。
+func (err *HTTPHandshakeError) Unwrap() error {
+	return err.err
+}
+
+func captureHTTPHandshakeError(dialErr error, response *http.Response) error {
+	if response == nil {
+		return dialErr
+	}
+	if response.Body == nil {
+		return &HTTPHandshakeError{
+			StatusCode: response.StatusCode,
+			Status:     response.Status,
+			err:        dialErr,
+		}
+	}
+	body, readErr := io.ReadAll(io.LimitReader(response.Body, maxHandshakeErrorBody))
+	closeErr := response.Body.Close()
+	handshakeErr := &HTTPHandshakeError{
+		StatusCode: response.StatusCode,
+		Status:     response.Status,
+		Body:       string(body),
+		err:        dialErr,
+	}
+	return errors.Join(handshakeErr, readErr, closeErr)
+}
 
 // Client WebSocket 客户端（基于 Session）。
 // 支持 Connect/Close 模式，Close 后可再次 Connect。
@@ -72,9 +121,9 @@ func (c *Client[T]) sessionClosedLocked() bool {
 // 且需在 codec 确定前完成), 客户端把支持的 codec 名字按优先级带给服务端, 服务端在
 // 响应里回选定的 codec。响应不带 codec (旧服务端) 时回退到默认 JSON。
 func (c *Client[T]) dial(ctx context.Context, guid string) (*websocket.Conn, Codec, error) {
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, c.serverURL, nil)
+	conn, response, err := websocket.DefaultDialer.DialContext(ctx, c.serverURL, nil)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, captureHTTPHandshakeError(err, response)
 	}
 	conn.SetReadLimit(c.maxMessageSize)
 	stopContextClose := context.AfterFunc(ctx, func() {

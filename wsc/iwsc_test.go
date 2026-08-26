@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -35,6 +36,27 @@ func TestReplyGenerationRejectsStaleConnection(t *testing.T) {
 	err := session.ReplyGeneration(ctx, staleGeneration, "old-request", testPayload{})
 	if !errors.Is(err, net.ErrConnectionClosed) {
 		t.Fatalf("stale generation reply error = %v, want connection closed", err)
+	}
+}
+
+func TestClientConnectPreservesHTTPHandshakeError(t *testing.T) {
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		if _, err := w.Write([]byte(`{"error":"Invalid credentials"}`)); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	}))
+	defer httpServer.Close()
+
+	client := NewClient[testPayload]("ws" + httpServer.URL[len("http"):])
+	defer checkClose(t, "client", client.Close)
+	err := client.Connect(context.Background())
+	var handshakeErr *HTTPHandshakeError
+	if !errors.As(err, &handshakeErr) {
+		t.Fatalf("Connect error = %v, want HTTPHandshakeError", err)
+	}
+	if handshakeErr.StatusCode != http.StatusUnauthorized || !strings.Contains(handshakeErr.Body, "Invalid credentials") {
+		t.Fatalf("handshake error = %+v", handshakeErr)
 	}
 }
 
