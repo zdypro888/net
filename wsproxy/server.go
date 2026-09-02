@@ -262,9 +262,28 @@ func (server *Server) registerSlaverSession(scope string, session *Session) bool
 //
 // list.Remove 对已移除元素是 no-op, popped 标记保证出池责任(回收+计数)只归一方.
 func (server *Server) watchSlaver(entry *slaverEntry, elem *list.Element) {
+	if err := entry.session.Conn.SetReadDeadline(time.Now().Add(slaverHeartbeatTimeout)); err != nil {
+		read := slaverRead{err: err}
+		entry.reply <- read
+		server.removePooledSlaver(entry, elem, read)
+		return
+	}
+	entry.session.Conn.SetPingHandler(func(message string) error {
+		now := time.Now()
+		if err := entry.session.Conn.SetReadDeadline(now.Add(slaverHeartbeatTimeout)); err != nil {
+			return err
+		}
+		return entry.session.Conn.WriteControl(websocket.PongMessage, []byte(message), now.Add(slaverHeartbeatWriteTTL))
+	})
 	var packet connPacket
 	err := entry.session.Conn.ReadJSON(&packet)
-	entry.reply <- slaverRead{packet: packet, err: err}
+	read := slaverRead{packet: packet, err: err}
+	entry.reply <- read
+	server.removePooledSlaver(entry, elem, read)
+}
+
+// removePooledSlaver 只回收仍归连接池所有的条目；已交给拨号流程的条目由调用方关闭。
+func (server *Server) removePooledSlaver(entry *slaverEntry, elem *list.Element, read slaverRead) {
 	server.locker.Lock()
 	inPool := !entry.popped
 	if inPool {
@@ -276,12 +295,12 @@ func (server *Server) watchSlaver(entry *slaverEntry, elem *list.Element) {
 		return
 	}
 	server.staleSessions.Add(1)
-	if err != nil {
+	if read.err != nil {
 		slog.Warn("wsproxy slaver disconnected while pooled",
-			slog.String("session", entry.session.Id), slog.Any("err", err))
+			slog.String("session", entry.session.Id), slog.Any("err", read.err))
 	} else {
 		slog.Warn("wsproxy slaver sent unsolicited packet while pooled; evicting",
-			slog.String("session", entry.session.Id), slog.Int("method", int(packet.Method)))
+			slog.String("session", entry.session.Id), slog.Int("method", int(read.packet.Method)))
 	}
 	if closeErr := entry.session.Close(); closeErr != nil {
 		slog.Debug("wsproxy watchSlaver close evicted slaver failed", slog.Any("err", closeErr))
@@ -422,8 +441,12 @@ func (server *Server) dialContextScope(ctx context.Context, scope, network, addr
 		return nil, closeWithContextError(read.err)
 	}
 	incoming := read.packet
+	// watcher 为待命心跳设置了读取截止时间；交接完成后必须清除，避免长连接被误杀。
+	if err := session.Conn.SetReadDeadline(time.Time{}); err != nil {
+		return nil, closeWithContextError(err)
+	}
 
-	// 清除写超时，后续由 copyLoop 管理. 读侧从未设 deadline (见 handshakeTimer), 无需清除.
+	// 清除写超时，后续由 copyLoop 管理。
 	if err := session.Conn.SetWriteDeadline(time.Time{}); err != nil {
 		return nil, closeWithContextError(err)
 	}

@@ -87,8 +87,11 @@ func (slaver *Slaver) Run(ctx context.Context, addr string) error {
 			}
 			continue
 		}
+		stopHeartbeat := keepSlaverConnectionAlive(ctx, wsConn)
 		var outgoing connPacket
-		if err := wsConn.ReadJSON(&outgoing); err != nil {
+		readErr := wsConn.ReadJSON(&outgoing)
+		stopHeartbeat()
+		if readErr != nil {
 			// 同上: stopContextClose 抢先关 done 后 watcher 可能不 Close, 补 best-effort Close。
 			stopContextClose()
 			if ctx.Err() != nil {
@@ -98,7 +101,7 @@ func (slaver *Slaver) Run(ctx context.Context, addr string) error {
 				return ctx.Err()
 			}
 			slog.Warn("wsproxy slaver read dial-request failed",
-				slog.String("addr", addr), slog.Any("err", err))
+				slog.String("addr", addr), slog.Any("err", readErr))
 			if closeErr := wsConn.Close(); closeErr != nil {
 				slog.Warn("wsproxy slaver close after read dial-request failure failed",
 					slog.String("addr", addr), slog.Any("err", closeErr))

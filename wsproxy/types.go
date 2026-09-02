@@ -16,6 +16,12 @@ import (
 // MaxMessageSize 是代理允许读取的单条 WebSocket 消息大小上限。
 const MaxMessageSize = 32 << 20
 
+const (
+	slaverHeartbeatInterval = 15 * time.Second
+	slaverHeartbeatTimeout  = 45 * time.Second
+	slaverHeartbeatWriteTTL = 5 * time.Second
+)
+
 func handshakeDeadline(ctx context.Context) time.Time {
 	deadline := time.Now().Add(dialHandshakeTimeout)
 	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
@@ -80,6 +86,39 @@ func closeWebSocketOnContextDone(ctx context.Context, conn *websocket.Conn) func
 		once.Do(func() {
 			close(done)
 		})
+		<-stopped
+	}
+}
+
+// keepSlaverConnectionAlive 在连接仍处于待命池时发送 WebSocket 控制帧。
+// 中间代理未及时传播 TCP 断开时，服务端仍可依靠心跳读取截止时间清理失效连接。
+func keepSlaverConnectionAlive(ctx context.Context, conn *websocket.Conn) func() {
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	var once sync.Once
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(slaverHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case now := <-ticker.C:
+				if err := conn.WriteControl(websocket.PingMessage, nil, now.Add(slaverHeartbeatWriteTTL)); err != nil {
+					slog.Warn("wsproxy slaver heartbeat failed", slog.Any("err", err))
+					if closeErr := conn.Close(); closeErr != nil {
+						slog.Debug("wsproxy slaver close after heartbeat failure failed", slog.Any("err", closeErr))
+					}
+					return
+				}
+			}
+		}
+	}()
+	return func() {
+		once.Do(func() { close(done) })
 		<-stopped
 	}
 }
