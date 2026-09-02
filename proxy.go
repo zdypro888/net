@@ -194,6 +194,9 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 		return conn, nil
 	case "ws", "wss":
 		if proxy.server != nil {
+			if proxy.WSToken != "" {
+				return proxy.server.DialContextToken(ctx, proxy.WSToken, network, address)
+			}
 			return proxy.server.DialContext(ctx, network, address)
 		} else {
 			client := wsproxy.NewClient(proxyURL.String())

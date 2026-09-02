@@ -20,6 +20,9 @@ var ErrNoConnection = errors.New("no available connection")
 // ErrServerClosed 表示代理服务器已经关闭。
 var ErrServerClosed = errors.New("proxy server closed")
 
+// ErrTokenRequired 表示服务端要求使用独立 token，但连接没有提供。
+var ErrTokenRequired = errors.New("proxy token required")
+
 // DefaultMaxSessions 是注册池的默认容量上限 (Server.MaxSessions<=0 时生效).
 // 每个池条目占一条 TCP + 一个 watcher goroutine, 上限防止异常 slaver 无界堆积.
 const DefaultMaxSessions = 1024
@@ -48,6 +51,7 @@ type slaverRead struct {
 //     (gorilla conn 不支持并发读, 读权始终归 watcher 直到交接完成).
 type slaverEntry struct {
 	session *Session
+	scope   string          // token 分池键；默认模式为空，日志中不得输出
 	reply   chan slaverRead // cap 1; watcher 交付一次后退出, 投递永不阻塞
 	popped  bool            // 由 server.locker 保护: 已出池 (popSession/CloseAll), watcher 不再负责回收与计数
 }
@@ -56,8 +60,16 @@ type slaverEntry struct {
 type Server struct {
 	locker   sync.Mutex
 	sessions *list.List // 使用 list 保持顺序，FIFO 方式使用连接; 元素类型 *slaverEntry
-	active   map[*Session]struct{}
+	active   map[*Session]string
 	Token    string
+	// ScopeByToken 启用后，注册和远程拨号都必须携带 token，各 token 的连接池完全隔离。
+	// Token 字段是旧版单一服务口令，两种模式不可同时使用。
+	ScopeByToken bool
+	// AuthorizeToken 在分池模式下校验 token 是否属于有效租户；为空时只校验非空。
+	// 回调不得记录 token，也不应执行耗时较长的操作。
+	AuthorizeToken func(context.Context, string) error
+	// MaxSessionsPerToken 限制单个 token 的待命连接数，<=0 表示不单独限制。
+	MaxSessionsPerToken int
 
 	// MaxSessions 限制注册池容量, <=0 时用 DefaultMaxSessions. 超限的注册被拒绝
 	// (关闭连接, slaver 侧按既有 backoff 重试), 防止死注册无界堆积.
@@ -83,7 +95,7 @@ func NewServer() *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
 		sessions: list.New(),
-		active:   make(map[*Session]struct{}),
+		active:   make(map[*Session]string),
 		ctx:      ctx,
 		cancel:   cancel,
 	}
@@ -118,7 +130,30 @@ func (server *Server) OnConnection(conn *websocket.Conn) {
 		}
 		return
 	}
-	if server.Token != "" && subtle.ConstantTimeCompare([]byte(incoming.Token), []byte(server.Token)) != 1 {
+	scope := ""
+	if server.ScopeByToken {
+		if incoming.Token == "" {
+			server.tokenRejects.Add(1)
+			if err := conn.Close(); err != nil {
+				slog.Warn("wsproxy OnConnection close tokenless connection failed", slog.Any("err", err))
+			}
+			return
+		}
+		if server.AuthorizeToken != nil {
+			if err := server.AuthorizeToken(server.ctx, incoming.Token); err != nil {
+				server.tokenRejects.Add(1)
+				slog.Warn("wsproxy OnConnection token rejected",
+					slog.String("remote", conn.RemoteAddr().String()),
+					slog.Int("method", int(incoming.Method)),
+					slog.Any("err", err))
+				if closeErr := conn.Close(); closeErr != nil {
+					slog.Warn("wsproxy OnConnection close after token rejection failed", slog.Any("err", closeErr))
+				}
+				return
+			}
+		}
+		scope = incoming.Token
+	} else if server.Token != "" && subtle.ConstantTimeCompare([]byte(incoming.Token), []byte(server.Token)) != 1 {
 		// 常数时间比较防止远端攻击者按 Token 字符位 timing 爆破.
 		server.tokenRejects.Add(1)
 		slog.Warn("wsproxy OnConnection token mismatch",
@@ -140,7 +175,7 @@ func (server *Server) OnConnection(conn *websocket.Conn) {
 	switch incoming.Method {
 	case MethodRegisterSlaver:
 		// 注册连接 (入池 + 启动 watcher); 池满或服务器已关时拒绝.
-		if !server.registerSlaverSession(&Session{Id: incoming.Id, Conn: conn}) {
+		if !server.registerSlaverSession(scope, &Session{Id: incoming.Id, Conn: conn}) {
 			if err := conn.Close(); err != nil {
 				slog.Warn("wsproxy OnConnection close rejected slaver failed", slog.Any("err", err))
 			}
@@ -161,7 +196,7 @@ func (server *Server) OnConnection(conn *websocket.Conn) {
 			return
 		}
 		server.workerWG.Go(func() {
-			server.onClientDialout(server.ctx, conn, &incoming)
+			server.onClientDialout(server.ctx, scope, conn, &incoming)
 		})
 		server.locker.Unlock()
 	default:
@@ -177,7 +212,7 @@ func (server *Server) OnConnection(conn *websocket.Conn) {
 
 // registerSlaverSession 把注册成功的 slaver 连接入池并启动 watcher.
 // OnConnection 注册分支与测试共用. 返回 false 表示服务器已关闭或池已满 (调用方负责关连接).
-func (server *Server) registerSlaverSession(session *Session) bool {
+func (server *Server) registerSlaverSession(scope string, session *Session) bool {
 	limit := server.MaxSessions
 	if limit <= 0 {
 		limit = DefaultMaxSessions
@@ -195,7 +230,23 @@ func (server *Server) registerSlaverSession(session *Session) bool {
 			slog.Int("limit", limit))
 		return false
 	}
-	entry := &slaverEntry{session: session, reply: make(chan slaverRead, 1)}
+	if scope != "" && server.MaxSessionsPerToken > 0 {
+		count := 0
+		for elem := server.sessions.Front(); elem != nil; elem = elem.Next() {
+			if elem.Value.(*slaverEntry).scope == scope {
+				count++
+			}
+		}
+		if count >= server.MaxSessionsPerToken {
+			server.locker.Unlock()
+			slog.Warn("wsproxy token pool full; rejecting registration",
+				slog.String("session", session.Id),
+				slog.String("remote", session.Conn.RemoteAddr().String()),
+				slog.Int("limit", server.MaxSessionsPerToken))
+			return false
+		}
+	}
+	entry := &slaverEntry{session: session, scope: scope, reply: make(chan slaverRead, 1)}
 	elem := server.sessions.PushBack(entry)
 	server.workerWG.Go(func() { server.watchSlaver(entry, elem) })
 	server.locker.Unlock()
@@ -239,18 +290,24 @@ func (server *Server) watchSlaver(entry *slaverEntry, elem *list.Element) {
 
 // popSession 从连接池中取出第一个可用会话（FIFO），并在同一个临界区把它
 // 转移到 active 集合，避免 CloseAll 在两种所有权状态之间漏掉连接。
-func (server *Server) popSession() (*slaverEntry, error) {
+func (server *Server) popSession(scope string) (*slaverEntry, error) {
 	for {
 		server.locker.Lock()
 		if server.closed.Load() {
 			server.locker.Unlock()
 			return nil, ErrServerClosed
 		}
-		if server.sessions.Len() == 0 {
+		var front *list.Element
+		for elem := server.sessions.Front(); elem != nil; elem = elem.Next() {
+			if elem.Value.(*slaverEntry).scope == scope {
+				front = elem
+				break
+			}
+		}
+		if front == nil {
 			server.locker.Unlock()
 			return nil, ErrNoConnection
 		}
-		front := server.sessions.Front()
 		server.sessions.Remove(front)
 		entry := front.Value.(*slaverEntry)
 		entry.popped = true
@@ -267,7 +324,7 @@ func (server *Server) popSession() (*slaverEntry, error) {
 			}
 		default:
 			entry.session.setOnClose(server.untrackSession)
-			server.active[entry.session] = struct{}{}
+			server.active[entry.session] = scope
 			server.locker.Unlock()
 			return entry, nil
 		}
@@ -282,6 +339,18 @@ func (server *Server) untrackSession(session *Session) {
 
 // DialContext 通过代理连接到目标地址
 func (server *Server) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return server.dialContextScope(ctx, "", network, address)
+}
+
+// DialContextToken 只使用指定 token 注册的反向连接进行拨号。
+func (server *Server) DialContextToken(ctx context.Context, token, network, address string) (net.Conn, error) {
+	if token == "" {
+		return nil, ErrTokenRequired
+	}
+	return server.dialContextScope(ctx, token, network, address)
+}
+
+func (server *Server) dialContextScope(ctx context.Context, scope, network, address string) (net.Conn, error) {
 	// 已过期的 ctx 不应消耗池中会话: popSession 取出的连接只用一次, 直接早返回。
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -290,7 +359,7 @@ func (server *Server) DialContext(ctx context.Context, network, address string) 
 		return nil, ErrServerClosed
 	}
 	// popSession 已经从池中移除了会话，每个连接只用一次
-	entry, err := server.popSession()
+	entry, err := server.popSession(scope)
 	if err != nil {
 		if errors.Is(err, ErrNoConnection) {
 			server.noSessionDials.Add(1)
@@ -386,7 +455,7 @@ func (server *Server) DialContext(ctx context.Context, network, address string) 
 	return session, nil
 }
 
-func (server *Server) onClientDialout(ctx context.Context, conn *websocket.Conn, packet *connPacket) {
+func (server *Server) onClientDialout(ctx context.Context, scope string, conn *websocket.Conn, packet *connPacket) {
 	stopContextClose := closeWebSocketOnContextDone(ctx, conn)
 	defer stopContextClose()
 	writeHandshake := func(packet *connPacket) error {
@@ -399,7 +468,7 @@ func (server *Server) onClientDialout(ctx context.Context, conn *websocket.Conn,
 		}
 		return conn.SetWriteDeadline(time.Time{})
 	}
-	session, err := server.DialContext(ctx, packet.Network, packet.Address)
+	session, err := server.dialContextScope(ctx, scope, packet.Network, packet.Address)
 	if err != nil {
 		if writeErr := writeHandshake(&connPacket{
 			Id:     packet.Id,
@@ -445,6 +514,52 @@ func (server *Server) ConnectionCount() int {
 	server.locker.Lock()
 	defer server.locker.Unlock()
 	return server.sessions.Len()
+}
+
+// ConnectionCountToken 返回指定 token 当前可用的待命连接数。
+func (server *Server) ConnectionCountToken(token string) int {
+	server.locker.Lock()
+	defer server.locker.Unlock()
+	count := 0
+	for elem := server.sessions.Front(); elem != nil; elem = elem.Next() {
+		if elem.Value.(*slaverEntry).scope == token {
+			count++
+		}
+	}
+	return count
+}
+
+// CloseToken 关闭并移除指定 token 的待命连接和活动隧道。
+func (server *Server) CloseToken(token string) {
+	server.locker.Lock()
+	var pooled []*slaverEntry
+	for elem := server.sessions.Front(); elem != nil; {
+		next := elem.Next()
+		entry := elem.Value.(*slaverEntry)
+		if entry.scope == token {
+			entry.popped = true
+			server.sessions.Remove(elem)
+			pooled = append(pooled, entry)
+		}
+		elem = next
+	}
+	var active []*Session
+	for session, scope := range server.active {
+		if scope == token {
+			active = append(active, session)
+		}
+	}
+	server.locker.Unlock()
+	for _, entry := range pooled {
+		if err := entry.session.Close(); err != nil {
+			slog.Debug("wsproxy CloseToken pooled session close failed", slog.Any("err", err))
+		}
+	}
+	for _, session := range active {
+		if err := session.Close(); err != nil {
+			slog.Debug("wsproxy CloseToken active session close failed", slog.Any("err", err))
+		}
+	}
 }
 
 // Stats 返回 wsproxy.Server 运行时计数. sessions 长度短暂持锁读取, 计数器用 atomic.Load;

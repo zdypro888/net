@@ -189,7 +189,7 @@ func TestServerCloseAllCancelsInflightDialout(t *testing.T) {
 	}
 	defer checkClose(t, "slaver websocket", slaverConn.Close)
 	// 直接入池 (跳过 OnConnection 握手), 走与注册分支相同的 registerSlaverSession.
-	if !proxyServer.registerSlaverSession(&Session{Id: "slaver-99", Conn: slaverConn}) {
+	if !proxyServer.registerSlaverSession("", &Session{Id: "slaver-99", Conn: slaverConn}) {
 		t.Fatal("registerSlaverSession rejected fake slaver")
 	}
 
@@ -267,7 +267,7 @@ func TestServerDialContextCancelWhileWaitingForSlaverReply(t *testing.T) {
 	if err != nil {
 		t.Fatalf("slaver dial failed: %v", err)
 	}
-	if !proxyServer.registerSlaverSession(&Session{Id: "slaver-cancel", Conn: slaverConn}) {
+	if !proxyServer.registerSlaverSession("", &Session{Id: "slaver-cancel", Conn: slaverConn}) {
 		t.Fatal("registerSlaverSession rejected fake slaver")
 	}
 
@@ -631,6 +631,79 @@ func TestServerMaxSessionsRejectsExcessRegistration(t *testing.T) {
 	}
 	if got := proxyServer.ConnectionCount(); got != 1 {
 		t.Fatalf("ConnectionCount after over-limit register = %d, want 1", got)
+	}
+}
+
+func TestServerScopesSlaverPoolByToken(t *testing.T) {
+	proxyServer := NewServer()
+	proxyServer.ScopeByToken = true
+	proxyServer.MaxSessionsPerToken = 1
+	proxyServer.AuthorizeToken = func(_ context.Context, token string) error {
+		if token == "tenant-a" || token == "tenant-b" {
+			return nil
+		}
+		return errors.New("unknown token")
+	}
+	defer proxyServer.CloseAll()
+
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err == nil {
+			proxyServer.OnConnection(conn)
+		}
+	}))
+	defer server.Close()
+
+	register := func(id, token string) *websocket.Conn {
+		conn, _, err := websocket.DefaultDialer.Dial("ws"+server.URL[len("http"):], nil)
+		if err != nil {
+			t.Fatalf("dial failed: %v", err)
+		}
+		if err := conn.WriteJSON(&connPacket{Id: id, Method: MethodRegisterSlaver, Token: token}); err != nil {
+			t.Fatalf("register write failed: %v", err)
+		}
+		return conn
+	}
+	waitForTokenCount := func(token string, want int) {
+		t.Helper()
+		deadline := time.Now().Add(time.Second)
+		for proxyServer.ConnectionCountToken(token) != want && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if got := proxyServer.ConnectionCountToken(token); got != want {
+			t.Fatalf("ConnectionCountToken(%q) = %d, want %d", token, got, want)
+		}
+	}
+
+	tenantA := register("tenant-a-1", "tenant-a")
+	defer checkClose(t, "tenant-a slaver", tenantA.Close)
+	tenantB := register("tenant-b-1", "tenant-b")
+	defer checkClose(t, "tenant-b slaver", tenantB.Close)
+	waitForTokenCount("tenant-a", 1)
+	waitForTokenCount("tenant-b", 1)
+
+	// 单租户上限只拒绝 A 的额外连接，不影响 B 的独立连接池。
+	tenantAExcess := register("tenant-a-2", "tenant-a")
+	defer checkClose(t, "tenant-a excess slaver", tenantAExcess.Close)
+	if err := tenantAExcess.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := tenantAExcess.ReadMessage(); err == nil {
+		t.Fatal("excess tenant connection was not rejected")
+	}
+
+	proxyServer.CloseToken("tenant-a")
+	waitForTokenCount("tenant-a", 0)
+	waitForTokenCount("tenant-b", 1)
+
+	rejected := register("unknown", "invalid")
+	defer checkClose(t, "rejected slaver", rejected.Close)
+	if err := rejected.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := rejected.ReadMessage(); err == nil {
+		t.Fatal("unauthorized token connection was not rejected")
 	}
 }
 
