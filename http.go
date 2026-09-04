@@ -218,6 +218,23 @@ func (h *HTTP) Dispose() {
 	}
 }
 
+// ResetConnections 为后续请求换用全新的连接池，同时保留当前 Transport 的
+// TLS、代理、拨号和超时配置。调用方必须保证此时没有并发中的 HTTP 请求。
+func (h *HTTP) ResetConnections() error {
+	if h == nil || h.client == nil {
+		return errors.New("HTTP client is unavailable")
+	}
+	transport, ok := h.transport.(*http.Transport)
+	if !ok {
+		return errors.New("HTTP transport does not support connection reset")
+	}
+	replacement := transport.Clone()
+	transport.CloseIdleConnections()
+	h.transport = replacement
+	h.client.Transport = replacement
+	return nil
+}
+
 func (h *HTTP) ConfigureV2() error {
 	switch transport := h.transport.(type) {
 	case *http.Transport:

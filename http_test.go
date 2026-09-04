@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	stdurl "net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -147,5 +148,45 @@ func TestConfigureProxyDialClearResetPreservesBaseDial(t *testing.T) {
 	doRequest("after reset without cache")
 	if proxyDials != 2 {
 		t.Fatalf("proxy dials after Reset without cache = %d, want 2", proxyDials)
+	}
+}
+
+func TestResetConnectionsReplacesPoolAndPreservesDialer(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	h := NewHTTP(nil)
+	defer h.Dispose()
+	var dials atomic.Int32
+	dial := func(ctx context.Context, network, addr string) (gonet.Conn, error) {
+		dials.Add(1)
+		return (&gonet.Dialer{Timeout: 20 * time.Second}).DialContext(ctx, network, addr)
+	}
+	if err := h.ConfigureProxyDial(dial, true); err != nil {
+		t.Fatalf("configure dialer: %v", err)
+	}
+	request := func() {
+		response, err := h.Request(context.Background(), server.URL, nil, nil)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		if _, err := response.Data(); err != nil {
+			t.Fatalf("read response: %v", err)
+		}
+	}
+
+	request()
+	request()
+	if got := dials.Load(); got != 1 {
+		t.Fatalf("dials before reset = %d, want 1", got)
+	}
+	if err := h.ResetConnections(); err != nil {
+		t.Fatalf("reset connections: %v", err)
+	}
+	request()
+	if got := dials.Load(); got != 2 {
+		t.Fatalf("dials after reset = %d, want 2", got)
 	}
 }
