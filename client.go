@@ -491,10 +491,8 @@ func (client *Client[M, T]) asyncGo(ctx context.Context, handleCtx context.Conte
 	for recv := range recvchan {
 		if notify, ok := any(recv).(NotifyMessage); ok {
 			if notifyId, ok := notify.Id(); ok {
-				if asyncRequest, found := requests.request(notifyId); found {
-					asyncRequest.Response(recv, nil)
-					delete(requests.pending, notifyId)
-				}
+				// 清理阶段也须遵守取消隔离，不能把已取消请求报告为成功。
+				requests.handleResponse(notifyId, recv)
 			}
 		}
 	}
