@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -34,153 +35,123 @@ func (slaver *Slaver) Start(ctx context.Context, serverAddr string) {
 	}()
 }
 
+// Run 维持待命连接，接到拨号命令后补充下一条；取消时等待已派发的隧道全部退出。
 func (slaver *Slaver) Run(ctx context.Context, addr string) error {
-	// backoff 复用与 dial-fail 相同的 3s 窗口, 避免握手期失败 (WriteJSON / ReadJSON /
-	// 非预期 Method) 退化成 hot reconnect loop 把对端 server / 本地 CPU 打死.
-	backoff := func() bool {
-		select {
-		case <-time.After(3 * time.Second):
-			return true
-		case <-ctx.Done():
-			return false
-		}
-	}
+	var workers sync.WaitGroup
+	defer workers.Wait()
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		wsConn, _, err := websocket.DefaultDialer.DialContext(ctx, addr, nil)
+		conn, packet, err := slaver.waitDialRequest(ctx, addr)
 		if err != nil {
-			slog.Warn("wsproxy slaver dial failed; backoff before retry",
-				slog.String("addr", addr), slog.Any("err", err))
-			if !backoff() {
-				return ctx.Err()
-			}
-			continue
-		}
-		stopContextClose := closeWebSocketOnContextDone(ctx, wsConn)
-		wsConn.SetReadLimit(MaxMessageSize)
-		incoming := &connPacket{
-			Id:     slaver.Id,
-			Method: MethodRegisterSlaver, // 注册连接
-			Token:  slaver.Token,
-		}
-		if err := wsConn.WriteJSON(incoming); err != nil {
-			// stopContextClose() 可能抢在 watcher 关连接前关掉 done, 使 watcher 走
-			// <-done 分支直接退出而不 Close; 故此处确定要返回时补一次 best-effort
-			// Close, 防 wsConn 两边都不关的极窄泄漏 (Close 幂等, 与 watcher 双关无害)。
-			stopContextClose()
 			if ctx.Err() != nil {
-				if closeErr := wsConn.Close(); closeErr != nil {
-					slog.Debug("wsproxy slaver close after context cancellation failed", slog.Any("err", closeErr))
-				}
 				return ctx.Err()
 			}
-			slog.Warn("wsproxy slaver register write failed",
-				slog.String("addr", addr), slog.Any("err", err))
-			if closeErr := wsConn.Close(); closeErr != nil {
-				slog.Warn("wsproxy slaver close after register write failure failed",
-					slog.String("addr", addr), slog.Any("err", closeErr))
-			}
-			if !backoff() {
+			slog.Warn("wsproxy slaver registration failed; backoff before retry", slog.Any("err", err))
+			select {
+			case <-time.After(3 * time.Second):
+			case <-ctx.Done():
 				return ctx.Err()
 			}
 			continue
 		}
-		stopHeartbeat := keepSlaverConnectionAlive(ctx, wsConn)
-		var outgoing connPacket
-		readErr := wsConn.ReadJSON(&outgoing)
-		stopHeartbeat()
-		if readErr != nil {
-			// 同上: stopContextClose 抢先关 done 后 watcher 可能不 Close, 补 best-effort Close。
-			stopContextClose()
-			if ctx.Err() != nil {
-				if closeErr := wsConn.Close(); closeErr != nil {
-					slog.Debug("wsproxy slaver close after context cancellation failed", slog.Any("err", closeErr))
-				}
-				return ctx.Err()
-			}
-			slog.Warn("wsproxy slaver read dial-request failed",
-				slog.String("addr", addr), slog.Any("err", readErr))
-			if closeErr := wsConn.Close(); closeErr != nil {
-				slog.Warn("wsproxy slaver close after read dial-request failure failed",
-					slog.String("addr", addr), slog.Any("err", closeErr))
-			}
-			if !backoff() {
-				return ctx.Err()
-			}
-			continue
-		}
-		if outgoing.Method != MethodSlaverDialout {
-			stopContextClose()
-			slog.Warn("wsproxy slaver unexpected method from server",
-				slog.String("addr", addr), slog.Int("method", int(outgoing.Method)))
-			if closeErr := wsConn.Close(); closeErr != nil {
-				slog.Warn("wsproxy slaver close after unexpected method failed",
-					slog.String("addr", addr), slog.Any("err", closeErr))
-			}
-			if !backoff() {
-				return ctx.Err()
-			}
-			continue
-		}
-		if ctx.Err() != nil {
-			stopContextClose()
-			if closeErr := wsConn.Close(); closeErr != nil {
-				slog.Warn("wsproxy slaver close after context cancellation failed", slog.Any("err", closeErr))
-			}
-			return ctx.Err()
-		}
-		stopContextClose()
-		go slaver.dialContext(ctx, wsConn, outgoing.Network, outgoing.Address)
+		workers.Go(func() { slaver.dialContext(ctx, conn, packet.Network, packet.Address) })
 	}
 }
 
+// waitDialRequest 完成有界注册，再用 Ping/Pong 维持待命连接；失败时始终收回连接所有权。
+func (slaver *Slaver) waitDialRequest(ctx context.Context, addr string) (conn *websocket.Conn, packet connPacket, err error) {
+	dialCtx, cancelDial := context.WithTimeout(ctx, dialHandshakeTimeout)
+	conn, response, err := websocket.DefaultDialer.DialContext(dialCtx, addr, nil)
+	cancelDial()
+	if err != nil {
+		if response != nil && response.Body != nil {
+			err = errors.Join(err, response.Body.Close())
+		}
+		return nil, packet, err
+	}
+	stopContextClose := closeWebSocketOnContextDone(ctx, conn)
+	defer func() {
+		stopContextClose()
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
+		if err != nil {
+			err = errors.Join(err, conn.Close())
+			conn = nil
+		}
+	}()
+	conn.SetReadLimit(MaxMessageSize)
+	if err = conn.SetWriteDeadline(handshakeDeadline(ctx)); err != nil {
+		return conn, packet, err
+	}
+	if err = conn.WriteJSON(&connPacket{Id: slaver.Id, Method: MethodRegisterSlaver, Token: slaver.Token}); err != nil {
+		return conn, packet, err
+	}
+	if err = conn.SetWriteDeadline(time.Time{}); err != nil {
+		return conn, packet, err
+	}
+	if err = conn.SetReadDeadline(time.Now().Add(slaverHeartbeatTimeout)); err != nil {
+		return conn, packet, err
+	}
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(slaverHeartbeatTimeout))
+	})
+	stopHeartbeat := keepSlaverConnectionAlive(ctx, conn)
+	err = conn.ReadJSON(&packet)
+	stopHeartbeat()
+	if err != nil {
+		return conn, packet, err
+	}
+	if packet.Method != MethodSlaverDialout {
+		return conn, packet, errors.New("unexpected slaver dial-request method")
+	}
+	if err = validateTarget(packet.Network, packet.Address); err != nil {
+		return conn, packet, err
+	}
+	// 待命期结束，迟到的 Pong 不得再次为已经投入使用的隧道设置空闲超时。
+	conn.SetPongHandler(nil)
+	if err = conn.SetReadDeadline(time.Time{}); err != nil {
+		return conn, packet, err
+	}
+	return conn, packet, nil
+}
+
+// dialContext 的 TCP 建连和结果写出均有上限；进入 copyLoop 后仅由上层 ctx 和连接 IO 结束。
 func (slaver *Slaver) dialContext(ctx context.Context, wsConn *websocket.Conn, network, address string) {
+	defer wsConn.Close()
 	stopContextClose := closeWebSocketOnContextDone(ctx, wsConn)
 	defer stopContextClose()
-	var dialer net.Dialer
-	conn, err := dialer.DialContext(ctx, network, address)
-	if err != nil {
-		if ctx.Err() != nil {
-			if closeErr := wsConn.Close(); closeErr != nil {
-				slog.Warn("wsproxy slaver close after context cancellation failed", slog.Any("err", closeErr))
-			}
-			return
-		}
-		if writeErr := wsConn.WriteJSON(&connPacket{
-			Id:     slaver.Id,
-			Method: MethodSlaverDialoutError, // 连接错误
-			Error:  err.Error(),
-		}); writeErr != nil {
-			slog.Warn("wsproxy slaver write dial error response failed",
-				slog.Any("dial_err", err), slog.Any("write_err", writeErr))
-		}
-		if closeErr := wsConn.Close(); closeErr != nil {
-			slog.Warn("wsproxy slaver close after dial failure failed", slog.Any("err", closeErr))
+	dialCtx, cancelDial := context.WithTimeout(ctx, dialHandshakeTimeout)
+	conn, dialErr := (&net.Dialer{}).DialContext(dialCtx, network, address)
+	cancelDial()
+	packet := &connPacket{Id: slaver.Id, Method: MethodSlaverDialoutSuccess}
+	if dialErr != nil {
+		packet.Method = MethodSlaverDialoutError
+		packet.Error = dialErr.Error()
+	} else {
+		defer conn.Close()
+	}
+	if err := wsConn.SetWriteDeadline(handshakeDeadline(ctx)); err != nil {
+		return
+	}
+	if err := wsConn.WriteJSON(packet); err != nil {
+		if ctx.Err() == nil {
+			slog.Warn("wsproxy slaver write dial result failed", slog.Any("err", err))
 		}
 		return
 	}
-
-	// 发送连接成功响应
-	if err := wsConn.WriteJSON(&connPacket{
-		Id:     slaver.Id,
-		Method: MethodSlaverDialoutSuccess, // 连接成功
-	}); err != nil {
-		// WebSocket 写入失败，关闭两端连接
-		if closeErr := errors.Join(wsConn.Close(), conn.Close()); closeErr != nil {
-			slog.Warn("wsproxy slaver close after success response failure failed",
-				slog.Any("write_err", err), slog.Any("close_err", closeErr))
-		}
+	if dialErr != nil {
 		return
 	}
-	if ctx.Err() != nil {
-		if closeErr := errors.Join(wsConn.Close(), conn.Close()); closeErr != nil {
-			slog.Warn("wsproxy slaver close after context cancellation failed", slog.Any("err", closeErr))
-		}
+	if err := wsConn.SetWriteDeadline(time.Time{}); err != nil {
 		return
 	}
 	stopContextClose()
+	if err := ctx.Err(); err != nil {
+		return
+	}
 	if err := copyLoop(ctx, wsConn, conn); err != nil {
 		slog.Warn("wsproxy slaver copy loop failed", slog.Any("err", err))
 	}

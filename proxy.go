@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/zdypro888/net/socks5"
@@ -34,10 +36,13 @@ func deadlineWithin(ctx context.Context, timeout time.Duration) time.Time {
 type prefixConn struct {
 	net.Conn
 	prefix []byte
+	readMu sync.Mutex
 }
 
 // Read 先返回 CONNECT 握手期间预读的隧道数据，再转发到底层连接。
 func (c *prefixConn) Read(b []byte) (int, error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
 	if len(c.prefix) > 0 {
 		n := copy(b, c.prefix)
 		c.prefix = c.prefix[n:]
@@ -54,7 +59,7 @@ type Proxy struct {
 	Address string `bson:"Address" json:"Address"`
 	WSToken string `bson:"WSToken,omitempty" json:"WSToken,omitempty"`
 	// TLSConfig 仅用于 https scheme proxy 的 CONNECT 隧道 TLS 握手.
-	// nil 使用 DefaultTLSConfig; 需要校验证书时显式传 StrictTLSConfig().
+	// nil 使用安全默认值；私有 CA 可通过该字段的 RootCAs 显式配置。
 	TLSConfig *tls.Config     `bson:"-" json:"-"`
 	server    *wsproxy.Server `bson:"-" json:"-"`
 }
@@ -67,7 +72,29 @@ func (proxy *Proxy) resolve() (*url.URL, error) {
 	if err != nil {
 		return nil, err
 	}
-	return url.Parse(address)
+	u, err := url.Parse(address)
+	if err != nil {
+		return nil, errors.New("invalid proxy URL") // 解析错误可能含口令，不向日志传播原 URL。
+	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	if u.Hostname() == "" {
+		return nil, errors.New("proxy URL has no host")
+	}
+	if u.Port() == "" {
+		var port string
+		switch u.Scheme {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		case "socks5", "socks5h":
+			port = "1080"
+		}
+		if port != "" {
+			u.Host = net.JoinHostPort(u.Hostname(), port)
+		}
+	}
+	return u, nil
 }
 
 // ProxyURL 取得代理地址 (实现 http.Transport.Proxy 的签名).
@@ -77,12 +104,23 @@ func (proxy *Proxy) ProxyURL(req *http.Request) (*url.URL, error) {
 
 // DialContext 使用配置的代理地址建立连接，并服从 ctx 的取消与截止时间。
 func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	switch network {
+	case "tcp", "tcp4", "tcp6":
+	default:
+		return nil, fmt.Errorf("proxy: unsupported network %q", network)
+	}
+	if _, _, err := net.SplitHostPort(address); err != nil {
+		return nil, err
+	}
 	proxyURL, err := proxy.resolve()
 	if err != nil {
 		return nil, err
 	}
 	switch proxyURL.Scheme {
-	case "socks5":
+	case "socks5", "socks5h":
 		d := socks5.NewDialer("tcp", proxyURL.Host)
 		if proxyURL.User != nil {
 			auth := &socks5.UsernamePassword{
@@ -97,6 +135,9 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 			}
 			d.Authenticate = auth.Authenticate
 		}
+		// SOCKS 握手和 TCP 拨号共用内部上限；成功后 context 不控制已交还的连接。
+		ctx, cancel := context.WithTimeout(ctx, proxyConnectTimeout)
+		defer cancel()
 		return d.DialContext(ctx, network, address)
 	case "http", "https":
 		dialer := &net.Dialer{Timeout: proxyConnectTimeout}
@@ -165,7 +206,7 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 			return nil, closeWithContextError(err)
 		}
 		if response.StatusCode != 200 {
-			return nil, closeWithContextError(fmt.Errorf("connect http tunnel faild: %d", response.StatusCode))
+			return nil, closeWithContextError(fmt.Errorf("connect HTTP tunnel failed: %d", response.StatusCode))
 		}
 		if err := conn.SetDeadline(time.Time{}); err != nil {
 			return nil, closeWithContextError(err)

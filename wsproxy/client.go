@@ -29,8 +29,16 @@ func NewClient(wsAddr string) *Client {
 
 // Dial 通过 WebSocket 代理建立到目标地址的连接。
 func (client *Client) Dial(ctx context.Context, network, address string) (net.Conn, error) {
-	wsConn, _, err := websocket.DefaultDialer.DialContext(ctx, client.WSAddr, nil)
+	if err := validateTarget(network, address); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, dialHandshakeTimeout)
+	defer cancel()
+	wsConn, response, err := websocket.DefaultDialer.DialContext(ctx, client.WSAddr, nil)
 	if err != nil {
+		if response != nil && response.Body != nil {
+			err = errors.Join(err, response.Body.Close())
+		}
 		return nil, err
 	}
 	stopContextClose := closeWebSocketOnContextDone(ctx, wsConn)

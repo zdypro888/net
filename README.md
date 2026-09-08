@@ -1,82 +1,71 @@
 # github.com/zdypro888/net
 
-通用网络工具库：HTTP/HTTP3 客户端、多路复用请求-响应客户端 (`Client`)、WebSocket 会话 (`wsc`)、WebSocket 代理 (`wsproxy`)、SOCKS5 等。
+通用网络库：HTTP/HTTP2/HTTP3、请求关联客户端 `Client`、可重连 WebSocket 会话 `wsc`、反向代理 `wsproxy`、SOCKS5 和可持久化 Cookie Jar。
 
-## ⚠️ 安全须知：TLS 默认不校验服务端证书
+## HTTP 与证书信任
 
-**本库的 HTTP/HTTP3 客户端默认 `InsecureSkipVerify: true`，并允许 TLS 1.1。**
-
-出于历史与内网/抓包调试用途，`NewHTTP(nil)` / `NewHTTP3(nil)` 在 `config == nil` 时回退到 `DefaultTLSConfig()`：
+`NewHTTP(nil)`、`NewHTTP3(nil)`、`DefaultTLSConfig()` 和 HTTPS 代理的 nil TLS 配置均默认验证证书链与主机名，最低 TLS 1.2。QUIC 自身使用 TLS 1.3。
 
 ```go
-// http.go: DefaultTLSConfig()
-&tls.Config{
-    InsecureSkipVerify: true,            // 不校验服务端证书
-    MinVersion:         tls.VersionTLS11, // 允许 TLS 1.1
-    MaxVersion:         tls.VersionTLS13,
+h := net.NewHTTP(nil)
+defer h.Dispose()
+if err := h.ConfigureV2(); err != nil {
+    return err
 }
-```
-
-这意味着默认情况下：
-
-- **不校验服务端证书链与主机名** —— 任何持有任意证书 (含自签名) 的中间人都能冒充目标服务端；
-- **存在中间人攻击 (MITM) 风险**，在公网/不可信网络上传输敏感数据时尤其危险；
-- 允许 TLS 1.1（已被主流浏览器废弃的旧协议版本）。
-
-同样地，HTTPS 代理隧道 (`Proxy.TLSConfig`，见 `proxy.go`) 在该字段为 `nil` 时也回退到 `DefaultTLSConfig()`，即对代理服务端证书亦不校验。
-
-> 该默认行为是刻意保留的历史契约，本说明仅作显式告警，不改变运行时默认值。
-
-## 如何开启严格证书校验 (opt-in)
-
-库已提供 `StrictTLSConfig()`，显式开启证书校验且最低 TLS 1.2：
-
-```go
-// http.go: StrictTLSConfig()
-&tls.Config{
-    MinVersion: tls.VersionTLS12,
-    MaxVersion: tls.VersionTLS13,
+res, err := h.Request(ctx, endpoint, headers, nil)
+if err != nil {
+    return err
 }
+data, err := res.Data() // 读取并关闭响应
 ```
 
-### 1. HTTP / HTTP3 客户端
+私有 CA 或抓包代理应配置系统信任根，或显式传入带 `RootCAs` 的 `tls.Config`。HTTPS 代理的信任配置使用 `Proxy.TLSConfig`，目标服务器的信任配置使用 `NewHTTP` 的参数。`ConfigureDebug()` 只切换代理，不关闭证书校验。确有受控测试需求时，调用方仍可显式传入 `InsecureSkipVerify: true`，需自行承担该配置的影响。
 
-把 `StrictTLSConfig()`（或你自己的严格 `*tls.Config`）显式传给构造函数，**不要传 `nil`**：
+迁移注意：旧版本 nil 配置跳过证书校验且允许 TLS 1.1。依赖旧默认值的自签名服务器、HTTPS 代理或 TLS 1.1 服务需要调整信任/协议配置，不能依赖隐式放行。
 
-```go
-import (
-    "github.com/zdypro888/net"
-)
+## 配置快照与连接池
 
-// 严格校验证书的 HTTP 客户端
-h := net.NewHTTP(net.StrictTLSConfig())
+`Configure*` 方法可以与请求并发。每次请求取得独立配置快照；修改代理、HTTP/2 或 Transport 超时，以及调用 `ResetConnections()` 时，会替换连接池。已经发出的请求继续使用原配置，后续请求不会复用旧代理的连接。HTTP/1 空闲连接有回收期限。
 
-// 严格校验证书的 HTTP3 (QUIC) 客户端
-h3 := net.NewHTTP3(net.StrictTLSConfig())
-```
+`ConfigureProxyClear()` 暂停代理，`ConfigureProxyReset()` 恢复 `storeCache=true` 保存的配置。HTTP/3 不支持 TCP 代理配置，返回错误的方法不会部分写入缓存。
 
-需要自定义 (例如指定 CA 池 / ServerName) 时，直接传入构造好的 `*tls.Config`：
+`OnResponse` / `AutoRetry` 导出字段仅为兼容旧调用保留；直接赋值必须在请求开始前完成。运行期间请用 `ConfigureOnResponse` / `ConfigureAutoRetry`。传入的 CookieJar、回调及拨号函数必须并发安全；`Proxy` 自身的导出字段应在使用前配置完成。
 
-```go
-h := net.NewHTTP(&tls.Config{
-    MinVersion: tls.VersionTLS12,
-    RootCAs:    myCertPool, // 自定义信任根
-})
-```
+`OnResponse` 返回错误或丢弃响应时，库关闭该次响应；不能返回 `(nil, nil, ...)`。若成功返回替代响应，回调负责转交或释放原响应 Body 的所有权，避免丢失原 Body。返回值中的 bool 用于关闭空闲连接。
 
-### 2. HTTPS 代理隧道
+## HTTP 重试和响应读取
 
-给 `Proxy.TLSConfig` 显式赋一个严格配置（用于 `https` scheme 代理的 CONNECT 隧道 TLS 握手）：
+- `ConfigureAutoRetry(n)` 保留历史计数含义：正数为**最多尝试次数，包含首次**；`n <= 0` 为一次。
+- 仅自动重发可重放的幂等请求。POST 等非幂等请求默认只发送一次；明确携带 `Idempotency-Key` / `X-Idempotency-Key` 的请求可重试，调用方须确认服务端支持该契约。
+- `bytes.Reader`、`strings.Reader`、`bytes.Buffer` 和 `utils.Reader` 从传入时的当前位置发送，每次重试使用独立 body。没有安全重放能力的普通流只发送一次，不会无界缓冲或强行 seek。
+- 不自动重试 HTTP 状态码；`OnResponse` 可将状态转换成错误，仍须遵守上述重发限制。业务请求的结果不明确时，由业务方查询或判断后决定是否重试。
+- `Response.Read/Data` 支持 gzip、zlib 格式 deflate、Brotli、Zstandard 和叠加编码。保留原响应头；直接访问嵌入的 `Body` 仍取得原始流。
+- `Data()` 负责关闭；流式读取后必须 `Close()`。`Close` 可与 `Read` 并发。不要复制使用中的 `HTTP` 或 `Response` 值。
 
-```go
-proxy := &net.Proxy{
-    Address:   "https://proxy.example.com:8443",
-    TLSConfig: net.StrictTLSConfig(),
-}
-```
+## Client / wsc 生命周期
 
-## 迁移建议
+`Client` 的状态锁只用于取得队列快照，满队列不会挡住 `Close/Reset`。关闭先发停止/取消信号，再关闭 IO 和排空待处理请求；旧连接的响应不会跨代匹配。取消的请求 ID 保留到迟到响应被消耗，或连接结束，不能立即复用。
 
-- **新接入方**：一律显式传 `net.StrictTLSConfig()`（或带自定义信任根的严格配置），不要依赖 `nil` 默认值。
-- **存量代码**：审计所有 `NewHTTP(nil)` / `NewHTTP3(nil)` / 未设置 `Proxy.TLSConfig` 的调用点；除非确有内网/调试需要保留不校验，否则改为传入 `StrictTLSConfig()`。
-- 若你的场景确实需要跳过校验（如内网自签名 + 无 CA 分发），请在调用点就近注释说明原因，避免被后续维护者误判为遗漏。
+`ResetUnsafe/CloseUnsafe` 仅供独占生命周期的单 owner 调用。其它带 Unsafe 的旧方法名保留，但入队使用与普通方法相同的同步门控。`Write` 成功表示已入队，ctx 仅控制入队；它不代表对端已收到数据。需要确定结果时使用请求/响应协议。
+
+`Conn.Handle` 和 `AsyncCall` 回调须响应传入 ctx；不得在自身 worker 中同步调用 `Close/Reset/Request`。回调忽略取消并永久阻塞时，库无法强制结束该 goroutine。
+
+`wsc.Client.Close` 会取消当前 Connect 握手。Session 关闭中止排队的连接切换，旧代清理定时器不能关闭重接后的会话。`ReplyGeneration` 用于只回复收到请求的连接代次；`TakeConnectionArgs` 每个非关闭 Packet 领取一次。应用必须持续消费 `Handle()`，并在不用时关闭 Client/Server/Session。
+
+## 代理
+
+`Proxy.DialContext` 支持 HTTP CONNECT、HTTPS CONNECT、SOCKS5/SOCKS5h、WS/WSS 字节流代理，目标 network 为 tcp/tcp4/tcp6。HTTP(S)/SOCKS5 省略端口时分别采用协议默认端口；SOCKS5/SOCKS5h 均由代理解析目标域名。
+
+`wsproxy.Server` 的待命池、正在拨号、已返回的隧道及尚未收到首包的连接均纳入 `CloseAll`。待命 Ping/Pong 的 deadline 在转交活动隧道时清除。`Slaver.Run` 取消后等待已派发隧道退出。
+
+公开服务应配置 `Token` 或 `ScopeByToken + AuthorizeToken`，或由 HTTP Upgrade 入口完成鉴权；空 Token 的默认模式不提供应用层认证。业务租户隔离须由调用方提供，不能把随机 session GUID 当成鉴权凭证。
+
+WebSocket 代理按流分块转发，不为大帧分配完整副本；会保留 Read 同时返回的数据与 EOF。`Session` 支持 deadline，但 Gorilla 在**帧读取/写入途中超时后不能恢复该方向**，应重新拨号；尚未开始的过期写不会进入 Gorilla。此限制不同于普通 TCP，不能把超时后的 WS 隧道继续当成可恢复流使用。
+
+在途写期限由会话定时器执行，支持并发缩短、延长和清除，避免 Gorilla 覆盖底层期限。写帧途中超时会关闭整个会话并返回 `os.ErrDeadlineExceeded`。
+
+## Cookie 持久化
+
+`cookiejar.New(nil)` 和零值 Jar 默认使用公共后缀表，阻止 `.co.uk` 等跨站 Cookie。`Restore(nil)` 在加载旧数据后恢复默认后缀表并重建索引；零值/反序列化后的 Jar 在首次读写时也会完成恢复。`SetPublicSuffixList` 会同时迁移索引。
+
+JSON 序列化自动取得加锁快照。BSON/xorm 等反射编码器应使用 `Snapshot()`，不要在并发流量期间直接读写 `Entries`。反序列化必须发生在实例投入并发使用前。Cookie 的 Quoted 标记、IPv6 host-only 语义及超长 MaxAge 都会保留或按合法范围处理。

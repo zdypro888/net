@@ -361,11 +361,29 @@ func TestClientCloseUnblocksBlockedHandle(t *testing.T) {
 		t.Fatal("Handle was never invoked")
 	}
 
+	// 同时占满命令队列，并让一个长 deadline 的发送者等待入队，关闭不得被其读锁挡住。
+	for range DefaultBufferSize {
+		if err := client.Write(context.Background(), testMessage{value: "queued"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeCtx, cancelWrite := context.WithTimeout(context.Background(), time.Hour)
+	defer cancelWrite()
+	writeDone := make(chan error, 1)
+	go func() { writeDone <- client.Write(writeCtx, testMessage{value: "blocked"}) }()
+	time.Sleep(20 * time.Millisecond)
 	done := make(chan error, 1)
 	go func() { done <- client.Close() }()
 	select {
 	case <-done:
-		// 修复后: CloseUnsafe cancel handleCtx → Handle 的 <-ctx.Done() 解锁 → asyncGo 退出.
+		select {
+		case err := <-writeDone:
+			if err != nil && !errors.Is(err, ErrConnectionClosed) {
+				t.Errorf("blocked Write = %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("blocked Write did not leave on Close")
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Close blocked behind a blocked user Handle callback (D-P1-1)")
 	}

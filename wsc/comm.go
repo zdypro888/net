@@ -104,6 +104,12 @@ func (m *Message[T]) SetEnvelopeHeart(heart bool) { m.IsHeart = heart }
 
 // SetEnvelopePayload 校验载荷类型后写入信封。
 func (m *Message[T]) SetEnvelopePayload(payload any) error {
+	if payload == nil {
+		// nil 表示清空载荷；复用信封解码时不能留下上一条消息的数据。
+		var zero T
+		m.Data = zero
+		return nil
+	}
 	data, ok := payload.(T)
 	if !ok {
 		return fmt.Errorf("wsc: payload type %T not assignable to %T", payload, m.Data)

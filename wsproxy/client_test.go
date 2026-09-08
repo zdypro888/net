@@ -3,10 +3,14 @@ package wsproxy
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -83,7 +87,25 @@ func TestSessionExpiredWriteDeadlineDoesNotCloseRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(50 * time.Millisecond)
+	if _, err := session.Write([]byte("expired")); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expired write=%v", err)
+	}
+	if err := session.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Write([]byte("recovered")); err != nil {
+		t.Fatalf("write after clearing unused deadline: %v", err)
+	}
+	if _, data, err := peer.ReadMessage(); err != nil || string(data) != "recovered" {
+		t.Fatalf("recovered data=%q err=%v", data, err)
+	}
+	if n, err := session.Read(nil); n != 0 || err != nil {
+		t.Fatalf("zero read=%d,%v", n, err)
+	}
 	if err := peer.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := peer.WriteMessage(websocket.BinaryMessage, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := peer.WriteMessage(websocket.BinaryMessage, []byte("still-readable")); err != nil {
@@ -99,6 +121,48 @@ func TestSessionExpiredWriteDeadlineDoesNotCloseRead(t *testing.T) {
 	}
 	if got := string(buffer[:n]); got != "still-readable" {
 		t.Fatalf("read payload = %q", got)
+	}
+
+	// 对端停止读取，验证在途写的期限可以清除再缩短，并实际中断阻塞。
+	if err := session.SetWriteDeadline(time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := session.Write(make([]byte, MaxMessageSize))
+		writeDone <- err
+	}()
+	until := time.Now().Add(2 * time.Second)
+	for {
+		session.deadlineMu.Lock()
+		active := session.writeActive
+		session.deadlineMu.Unlock()
+		if active {
+			break
+		}
+		if time.Now().After(until) {
+			t.Fatal("write did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := session.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-writeDone:
+		t.Fatalf("write should remain blocked: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := session.SetWriteDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-writeDone:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("inflight write deadline: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("inflight write ignored updated deadline")
 	}
 }
 
@@ -136,6 +200,25 @@ func TestCopyLoopReturnsWhenWebSocketSideCloses(t *testing.T) {
 		done <- copyLoop(context.Background(), proxyConn, pipeReader)
 	}()
 
+	defer wsConn.Close()
+	defer pipeWriter.Close()
+	// 同一次 Read 返回数据与 EOF，最后一段仍必须完整穿过隧道。
+	const tailPayload = "last-bytes-with-EOF"
+	tailDone := make(chan error, 1)
+	go func() {
+		tailDone <- connCopyToWs(func() {}, iotest.DataErrReader(strings.NewReader(tailPayload)), wsConn)
+	}()
+	_ = pipeWriter.SetReadDeadline(time.Now().Add(time.Second))
+	payload := make([]byte, len(tailPayload))
+	if _, err := io.ReadFull(pipeWriter, payload); err != nil {
+		t.Fatalf("read final bytes: %v", err)
+	}
+	if string(payload) != tailPayload {
+		t.Fatalf("tail=%q", payload)
+	}
+	if err := <-tailDone; !errors.Is(err, io.EOF) {
+		t.Fatalf("tail copy error=%v", err)
+	}
 	if err := wsConn.Close(); err != nil {
 		t.Fatalf("ws close failed: %v", err)
 	}

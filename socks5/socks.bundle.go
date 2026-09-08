@@ -19,34 +19,32 @@ func (d *Dialer) connect(ctx context.Context, c net.Conn, address string) (_ net
 	if err != nil {
 		return nil, err
 	}
-	if deadline, ok := ctx.Deadline(); ok && !deadline.IsZero() {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	deadline, hasDeadline := ctx.Deadline()
+	if hasDeadline {
 		if err := c.SetDeadline(deadline); err != nil {
 			return nil, err
 		}
-		defer func() {
-			if err := c.SetDeadline(socksnoDeadline); ctxErr == nil {
-				ctxErr = err
-			}
-		}()
 	}
-	if ctx != context.Background() {
-		errCh := make(chan error, 1)
-		done := make(chan struct{})
-		defer func() {
-			close(done)
-			if ctxErr == nil {
-				ctxErr = <-errCh
-			}
-		}()
-		go func() {
-			select {
-			case <-ctx.Done():
-				errCh <- errors.Join(ctx.Err(), c.SetDeadline(socksaLongTimeAgo))
-			case <-done:
-				errCh <- nil
-			}
-		}()
-	}
+	// 取消回调必须先停并等待结束，再清除握手 deadline；否则迟到回调会破坏已返回的连接。
+	interrupted := make(chan struct{})
+	var interruptErr error
+	stopCancel := context.AfterFunc(ctx, func() {
+		interruptErr = c.SetDeadline(socksaLongTimeAgo)
+		close(interrupted)
+	})
+	defer func() {
+		stopped := stopCancel()
+		if !stopped {
+			<-interrupted
+		}
+		ctxErr = errors.Join(ctx.Err(), ctxErr, interruptErr)
+		if hasDeadline || !stopped {
+			ctxErr = errors.Join(ctxErr, c.SetDeadline(socksnoDeadline))
+		}
+	}()
 
 	b := make([]byte, 0, 6+len(host)) // the size here is just an estimate
 	b = append(b, socksVersion5)
@@ -62,8 +60,10 @@ func (d *Dialer) connect(ctx context.Context, c net.Conn, address string) (_ net
 			b = append(b, byte(am))
 		}
 	}
-	if _, ctxErr = c.Write(b); ctxErr != nil {
-		return
+	if n, err := c.Write(b); err != nil {
+		return nil, err
+	} else if n != len(b) {
+		return nil, io.ErrShortWrite
 	}
 
 	if _, ctxErr = io.ReadFull(c, b[:2]); ctxErr != nil {
@@ -75,6 +75,20 @@ func (d *Dialer) connect(ctx context.Context, c net.Conn, address string) (_ net
 	am := AuthMethod(b[1])
 	if am == AuthMethodNoAcceptableMethods {
 		return nil, errors.New("no acceptable authentication methods")
+	}
+	// 服务端只能从本次 greeting 真正提供的方法中选择，不能让未知方法越过认证阶段。
+	offered := am == AuthMethodNotRequired
+	if len(d.AuthMethods) > 0 && d.Authenticate != nil {
+		offered = false
+		for _, method := range d.AuthMethods {
+			if method == am {
+				offered = true
+				break
+			}
+		}
+	}
+	if !offered {
+		return nil, errors.New("server selected an unoffered authentication method")
 	}
 	if d.Authenticate != nil {
 		if ctxErr = d.Authenticate(ctx, c, am); ctxErr != nil {
@@ -103,8 +117,10 @@ func (d *Dialer) connect(ctx context.Context, c net.Conn, address string) (_ net
 		b = append(b, host...)
 	}
 	b = append(b, byte(port>>8), byte(port))
-	if _, ctxErr = c.Write(b); ctxErr != nil {
-		return
+	if n, err := c.Write(b); err != nil {
+		return nil, err
+	} else if n != len(b) {
+		return nil, io.ErrShortWrite
 	}
 
 	if _, ctxErr = io.ReadFull(c, b[:4]); ctxErr != nil {
@@ -435,6 +451,9 @@ type UsernamePassword struct {
 // Authenticate authenticates a pair of username and password with the
 // proxy server.
 func (up *UsernamePassword) Authenticate(ctx context.Context, rw io.ReadWriter, auth AuthMethod) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	switch auth {
 	case AuthMethodNotRequired:
 		return nil
@@ -449,8 +468,10 @@ func (up *UsernamePassword) Authenticate(ctx context.Context, rw io.ReadWriter, 
 		b = append(b, up.Password...)
 		// TODO(mikio): handle IO deadlines and cancelation if
 		// necessary
-		if _, err := rw.Write(b); err != nil {
+		if n, err := rw.Write(b); err != nil {
 			return err
+		} else if n != len(b) {
+			return io.ErrShortWrite
 		}
 		if _, err := io.ReadFull(rw, b[:2]); err != nil {
 			return err

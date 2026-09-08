@@ -58,10 +58,11 @@ type slaverEntry struct {
 
 // Server 表示一个代理服务器
 type Server struct {
-	locker   sync.Mutex
-	sessions *list.List // 使用 list 保持顺序，FIFO 方式使用连接; 元素类型 *slaverEntry
-	active   map[*Session]string
-	Token    string
+	locker     sync.Mutex
+	sessions   *list.List // 使用 list 保持顺序，FIFO 方式使用连接; 元素类型 *slaverEntry
+	active     map[*Session]string
+	handshakes map[*websocket.Conn]struct{}
+	Token      string
 	// ScopeByToken 启用后，注册和远程拨号都必须携带 token，各 token 的连接池完全隔离。
 	// Token 字段是旧版单一服务口令，两种模式不可同时使用。
 	ScopeByToken bool
@@ -94,25 +95,35 @@ type Server struct {
 func NewServer() *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
-		sessions: list.New(),
-		active:   make(map[*Session]string),
-		ctx:      ctx,
-		cancel:   cancel,
+		sessions:   list.New(),
+		active:     make(map[*Session]string),
+		handshakes: make(map[*websocket.Conn]struct{}),
+		ctx:        ctx,
+		cancel:     cancel,
 	}
 }
 
 // OnConnection 处理新连接
 func (server *Server) OnConnection(conn *websocket.Conn) {
 	conn.SetReadLimit(MaxMessageSize)
+	server.locker.Lock()
 	if server.closed.Load() {
-		// CloseAll 已调用, 不接新连接.
-		if err := conn.Close(); err != nil {
-			slog.Warn("wsproxy OnConnection close rejected connection failed", slog.Any("err", err))
-		}
+		server.locker.Unlock()
+		_ = conn.Close()
 		return
 	}
+	// 未收到首包的连接也属于服务生命周期；CloseAll 必须中断并等候它退出。
+	server.handshakes[conn] = struct{}{}
+	server.workerWG.Add(1)
+	server.locker.Unlock()
+	defer func() {
+		server.locker.Lock()
+		delete(server.handshakes, conn)
+		server.locker.Unlock()
+		server.workerWG.Done()
+	}()
 	// 设置读取超时，防止恶意连接
-	if err := conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+	if err := conn.SetReadDeadline(handshakeDeadline(server.ctx)); err != nil {
 		if closeErr := conn.Close(); closeErr != nil {
 			slog.Warn("wsproxy OnConnection close after deadline setup failure failed",
 				slog.Any("deadline_err", err), slog.Any("close_err", closeErr))
@@ -370,6 +381,9 @@ func (server *Server) DialContextToken(ctx context.Context, token, network, addr
 }
 
 func (server *Server) dialContextScope(ctx context.Context, scope, network, address string) (net.Conn, error) {
+	if err := validateTarget(network, address); err != nil {
+		return nil, err
+	}
 	// 已过期的 ctx 不应消耗池中会话: popSession 取出的连接只用一次, 直接早返回。
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -441,6 +455,8 @@ func (server *Server) dialContextScope(ctx context.Context, scope, network, addr
 		return nil, closeWithContextError(read.err)
 	}
 	incoming := read.packet
+	// 已离开待命池，恢复默认 Ping 处理，迟到心跳不能重新给活动隧道加空闲 deadline。
+	session.Conn.SetPingHandler(nil)
 	// watcher 为待命心跳设置了读取截止时间；交接完成后必须清除，避免长连接被误杀。
 	if err := session.Conn.SetReadDeadline(time.Time{}); err != nil {
 		return nil, closeWithContextError(err)
@@ -608,6 +624,10 @@ func (server *Server) CloseAll() {
 	server.locker.Lock()
 	server.closed.Store(true)
 	var drained []*slaverEntry
+	handshakes := make([]*websocket.Conn, 0, len(server.handshakes))
+	for conn := range server.handshakes {
+		handshakes = append(handshakes, conn)
+	}
 	active := make([]*Session, 0, len(server.active))
 	for session := range server.active {
 		active = append(active, session)
@@ -625,6 +645,9 @@ func (server *Server) CloseAll() {
 
 	// 取消 ctx 让在飞 onClientDialout 退出 (copyLoop 内的 ctx-watcher 关闭两端 conn).
 	server.cancel()
+	for _, conn := range handshakes {
+		_ = conn.Close()
+	}
 	for _, entry := range drained {
 		if err := entry.session.Close(); err != nil {
 			slog.Warn("wsproxy CloseAll pooled session close failed", slog.Any("err", err))

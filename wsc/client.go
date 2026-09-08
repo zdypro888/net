@@ -121,6 +121,9 @@ func (c *Client[T]) sessionClosedLocked() bool {
 // 且需在 codec 确定前完成), 客户端把支持的 codec 名字按优先级带给服务端, 服务端在
 // 响应里回选定的 codec。响应不带 codec (旧服务端) 时回退到默认 JSON。
 func (c *Client[T]) dial(ctx context.Context, guid string) (*websocket.Conn, Codec, error) {
+	// 同一握手上限覆盖 DNS/TCP/TLS、HTTP Upgrade 和应用握手。
+	ctx, cancel := context.WithTimeout(ctx, HandshakeTimeout)
+	defer cancel()
 	conn, response, err := websocket.DefaultDialer.DialContext(ctx, c.serverURL, nil)
 	if err != nil {
 		return nil, nil, captureHTTPHandshakeError(err, response)
@@ -164,14 +167,14 @@ func (c *Client[T]) dial(ctx context.Context, guid string) (*websocket.Conn, Cod
 	if resp.Status != 200 {
 		return nil, nil, closeWithContextError(fmt.Errorf("dial failed: %s", resp.Message))
 	}
-	// 解析协商结果: 空 = 旧服务端, 回退默认 JSON; 非空必须是本端支持的 codec。
-	codec := defaultCodec
-	if resp.Codec != "" {
-		selected, ok := c.codecs.get(resp.Codec)
-		if !ok {
-			return nil, nil, closeWithContextError(fmt.Errorf("dial failed: server selected unsupported codec %q", resp.Codec))
-		}
-		codec = selected
+	// 旧服务端未返回 codec 时只可回退到本端也允许的 JSON，不能越过显式 codec 限制。
+	selectedName := resp.Codec
+	if selectedName == "" {
+		selectedName = CodecJSON
+	}
+	codec, ok := c.codecs.get(selectedName)
+	if !ok {
+		return nil, nil, closeWithContextError(fmt.Errorf("dial failed: server selected unsupported codec %q", selectedName))
 	}
 	// 清除 deadline
 	if err := conn.SetReadDeadline(time.Time{}); err != nil {
@@ -267,6 +270,10 @@ func (c *Client[T]) Connect(ctx context.Context) error {
 	guid := session.guid
 	c.locker.Unlock()
 
+	// Close 同时中断本次 Connect 的 HTTP/应用握手，避免会话关闭后还继续等待网络超时。
+	ctx, cancelConnect := context.WithCancel(ctx)
+	stopSessionClose := context.AfterFunc(session.ctx, cancelConnect)
+	defer func() { stopSessionClose(); cancelConnect() }()
 	conn, codec, err := c.dial(ctx, guid)
 	if err != nil {
 		return err

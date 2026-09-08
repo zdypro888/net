@@ -16,12 +16,20 @@ type Server[T any] struct {
 	locker             sync.Mutex
 	sessions           map[string]*Session[T]
 	handshakes         map[*websocket.Conn]struct{}
-	cleanupTimers      map[string]cleanupTimer
+	cleanupTimers      map[string]*cleanupTimer
+	attaching          map[*Session[T]]*sessionAttach
 	bufferSize         int
 	codecs             *codecSet
 	maxMessageSize     int64
 	sessionIdleTimeout time.Duration
 	closed             bool
+}
+
+// sessionAttach 暂存连接交接期间的断线事件，避免旧连接清理与新连接安装互相抢占。
+type sessionAttach struct {
+	count        int
+	disconnected bool
+	generation   uint64
 }
 
 type cleanupTimer struct {
@@ -50,7 +58,8 @@ func NewServerWithBuffer[T any](bufferSize int, opts ...Option) *Server[T] {
 	return &Server[T]{
 		sessions:           make(map[string]*Session[T]),
 		handshakes:         make(map[*websocket.Conn]struct{}),
-		cleanupTimers:      make(map[string]cleanupTimer),
+		cleanupTimers:      make(map[string]*cleanupTimer),
+		attaching:          make(map[*Session[T]]*sessionAttach),
 		bufferSize:         bufferSize,
 		codecs:             newCodecSet(o.codecs),
 		maxMessageSize:     o.resolvedMaxMessageSize(),
@@ -88,24 +97,25 @@ func (server *Server[T]) scheduleSessionCleanup(session *Session[T], generation 
 	if cur := server.sessions[session.guid]; cur != session || session.generation() != generation {
 		return
 	}
+	if attach := server.attaching[session]; attach != nil {
+		attach.disconnected, attach.generation = true, generation
+		return
+	}
 	server.cancelSessionCleanupLocked(session.guid)
-	timer := time.AfterFunc(server.sessionIdleTimeout, func() {
-		server.expireSession(session, generation)
+	cleanup := &cleanupTimer{generation: generation}
+	cleanup.timer = time.AfterFunc(server.sessionIdleTimeout, func() {
+		server.expireSession(session, cleanup)
 	})
-	server.cleanupTimers[session.guid] = cleanupTimer{generation: generation, timer: timer}
+	server.cleanupTimers[session.guid] = cleanup
 }
 
-// expireSession 在空闲定时器到期时执行: 仅当本 guid 的 cleanup timer 仍在表内 (未被
-// cancelSessionCleanup 取消) 且代号匹配时, 才删除并关闭会话。把会话删除嵌套进 timer 存在性
-// 判断内, 使 cancel 成为权威 —— 一个"已触发但回调尚未执行"的旧 timer 在重连取消后跑到这里
-// 会因找不到自己而成为 no-op, 无需靠预推进 connGeneration 去作废它。内层的 generation 复查
-// 仍保留: 它作废"重连成功(asyncGo 已推进代号)后才跑到的、按旧代排的 cleanup"。
-func (server *Server[T]) expireSession(session *Session[T], generation uint64) {
+// expireSession 同时匹配定时器对象、session 和代次；同代重排也不能被已触发的旧回调删除。
+func (server *Server[T]) expireSession(session *Session[T], expected *cleanupTimer) {
 	var expired *Session[T]
 	server.locker.Lock()
-	if cleanup, ok := server.cleanupTimers[session.guid]; ok && cleanup.generation == generation {
+	if cleanup := server.cleanupTimers[session.guid]; cleanup != nil && cleanup == expected {
 		delete(server.cleanupTimers, session.guid)
-		if cur := server.sessions[session.guid]; cur == session && session.generation() == generation {
+		if cur := server.sessions[session.guid]; cur == session && session.generation() == cleanup.generation {
 			delete(server.sessions, session.guid)
 			expired = session
 		}
@@ -113,9 +123,24 @@ func (server *Server[T]) expireSession(session *Session[T], generation uint64) {
 	server.locker.Unlock()
 	if expired != nil {
 		if err := expired.Close(); err != nil {
-			slog.Warn("wsc server idle session close failed",
-				slog.String("guid", expired.guid), slog.Any("err", err))
+			slog.Warn("wsc server idle session close failed", slog.Any("err", err))
 		}
+	}
+}
+
+// finishSessionAttach 在最后一个并发交接结束后恢复仍适用于当前代次的断线清理。
+func (server *Server[T]) finishSessionAttach(session *Session[T]) {
+	server.locker.Lock()
+	attach := server.attaching[session]
+	attach.count--
+	finished := attach.count == 0
+	if finished {
+		delete(server.attaching, session)
+	}
+	disconnected, generation := attach.disconnected, attach.generation
+	server.locker.Unlock()
+	if finished && disconnected {
+		server.scheduleSessionCleanup(session, generation)
 	}
 }
 
@@ -180,8 +205,8 @@ func (server *Server[T]) OnConnection(conn *websocket.Conn, args any) (*Session[
 	}
 	var session *Session[T]
 	var created bool
-	hadIdleCleanup := server.cancelSessionCleanup(req.GUID)
 	server.locker.Lock()
+	hadIdleCleanup := server.cancelSessionCleanupLocked(req.GUID)
 	if server.closed {
 		server.locker.Unlock()
 		return nil, errors.Join(ErrServerClosed, conn.Close())
@@ -202,7 +227,17 @@ func (server *Server[T]) OnConnection(conn *websocket.Conn, args any) (*Session[
 		server.sessions[req.GUID] = session
 		created = true
 	}
+	attach := server.attaching[session]
+	if attach == nil {
+		attach = &sessionAttach{}
+		server.attaching[session] = attach
+	}
+	attach.count++
+	if hadIdleCleanup {
+		attach.disconnected, attach.generation = true, session.generation()
+	}
 	server.locker.Unlock()
+	defer server.finishSessionAttach(session)
 	if err := session.reset(context.Background(), conn, codec, args); err != nil {
 		closeErr := conn.Close()
 		if created {
@@ -214,12 +249,7 @@ func (server *Server[T]) OnConnection(conn *websocket.Conn, args any) (*Session[
 			server.locker.Unlock()
 			return nil, errors.Join(err, closeErr, session.Close())
 		}
-		// 复用 session 的重连失败: 老连接(若仍存活)断开时其 handleMessageGo 会自行重排 cleanup;
-		// 但若重连前 session 已空闲待清理(hadIdleCleanup), 上面取消掉的那个 cleanup 必须补回,
-		// 否则这个没有活动连接的 session 永不回收。generation 未被预推进, 故按当前代补排即可。
-		if hadIdleCleanup {
-			server.scheduleSessionCleanup(session, session.generation())
-		}
+		// 已取消的旧清理及交接中收到的断线事件，由 finishSessionAttach 统一恢复。
 		return nil, errors.Join(err, closeErr)
 	}
 	return session, nil

@@ -80,6 +80,8 @@ func (codec) Decode(messageType int, data []byte, v any) error {
 		if err := env.SetEnvelopePayload(msg); err != nil {
 			return err
 		}
+	} else {
+		return env.SetEnvelopePayload(nil)
 	}
 	return nil
 }

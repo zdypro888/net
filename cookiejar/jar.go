@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/publicsuffix"
 )
 
 // PublicSuffixList provides the public suffix of a domain. For example:
@@ -52,9 +54,7 @@ type Options struct {
 	// PublicSuffixList is the public suffix list that determines whether
 	// an HTTP server can set a cookie for a domain.
 	//
-	// A nil value is valid and may be useful for testing but it is not
-	// secure: it means that the HTTP server for foo.co.uk can set a cookie
-	// for bar.co.uk.
+	// nil 默认使用 golang.org/x/net/publicsuffix.List，防止公共后缀上的跨站 cookie。
 	PublicSuffixList PublicSuffixList
 }
 
@@ -90,9 +90,11 @@ func New(o *Options) (*Jar, error) {
 	jar := &Jar{
 		Entries: make(map[string]map[string]Entry),
 	}
+	var psl PublicSuffixList
 	if o != nil {
-		jar.psList = o.PublicSuffixList
+		psl = o.PublicSuffixList
 	}
+	jar.restoreLocked(psl)
 	return jar, nil
 }
 
@@ -122,29 +124,47 @@ func (j *Jar) MarshalJSON() ([]byte, error) {
 	return json.Marshal(j.Snapshot())
 }
 
-// Restore 在从存储反序列化得到 Jar 后恢复不参与序列化的瞬态字段: psList(从不序列化)
-// 与惰性 Entries(空 jar 持久化后可能为 nil)。setCookies 已对 nil Entries 自愈, 故
-// Entries 初始化非必需, Restore 只是让反序列化后的 jar 立即处于完整可用状态。
-// 仅需恢复 PublicSuffixList 时用 SetPublicSuffixList。
+// Restore 恢复未持久化的公共后缀配置，并按该配置重建 Cookie 索引。
+// nil 使用内置公共后缀表；旧版按最后两段域名分桶的数据也会被正确迁移。
 func (j *Jar) Restore(psl PublicSuffixList) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if j.Entries == nil {
-		j.Entries = make(map[string]map[string]Entry)
-	}
-	j.psList = psl
+	j.restoreLocked(psl)
 }
 
-// SetPublicSuffixList 仅设置 jar 的 PublicSuffixList。
-// psList 字段不参与 bson/json 序列化, 因此反序列化得到的 jar 必定 psList==nil,
-// 此时 jarKey/domainAndType 退化到"最后一个点之前"的算法, 与持久化前不一致.
-// caller 应在反序列化后恢复(需连带初始化 Entries 时用 Restore)。必须加锁: psList 在
-// Cookies/SetCookies 的 hot path 内被读 (j.psList.PublicSuffix(domain)), 与本 setter
-// 真实并发。复用现有 j.mu (零成本, 不引入新锁)。
+// SetPublicSuffixList 更换后缀表并同步迁移索引，避免配置变化后正常 Cookie 不可见。
 func (j *Jar) SetPublicSuffixList(psl PublicSuffixList) {
-	j.mu.Lock()
-	defer j.mu.Unlock()
+	j.Restore(psl)
+}
+
+// restoreLocked 同时收敛零值和反序列化后的 Jar，调用方必须持有 mu 或尚未发布实例。
+func (j *Jar) restoreLocked(psl PublicSuffixList) {
+	if psl == nil {
+		psl = publicsuffix.List
+	}
 	j.psList = psl
+	entries := make(map[string]map[string]Entry, len(j.Entries))
+	for _, bucket := range j.Entries {
+		for _, entry := range bucket {
+			if entry.HostOnly && strings.HasPrefix(entry.Domain, "[") && strings.HasSuffix(entry.Domain, "]") {
+				entry.Domain = entry.Domain[1 : len(entry.Domain)-1]
+			}
+			// 域 Cookie 不能覆盖公共后缀；旧数据中的非法项不能借索引迁移继续生效。
+			if !entry.HostOnly && (isIP(entry.Domain) || psl.PublicSuffix(entry.Domain) == entry.Domain) {
+				continue
+			}
+			key := jarKey(entry.Domain, psl)
+			if entries[key] == nil {
+				entries[key] = make(map[string]Entry)
+			}
+			id := entry.id()
+			if prior, ok := entries[key][id]; ok && prior.LastAccess.After(entry.LastAccess) {
+				continue
+			}
+			entries[key][id] = entry
+		}
+	}
+	j.Entries = entries
 }
 
 // Entry is the internal representation of a cookie.
@@ -154,6 +174,7 @@ func (j *Jar) SetPublicSuffixList(psl PublicSuffixList) {
 type Entry struct {
 	Name       string    `bson:"name" json:"name" xorm:"name text" plist:"name"`
 	Value      string    `bson:"value" json:"value" xorm:"value text" plist:"value"`
+	Quoted     bool      `bson:"quoted,omitempty" json:"quoted,omitempty" xorm:"quoted bool" plist:"quoted,omitempty"`
 	Domain     string    `bson:"domain" json:"domain" xorm:"domain text" plist:"domain"`
 	Path       string    `bson:"path" json:"path" xorm:"path text" plist:"path"`
 	SameSite   string    `bson:"samesite" json:"samesite" xorm:"samesite text" plist:"samesite"`
@@ -230,6 +251,9 @@ func (j *Jar) cookies(u *url.URL, now time.Time) (cookies []*http.Cookie) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
+	if j.psList == nil {
+		j.restoreLocked(nil)
+	}
 	key := jarKey(host, j.psList)
 	submap := j.Entries[key]
 	if submap == nil {
@@ -279,7 +303,7 @@ func (j *Jar) cookies(u *url.URL, now time.Time) (cookies []*http.Cookie) {
 		return s[i].SeqNum < s[j].SeqNum
 	})
 	for _, e := range selected {
-		cookies = append(cookies, &http.Cookie{Name: e.Name, Value: e.Value})
+		cookies = append(cookies, &http.Cookie{Name: e.Name, Value: e.Value, Quoted: e.Quoted})
 	}
 
 	return cookies
@@ -312,11 +336,17 @@ func (j *Jar) setCookies(u *url.URL, cookies []*http.Cookie, now time.Time) {
 	if j.Entries == nil {
 		j.Entries = make(map[string]map[string]Entry)
 	}
+	if j.psList == nil {
+		j.restoreLocked(nil)
+	}
 	key := jarKey(host, j.psList)
 	submap := j.Entries[key]
 
 	modified := false
 	for _, cookie := range cookies {
+		if cookie == nil {
+			continue
+		}
 		e, remove, err := j.newEntry(cookie, now, defPath, host)
 		if err != nil {
 			continue
@@ -373,6 +403,10 @@ func canonicalHost(host string) (string, error) {
 			return "", err
 		}
 	}
+	// IPv6 在不带端口的 URL.Host 中仍有方括号，必须与带端口时的地址使用同一索引。
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
 	// Strip trailing dot from fully qualified domain names.
 	host = strings.TrimSuffix(host, ".")
 	return toASCII(host)
@@ -424,7 +458,8 @@ func jarKey(host string, psl PublicSuffixList) string {
 
 // isIP reports whether host is an IP address.
 func isIP(host string) bool {
-	return net.ParseIP(host) != nil
+	// IPv6 zone 可包含点号，不能把 ::1%zone.example.com 误当成 DNS 子域。
+	return strings.ContainsAny(host, ":%") || net.ParseIP(host) != nil
 }
 
 // defaultPath returns the directory part of an URL's path according to
@@ -468,7 +503,12 @@ func (j *Jar) newEntry(c *http.Cookie, now time.Time, defPath, host string) (e E
 	if c.MaxAge < 0 {
 		return e, true, nil
 	} else if c.MaxAge > 0 {
-		e.Expires = now.Add(time.Duration(c.MaxAge) * time.Second)
+		// 秒数先乘 time.Second 会在约 292 年处溢出为负，令长寿命 Cookie 立即失效。
+		if int64(c.MaxAge) >= endOfTime.Unix()-now.Unix() {
+			e.Expires = endOfTime
+		} else {
+			e.Expires = time.Unix(now.Unix()+int64(c.MaxAge), int64(now.Nanosecond()))
+		}
 		e.Persistent = true
 	} else {
 		if c.Expires.IsZero() {
@@ -484,6 +524,7 @@ func (j *Jar) newEntry(c *http.Cookie, now time.Time, defPath, host string) (e E
 	}
 
 	e.Value = c.Value
+	e.Quoted = c.Quoted
 	e.Secure = c.Secure
 	e.HttpOnly = c.HttpOnly
 
@@ -502,7 +543,6 @@ func (j *Jar) newEntry(c *http.Cookie, now time.Time, defPath, host string) (e E
 var (
 	errIllegalDomain   = errors.New("cookiejar: illegal cookie domain attribute")
 	errMalformedDomain = errors.New("cookiejar: malformed cookie domain attribute")
-	errNoHostname      = errors.New("cookiejar: no host name available (IP only)")
 )
 
 // endOfTime is the time when session (non-persistent) cookies expire.
@@ -519,10 +559,11 @@ func (j *Jar) domainAndType(host, domain string) (string, bool, error) {
 	}
 
 	if isIP(host) {
-		// According to RFC 6265 domain-matching includes not being
-		// an IP address.
-		// TODO: This might be relaxed as in common browsers.
-		return "", false, errNoHostname
+		// 与当前 Go 标准库一致，只接受完全相同的 IP，并按 host-only Cookie 保存。
+		if host != domain {
+			return "", false, errIllegalDomain
+		}
+		return host, true, nil
 	}
 
 	// From here on: If the cookie is valid, it is a domain cookie (with

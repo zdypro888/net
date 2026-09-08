@@ -22,7 +22,8 @@ func TestProxyDialContextUsesTLSForHTTPSProxy(t *testing.T) {
 	defer server.Close()
 
 	proxy := &Proxy{
-		Address: "https://user:pass@" + server.Listener.Addr().String(),
+		Address:   "https://user:pass@" + server.Listener.Addr().String(),
+		TLSConfig: server.Client().Transport.(*http.Transport).TLSClientConfig.Clone(),
 	}
 	conn, err := proxy.DialContext(context.Background(), "tcp", "example.com:443")
 	if err != nil {
@@ -117,13 +118,19 @@ func TestProxyDialContextHTTPSProxyStrictRejectsSelfSigned(t *testing.T) {
 	}))
 	defer server.Close()
 
-	proxy := &Proxy{Address: "https://" + server.Listener.Addr().String(), TLSConfig: StrictTLSConfig()}
+	proxy := &Proxy{Address: "https://" + server.Listener.Addr().String()}
 	conn, err := proxy.DialContext(context.Background(), "tcp", "example.com:443")
 	if conn != nil {
 		checkClose(t, "proxy conn", conn.Close)
 	}
 	if err == nil {
 		t.Fatalf("DialContext should have failed against self-signed proxy with strict TLS config")
+	}
+	client := NewHTTP(nil)
+	defer client.Dispose()
+	if response, err := client.Request(context.Background(), server.URL, nil, nil); err == nil {
+		_ = response.Close()
+		t.Fatal("default HTTP client accepted an untrusted TLS certificate")
 	}
 	var verr *tls.CertificateVerificationError
 	if !errors.As(err, &verr) {

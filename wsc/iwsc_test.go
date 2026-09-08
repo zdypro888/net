@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -566,11 +567,15 @@ func TestServerCanceledCleanupDoesNotExpireSession(t *testing.T) {
 
 	generation := session.generation()
 	server.scheduleSessionCleanup(session, generation)
+	server.locker.Lock()
+	oldCleanup := server.cleanupTimers[session.guid]
+	server.locker.Unlock()
 	if !server.cancelSessionCleanup(session.guid) {
 		t.Fatalf("expected pending cleanup to be canceled")
 	}
-	// 模拟已触发的旧 timer 在取消之后才执行回调:
-	server.expireSession(session, generation)
+	server.scheduleSessionCleanup(session, generation)
+	// 模拟已触发的旧 timer 在同代重排之后才执行回调:
+	server.expireSession(session, oldCleanup)
 	if server.GetSession(session.guid) == nil {
 		t.Fatalf("canceled cleanup wrongly expired session")
 	}
@@ -817,7 +822,7 @@ func TestWSConnectionCloseDoesNotBlockWhenMessageChannelIsFull(t *testing.T) {
 			return
 		}
 		defer checkClose(t, "websocket conn", conn.Close)
-		<-r.Context().Done()
+		_, _, _ = conn.ReadMessage()
 	}))
 	defer httpServer.Close()
 
@@ -831,6 +836,11 @@ func TestWSConnectionCloseDoesNotBlockWhenMessageChannelIsFull(t *testing.T) {
 	wsConn := createWSConnection[testPayload](conn, 1, defaultCodec)
 	wsConn.msgchan <- &messagechannel[testPayload]{Message: &Message[testPayload]{Data: testPayload{Kind: "queued"}}}
 
+	var handlers sync.WaitGroup
+	for range 64 {
+		handlers.Go(func() { wsConn.Handle(context.Background(), &Message[testPayload]{Data: testPayload{Kind: "blocked"}}) })
+	}
+	time.Sleep(10 * time.Millisecond)
 	done := make(chan error, 1)
 	go func() {
 		done <- wsConn.Close(context.Background())
@@ -838,6 +848,7 @@ func TestWSConnectionCloseDoesNotBlockWhenMessageChannelIsFull(t *testing.T) {
 
 	select {
 	case err := <-done:
+		handlers.Wait()
 		if err != nil {
 			t.Fatalf("Close returned error: %v", err)
 		}

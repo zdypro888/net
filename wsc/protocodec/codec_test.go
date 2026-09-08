@@ -63,7 +63,7 @@ func TestCodecRoundTripNilPayload(t *testing.T) {
 		t.Fatalf("nil payload must not be marked present")
 	}
 
-	var out wsc.Message[*Frame]
+	out := wsc.Message[*Frame]{ID: "previous", Data: &Frame{Id: "stale-payload"}}
 	if err := c.Decode(messageType, data, &out); err != nil {
 		t.Fatalf("Decode failed: %v", err)
 	}

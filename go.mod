@@ -6,6 +6,7 @@ require (
 	github.com/andybalholm/brotli v1.2.2
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
+	github.com/klauspost/compress v1.19.2
 	github.com/quic-go/quic-go v0.61.0
 	github.com/zdypro888/utils v0.0.0-20260824052109-c0310edd561a
 	golang.org/x/net v0.58.0

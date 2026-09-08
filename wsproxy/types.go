@@ -170,7 +170,7 @@ func normalizeCopyError(direction string, err error) error {
 	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
 		return nil
 	}
-	if _, ok := errors.AsType[*websocket.CloseError](err); ok {
+	if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 		return nil
 	}
 	return fmt.Errorf("%s: %w", direction, err)
@@ -179,26 +179,44 @@ func normalizeCopyError(direction string, err error) error {
 func wsCopyToConn(closeBoth func(), wsConn *websocket.Conn, conn net.Conn) error {
 	defer closeBoth()
 	for {
-		_, message, err := wsConn.ReadMessage()
+		kind, reader, err := wsConn.NextReader()
 		if err != nil {
 			return err
 		}
-		if _, err := conn.Write(message); err != nil {
+		if kind != websocket.BinaryMessage {
+			return fmt.Errorf("wsproxy: expected binary stream, got message type %d", kind)
+		}
+		// 按块搬运，避免为每条最大 32 MiB 的帧分配完整副本；io.Copy 负责短写检查。
+		if _, err := io.Copy(conn, reader); err != nil {
 			return err
 		}
 	}
 }
 
-func connCopyToWs(closeBoth func(), conn net.Conn, wsConn *websocket.Conn) error {
+func connCopyToWs(closeBoth func(), conn io.Reader, wsConn *websocket.Conn) error {
 	defer closeBoth()
 	buf := make([]byte, 32*1024)
 	for {
-		n, err := conn.Read(buf)
-		if err != nil {
-			return err
+		n, readErr := conn.Read(buf)
+		// Reader 允许最后一批数据与 EOF/错误一起返回，必须先转发 n 个有效字节。
+		if n > 0 {
+			if err := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
+				return err
+			}
 		}
-		if err := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
-			return err
+		if readErr != nil {
+			return readErr
 		}
 	}
+}
+
+// validateTarget 在消耗待命连接前校验字节流隧道支持的目标；UDP/Unix 不属于该 wire 协议。
+func validateTarget(network, address string) error {
+	switch network {
+	case "tcp", "tcp4", "tcp6":
+	default:
+		return fmt.Errorf("wsproxy: unsupported network %q", network)
+	}
+	_, _, err := net.SplitHostPort(address)
+	return err
 }

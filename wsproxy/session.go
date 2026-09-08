@@ -1,7 +1,10 @@
 package wsproxy
 
 import (
+	"fmt"
+	"io"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -12,44 +15,49 @@ import (
 type Session struct {
 	Id            string
 	Conn          *websocket.Conn
-	buffer        []byte // 缓存未读完的数据
+	reader        io.Reader // 当前二进制帧，按调用方缓冲区流式读取
 	readMu        sync.Mutex
 	writeMu       sync.Mutex
 	deadlineMu    sync.Mutex
 	writeDeadline time.Time
+	writeTimer    *time.Timer
+	writeActive   bool
+	writeTimedOut bool
+	closed        bool
 	close         sync.Once
 	closeErr      error
 	onClose       func(*Session)
 }
 
 // Read 从 WebSocket 二进制消息中读取字节，并缓存本次未消费的剩余数据。
-func (s *Session) Read(b []byte) (n int, err error) {
+func (s *Session) Read(b []byte) (int, error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
-
-	// 如果缓存中有数据，先返回缓存的数据
-	if len(s.buffer) > 0 {
-		n = copy(b, s.buffer)
-		s.buffer = s.buffer[n:]
-		return n, nil
+	for {
+		if s.reader == nil {
+			kind, reader, err := s.Conn.NextReader()
+			if err != nil {
+				return 0, err
+			}
+			if kind != websocket.BinaryMessage {
+				return 0, fmt.Errorf("wsproxy: expected binary stream, got message type %d", kind)
+			}
+			s.reader = reader
+		}
+		n, err := s.reader.Read(b)
+		if err == io.EOF {
+			// 帧边界不是 TCP 流的 EOF；空帧不向上游返回 (0, nil)。
+			s.reader = nil
+			if n > 0 {
+				return n, nil
+			}
+			continue
+		}
+		return n, err
 	}
-
-	// 读取新的 WebSocket 消息
-	_, message, err := s.Conn.ReadMessage()
-	if err != nil {
-		return 0, err
-	}
-
-	// 如果消息长度小于等于 buffer 大小，直接复制
-	if len(message) <= len(b) {
-		return copy(b, message), nil
-	}
-
-	// 消息长度大于 buffer，复制部分数据，剩余存入缓存
-	n = copy(b, message)
-	s.buffer = make([]byte, len(message)-n)
-	copy(s.buffer, message[n:])
-	return n, nil
 }
 
 // Write 将数据作为一个二进制 WebSocket 消息写入代理会话。
@@ -57,15 +65,34 @@ func (s *Session) Write(b []byte) (n int, err error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	// SetWriteDeadline 可并发中断阻塞写；在同一把锁下同步 Gorilla 缓存的
-	// 截止时间，保证最近一次设置生效。
+	// 已过期且尚未开始的写直接返回，不进入 Gorilla 使整条写流永久失效。
+	// 一旦帧写入途中超时，Gorilla 连接不可恢复，调用方须重新拨号。
 	s.deadlineMu.Lock()
-	err = s.Conn.SetWriteDeadline(s.writeDeadline)
+	if s.closed {
+		s.deadlineMu.Unlock()
+		return 0, net.ErrClosed
+	}
+	if !s.writeDeadline.IsZero() && !time.Now().Before(s.writeDeadline) {
+		s.deadlineMu.Unlock()
+		return 0, os.ErrDeadlineExceeded
+	}
+	// Gorilla 每次写帧都会应用缓存的期限；禁止它覆盖并发修改后的期限。
+	// 由会话定时器中断在途写，过期的 WebSocket 帧不能继续复用。
+	err = s.Conn.SetWriteDeadline(time.Time{})
+	s.writeActive = err == nil
+	s.armWriteTimerLocked()
 	s.deadlineMu.Unlock()
 	if err != nil {
 		return 0, err
 	}
 	err = s.Conn.WriteMessage(websocket.BinaryMessage, b)
+	s.deadlineMu.Lock()
+	s.writeActive = false
+	s.armWriteTimerLocked()
+	if s.writeTimedOut {
+		err = os.ErrDeadlineExceeded
+	}
+	s.deadlineMu.Unlock()
 	if err != nil {
 		return 0, err
 	}
@@ -75,6 +102,10 @@ func (s *Session) Write(b []byte) (n int, err error) {
 // Close 关闭代理会话，并执行一次所属服务器的注销回调。
 func (s *Session) Close() error {
 	s.close.Do(func() {
+		s.deadlineMu.Lock()
+		s.closed = true
+		s.armWriteTimerLocked()
+		s.deadlineMu.Unlock()
 		s.closeErr = s.Conn.Close()
 		if s.onClose != nil {
 			s.onClose(s)
@@ -116,9 +147,35 @@ func (s *Session) SetReadDeadline(t time.Time) error {
 func (s *Session) SetWriteDeadline(t time.Time) error {
 	s.deadlineMu.Lock()
 	defer s.deadlineMu.Unlock()
-	if err := s.Conn.UnderlyingConn().SetWriteDeadline(t); err != nil {
-		return err
+	if s.closed {
+		return net.ErrClosed
 	}
 	s.writeDeadline = t
+	s.armWriteTimerLocked()
 	return nil
+}
+
+// armWriteTimerLocked 统一管理在途写期限；持 deadlineMu 调用。
+func (s *Session) armWriteTimerLocked() {
+	if s.writeTimer != nil {
+		s.writeTimer.Stop()
+		s.writeTimer = nil
+	}
+	if s.closed || !s.writeActive || s.writeDeadline.IsZero() {
+		return
+	}
+	var timer *time.Timer
+	timer = time.AfterFunc(time.Until(s.writeDeadline), func() {
+		s.deadlineMu.Lock()
+		// Stop 不保证回调未启动，身份检查阻止旧期限关闭新一轮写。
+		if s.writeTimer != timer || s.closed || !s.writeActive {
+			s.deadlineMu.Unlock()
+			return
+		}
+		s.writeTimedOut = true
+		s.closed = true
+		s.deadlineMu.Unlock()
+		_ = s.Close()
+	})
+	s.writeTimer = timer
 }

@@ -65,19 +65,13 @@ type ClientStats struct {
 // T 注意需要指针类型才能修改连接状态。
 // 原则上M, T都应该是指针类型，以避免数据拷贝开销。
 //
-// 关于 *Unsafe API 的并发契约 (R2 重新明确):
-//   - Reset / Close / Write / Request / AsyncCall / RequestCallback (Lock 版本)
-//     线程安全, 可并发调用.
-//   - ResetUnsafe / CloseUnsafe / WriteUnsafe / RequestUnsafe / AsyncCallUnsafe /
-//     RequestCallbackUnsafe 不持锁. 当且仅当 caller 自己是 single owner goroutine
-//     (例如 apn.asyncGo, wsc.Session.asyncGo) 时可用 —— 该 goroutine 必须独占
-//     Reset/Close/Write 系列调用. 与上面 Lock 版本混用会 race.
-//   - async() 内部用 sync.Once 保证 stopChan 只 close 一次, 即便 Close 与 asyncGo
-//     退出竞速也只触发一次 close. 它是 *Unsafe 与 Lock 版本之间的同步桥.
+// ResetUnsafe / CloseUnsafe 仅供独占生命周期的单 owner 调用，不得与 Reset/Close 混用。
+// 其它 Unsafe 名称为兼容旧调用保留，入队与对应普通方法使用同一快照和停止门控。
 type Client[M any, T Conn[M]] struct {
-	locker sync.RWMutex   // 保护 Client 会话状态的读写锁
-	waiter sync.WaitGroup // 等待 goroutine 退出
-	errMu  sync.RWMutex
+	locker    sync.RWMutex   // 保护 Client 会话状态的读写锁
+	lifecycle sync.Mutex     // 串行化公开 Reset/Close；等待 worker 时不占状态锁
+	waiter    sync.WaitGroup // 等待 goroutine 退出
+	errMu     sync.RWMutex
 
 	conn      T     // 底层连接实现
 	lastError error // 最后发生的错误
@@ -87,6 +81,8 @@ type Client[M any, T Conn[M]] struct {
 	bufferSize int
 
 	asynchan chan *asynRequest[M, T]
+	// 每代独立的入队锁；Close 先关 stopChan，再等待发送者退出，避免队列背压挡住关闭。
+	sendMu   *sync.RWMutex
 	stopChan chan struct{} // 停止信号; 由 stopOnce 保证只 close 一次
 	active   atomic.Bool
 
@@ -185,6 +181,11 @@ func (client *Client[M, T]) ResetUnsafe(ctx context.Context, conn T) {
 	client.CloseUnsafe()
 	// 等待旧的 goroutine 完全退出
 	client.waiter.Wait()
+	client.startConnection(ctx, conn)
+}
+
+// startConnection 在旧代 worker 全部退出后初始化新代；调用方独占生命周期和状态写入。
+func (client *Client[M, T]) startConnection(ctx context.Context, conn T) {
 	client.conn = conn
 	var closeOnce sync.Once
 	var closeErr error
@@ -210,6 +211,7 @@ func (client *Client[M, T]) ResetUnsafe(ctx context.Context, conn T) {
 	}
 	asynchan := make(chan *asynRequest[M, T], bufSize)
 	client.asynchan = asynchan
+	client.sendMu = &sync.RWMutex{}
 	client.active.Store(true)
 	recvchan := make(chan M, bufSize)
 	cctx, cancel := context.WithCancel(ctx)
@@ -239,40 +241,37 @@ func (client *Client[M, T]) ResetUnsafe(ctx context.Context, conn T) {
 
 // Reset 重置 Client 使用新的连接。如果存在则关闭旧连接。
 func (client *Client[M, T]) Reset(ctx context.Context, conn T) {
+	client.lifecycle.Lock()
+	defer client.lifecycle.Unlock()
 	client.locker.Lock()
-	defer client.locker.Unlock()
-	client.ResetUnsafe(ctx, conn)
+	client.CloseUnsafe()
+	client.locker.Unlock()
+	// 回调收到取消后可能读取 Stats/Conn；等待退出时不能持状态写锁。
+	client.waiter.Wait()
+	client.locker.Lock()
+	client.startConnection(ctx, conn)
+	client.locker.Unlock()
 }
 
-// CloseUnsafe 关闭异步通道，通知 asyncGo 退出。
-// 注意：此方法不持有锁，调用方需自行确保并发安全。
-// 安全: signalStop 用 sync.Once 保护, 与 asyncGo 退出尾段并发关 stopChan 不会 panic.
-// asynchan 仍然由 CloseUnsafe (在 Lock 内) 单点关闭, 与 async() 的 RLock 互斥保证
-// 不会 send-after-close.
+// CloseUnsafe 中断当前代连接并停止入队；调用方须独占 Reset/Close。
+// stopChan 必须先于 sendMu 关闭，否则满队列中的发送者无法释放入队读锁。
 func (client *Client[M, T]) CloseUnsafe() {
 	client.closed.Store(true)
-	// 先 signalStop 让 async() 与 RequestUnsafe 卡在 select 上的 caller 立即解锁,
-	// 避免它们继续等 asynchan 空位 / response. asyncGo 在 ctx-cancel + asynchan
-	// 关闭后会走到清理路径, 也会幂等地再 signalStop 一次.
 	client.signalStop()
+	if client.handleCancel != nil {
+		client.handleCancel()
+	}
 	if client.closeCurrent != nil {
 		if err := client.closeCurrent(); err != nil {
 			slog.Debug("net.Client interrupt close failed", slog.Any("err", err))
 		}
 	}
-	// D-P1-1: cancel handleCtx, 把取消透传给可能正卡在 conn.Handle 内的用户回调
-	// (遵守 ctx 的 Handle 会因 ctx.Done() 解阻塞), 从而 asyncGo 能回到循环顶看到
-	// asynchan 已关闭并走正常退出尾段, waiter.Wait() 不被永久阻塞. 只 cancel
-	// handleCtx 不 cancel cctx — 不改变 asyncGo 的 lastError 归一 (仍为 ErrConnectionClosed).
-	// cancel 幂等; 若 asyncGo 已退出该字段仍有效, 调用无副作用.
-	if client.handleCancel != nil {
-		client.handleCancel()
-	}
 	client.active.Store(false)
 	if client.asynchan != nil {
-		// asynchan 只可以在 locker 保护下关闭
+		client.sendMu.Lock()
 		close(client.asynchan)
 		client.asynchan = nil
+		client.sendMu.Unlock()
 	}
 }
 
@@ -280,16 +279,16 @@ func (client *Client[M, T]) CloseUnsafe() {
 // 会等待所有 goroutine 退出后返回。
 // 返回连接期间最后发生的错误（如果有）。
 func (client *Client[M, T]) Close() error {
+	client.lifecycle.Lock()
+	defer client.lifecycle.Unlock()
 	client.locker.Lock()
-	defer client.locker.Unlock()
 	client.CloseUnsafe()
-	// 等待所有 goroutine 退出
+	client.locker.Unlock()
 	client.waiter.Wait()
-	err := client.getLastError()
-	return err
+	return client.getLastError()
 }
 
-// Stats 返回 net.Client 运行时计数. 不持锁 — 各字段 atomic 或 chan-Len,
+// Stats 返回 net.Client 运行时计数，队列快照在读锁内取得。
 // 不保证瞬间一致性, 监控用足够.
 func (client *Client[M, T]) Stats() ClientStats {
 	stats := ClientStats{
@@ -359,7 +358,7 @@ func (client *Client[M, T]) asyncGo(ctx context.Context, handleCtx context.Conte
 				// 尝试匹配请求
 				foundNotify := false
 				if notify, ok := any(recv).(NotifyMessage); ok {
-					if notifyId, ok := notify.Id(); ok {
+					if notifyId, ok := notify.Id(); ok && notifyId != nil && reflect.ValueOf(notifyId).Comparable() {
 						foundNotify = requests.handleResponse(notifyId, recv)
 					}
 				}
@@ -398,7 +397,7 @@ func (client *Client[M, T]) asyncGo(ctx context.Context, handleCtx context.Conte
 							asyncRequest.Response(zeroM, fmt.Errorf("message does not provide a request id"))
 							continue
 						}
-						if !reflect.TypeOf(notifyID).Comparable() {
+						if !reflect.ValueOf(notifyID).Comparable() {
 							asyncRequest.Response(zeroM, fmt.Errorf("request id type %T is not comparable", notifyID))
 							continue
 						}
@@ -439,7 +438,7 @@ func (client *Client[M, T]) asyncGo(ctx context.Context, handleCtx context.Conte
 					}
 				case AsyncCommandCallback:
 					if asyncall.Callback != nil {
-						asyncall.Callback(ctx, conn)
+						asyncall.Callback(handleCtx, conn)
 					}
 				}
 
@@ -474,6 +473,9 @@ func (client *Client[M, T]) asyncGo(ctx context.Context, handleCtx context.Conte
 		}
 	}
 	client.signalStop()
+	// 停止信号之后等待已取得本代队列的发送者退出，随后排空才不会遗漏迟到入队的请求。
+	client.sendMu.Lock()
+	client.sendMu.Unlock()
 	client.active.Store(false)
 
 	// 关闭底层连接，让 receiveGo 退出. close 错误只记日志, 不写入 lastError:
@@ -490,7 +492,7 @@ func (client *Client[M, T]) asyncGo(ctx context.Context, handleCtx context.Conte
 	// 处理 recvchan 中残留的数据，尝试匹配响应
 	for recv := range recvchan {
 		if notify, ok := any(recv).(NotifyMessage); ok {
-			if notifyId, ok := notify.Id(); ok {
+			if notifyId, ok := notify.Id(); ok && notifyId != nil && reflect.ValueOf(notifyId).Comparable() {
 				// 清理阶段也须遵守取消隔离，不能把已取消请求报告为成功。
 				requests.handleResponse(notifyId, recv)
 			}
@@ -549,33 +551,45 @@ func failQueuedRequests[M any, T Conn[M]](asynchan <-chan *asynRequest[M, T], ze
 }
 
 func (client *Client[M, T]) async(ctx context.Context, request *asynRequest[M, T]) error {
-	if !client.active.Load() || client.asynchan == nil {
-		// stopChan 在首次 ResetUnsafe 时创建: 仍为 nil 说明从未连接过;
-		// 否则是连接后被 Close (CloseUnsafe 置 asynchan=nil) — 与下方
-		// stopChan 竞速分支同语义, 同一"已关"状态只暴露 ErrConnectionClosed.
-		if client.stopChan == nil {
+	// 状态锁只用于取得本代快照；任何背压等待均在锁外，Close/Reset 可立即发出停止信号。
+	client.locker.RLock()
+	queue, stop, sendMu := client.asynchan, client.stopChan, client.sendMu
+	active := client.active.Load()
+	client.locker.RUnlock()
+	if !active || queue == nil {
+		if stop == nil {
 			return ErrNotConnected
 		}
 		return ErrConnectionClosed
 	}
-	// RUN-6: caller 传 ctx 无 deadline 时强加 DefaultAsyncTimeout 兜底, 防止
-	// asynchan 满 + asyncGo 卡死 = 永久阻塞. 不影响有 deadline 的 caller.
+	sendMu.RLock()
+	defer sendMu.RUnlock()
+	select {
+	case <-stop:
+		return ErrConnectionClosed
+	default:
+	}
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, DefaultAsyncTimeout)
 		defer cancel()
 	}
+	// 已取消的调用不能因发送分支恰好可用而成功入队。
+	if err := ctx.Err(); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			client.asyncTimeouts.Add(1)
+		}
+		return err
+	}
 	select {
 	case <-ctx.Done():
-		// 只把真正的超时 (内部 DefaultAsyncTimeout 兜底或 caller deadline 到期)
-		// 计入 asyncTimeouts; caller 主动取消 (context.Canceled) 不是拥塞信号.
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			client.asyncTimeouts.Add(1)
 		}
 		return ctx.Err()
-	case client.asynchan <- request:
+	case queue <- request:
 		return nil
-	case <-client.stopChan:
+	case <-stop:
 		return ErrConnectionClosed
 	}
 }
@@ -629,7 +643,7 @@ func (request *asyncMessage[M]) Response(resp M, err error) {
 }
 
 // RequestCallbackUnsafe 发送数据到连接(设置是否需要响应)
-// 注意：此方法不持有锁，调用方需自行确保并发安全。
+// 保留旧方法名；入队会短暂加锁，回调在独立 goroutine 中执行。
 func (client *Client[M, T]) RequestCallbackUnsafe(ctx context.Context, data M, callback func(resp M, err error)) error {
 	message := &asyncMessage[M]{Data: data, Notify: true, callback: callback, ctx: ctx}
 	request := &asynRequest[M, T]{Command: AsyncCommandSend, Message: message}
@@ -644,7 +658,7 @@ func (client *Client[M, T]) RequestCallbackUnsafe(ctx context.Context, data M, c
 }
 
 // asyncMessage 发送数据到连接(设置是否需要响应)
-// 注意：此方法不持有锁，调用方需自行确保并发安全。
+// 入队只在取得当前连接快照时短暂加锁。
 func (client *Client[M, T]) asyncMessage(ctx context.Context, data M, notify bool) (*asyncMessage[M], error) {
 	message := &asyncMessage[M]{Data: data, Notify: notify}
 	if notify {
@@ -663,7 +677,7 @@ func (client *Client[M, T]) asyncMessage(ctx context.Context, data M, notify boo
 }
 
 // WriteUnsafe 发送数据到连接(不需要响应)
-// 注意：此方法不持有锁，调用方需自行确保并发安全。
+// 保留旧方法名；ctx 仅控制入队，已入队通知按连接生命周期发送。
 func (client *Client[M, T]) WriteUnsafe(ctx context.Context, data M) error {
 	_, err := client.asyncMessage(ctx, data, false)
 	return err
@@ -672,14 +686,12 @@ func (client *Client[M, T]) WriteUnsafe(ctx context.Context, data M) error {
 // Write 发送数据到连接(不需要响应)
 // 线程安全，可并发调用。
 func (client *Client[M, T]) Write(ctx context.Context, data M) error {
-	client.locker.RLock()
-	defer client.locker.RUnlock()
 	return client.WriteUnsafe(ctx, data)
 }
 
 // RequestUnsafe 发送数据到连接, 等待响应.
 // *注意* 次方法会阻塞直到收到响应或发生错误, 所以不可以在 Handle 回调中调用此方法.
-// 注意：此方法不持有锁，调用方需自行确保并发安全。
+// 保留旧方法名；行为与 Request 相同。
 func (client *Client[M, T]) RequestUnsafe(ctx context.Context, data M) (M, error) {
 	message, err := client.asyncMessage(ctx, data, true)
 	if err != nil {
@@ -695,14 +707,9 @@ func (client *Client[M, T]) RequestUnsafe(ctx context.Context, data M) (M, error
 // *注意* 次方法会阻塞直到收到响应或发生错误, 所以不可以在 Handle 回调中调用此方法.
 // 线程安全，可并发调用。
 //
-// 注意 RLock 释放时机: 入队 (asyncMessage → async) 在 RLock 内, 等待响应 (waiter)
-// 在 RLock 外. 原因: 等响应可能阻塞数秒~数分钟, 持 RLock 会让并发的 Close (Wlock)
-// 一直等不到 RLock 释放, 造成 Close 永远 hang. 而入队 / waiter 之间用 stopChan
-// 与 message.canceled 的内置同步, 不需要锁保护.
+// 入队和等待响应均不持会话状态锁；async 只在取得队列快照时短暂加锁。
 func (client *Client[M, T]) Request(ctx context.Context, data M) (M, error) {
-	client.locker.RLock()
 	message, err := client.asyncMessage(ctx, data, true)
-	client.locker.RUnlock()
 	if err != nil {
 		var zero M
 		return zero, err
@@ -710,7 +717,7 @@ func (client *Client[M, T]) Request(ctx context.Context, data M) (M, error) {
 	return client.waitResponse(ctx, message)
 }
 
-// waitResponse 等 asyncGo 通过 Response 或 stopChan 关闭通知; 不持锁.
+// waitResponse 等 asyncGo 完成该请求或调用方取消，不持会话锁。
 func (client *Client[M, T]) waitResponse(ctx context.Context, message *asyncMessage[M]) (M, error) {
 	var zeroM M
 	select {
@@ -727,7 +734,7 @@ func (client *Client[M, T]) waitResponse(ctx context.Context, message *asyncMess
 
 // AsyncCallUnsafe 异步执行回调函数，传入当前连接。
 // 回调在 asyncGo 协程中执行，保证回调内部线程安全。
-// 注意：此方法不持有锁，调用方需自行确保并发安全。
+// 保留旧方法名；回调须观察传入 ctx，且不能在自身 worker 中同步 Close/Reset/Request。
 func (client *Client[M, T]) AsyncCallUnsafe(ctx context.Context, callback func(ctx context.Context, conn T)) error {
 	request := &asynRequest[M, T]{Command: AsyncCommandCallback, Callback: callback}
 	return client.async(ctx, request)
@@ -737,7 +744,5 @@ func (client *Client[M, T]) AsyncCallUnsafe(ctx context.Context, callback func(c
 // 回调在 asyncGo 协程中执行，保证线程安全。
 // 如果客户端未连接，返回错误。
 func (client *Client[M, T]) AsyncCall(ctx context.Context, callback func(ctx context.Context, conn T)) error {
-	client.locker.RLock()
-	defer client.locker.RUnlock()
 	return client.AsyncCallUnsafe(ctx, callback)
 }

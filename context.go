@@ -53,6 +53,8 @@ func SetCookie(ctx context.Context, c http.CookieJar) error {
 
 func GetCookie(ctx context.Context) http.CookieJar {
 	if h := FromContext(ctx); h != nil {
+		h.mu.RLock()
+		defer h.mu.RUnlock()
 		return h.client.Jar
 	}
 	return nil

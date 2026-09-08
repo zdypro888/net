@@ -3,7 +3,6 @@ package net
 import (
 	"crypto/tls"
 	"net/http"
-	"time"
 
 	"github.com/quic-go/quic-go/http3"
 )
@@ -13,11 +12,11 @@ func NewHTTP3(config *tls.Config) *HTTP {
 		config = DefaultTLSConfig()
 	}
 	transport := &http3.Transport{
-		TLSClientConfig: config,
+		TLSClientConfig: config.Clone(),
 	}
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   120 * time.Second,
+		Timeout:   defaultHTTPRequestTimeout,
 	}
 	h := &HTTP{
 		transport: transport,

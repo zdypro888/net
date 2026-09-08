@@ -3,6 +3,7 @@ package net
 import (
 	"bytes"
 	"compress/gzip"
+	"compress/zlib"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -14,18 +15,20 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/zdypro888/utils"
-	"golang.org/x/net/http2"
 )
 
 // DefaultRetryBackoff 是 HTTP.RequestMethod 默认的 retry 间隔.
 // 指数 + 抖动, 100ms * 2^attempt, capped 5s. attempt 从 0 起计数 (即 0 = 第一次重试).
 // RUN-5 修复: 旧实现 retry 之间 0 sleep, 服务端 5xx 风暴时立即捶 N 次.
-// 暴露为变量便于 caller 用 HTTP.ConfigureRetryBackoff 覆盖.
+// 可通过 HTTP.ConfigureRetryBackoff 覆盖。
 func DefaultRetryBackoff(attempt int) time.Duration {
 	if attempt < 0 {
 		attempt = 0
@@ -50,7 +53,13 @@ var ErrContextNotContainHTTP = errors.New("context not contain http")
 // Response 请求返回
 type Response struct {
 	*http.Response
-	reader io.Reader
+	reader        io.Reader
+	readerErr     error
+	closeDecoders []func()
+	readMu        sync.Mutex
+	closed        atomic.Bool
+	closeOnce     sync.Once
+	closeErr      error
 }
 
 func (response *Response) Error() string {
@@ -58,36 +67,96 @@ func (response *Response) Error() string {
 }
 
 func (response *Response) Read(p []byte) (int, error) {
+	response.readMu.Lock()
+	defer func() {
+		if response.closed.Load() {
+			response.releaseDecoders()
+		}
+		response.readMu.Unlock()
+	}()
+	if response.closed.Load() {
+		return 0, http.ErrBodyReadAfterClose
+	}
 	if response.Body == nil {
 		return 0, io.EOF
 	}
+	if response.readerErr != nil {
+		return 0, response.readerErr
+	}
 	if response.reader == nil {
-		switch response.Header.Get("Content-Encoding") {
-		case "gzip":
-			var err error
-			if response.reader, err = gzip.NewReader(response.Body); err != nil {
-				return 0, err
-			}
-		case "br":
-			response.reader = brotli.NewReader(response.Body)
-		default:
-			response.reader = response.Body
+		reader, err := response.decodeBody()
+		if err != nil {
+			response.releaseDecoders()
+			response.readerErr = err
+			return 0, err
 		}
+		response.reader = reader
 	}
 	return response.reader.Read(p)
 }
 
-func (response *Response) Close() error {
-	if response.Body != nil {
-		var err error
-		if response.reader != nil {
-			if closer, ok := response.reader.(*gzip.Reader); ok {
-				err = closer.Close()
+// decodeBody 依 RFC 9110 逆序移除 Content-Encoding，调用方持有 readMu。
+// 与调用方实际发送的 gzip/deflate/br/zstd 协商列表保持一致，未知编码返回明确错误。
+func (response *Response) decodeBody() (io.Reader, error) {
+	var reader io.Reader = response.Body
+	encodings := strings.Split(strings.Join(response.Header.Values("Content-Encoding"), ","), ",")
+	for i := len(encodings) - 1; i >= 0; i-- {
+		switch encoding := strings.ToLower(strings.TrimSpace(encodings[i])); encoding {
+		case "", "identity":
+		case "gzip", "x-gzip":
+			decoded, err := gzip.NewReader(reader)
+			if err != nil {
+				return nil, err
 			}
+			response.closeDecoders = append(response.closeDecoders, func() { _ = decoded.Close() })
+			reader = decoded
+		case "deflate":
+			decoded, err := zlib.NewReader(reader)
+			if err != nil {
+				return nil, err
+			}
+			response.closeDecoders = append(response.closeDecoders, func() { _ = decoded.Close() })
+			reader = decoded
+		case "br":
+			reader = brotli.NewReader(reader)
+		case "zstd":
+			// 每个响应同步解码，避免为普通 HTTP 流额外启动后台解码 worker。
+			decoded, err := zstd.NewReader(reader, zstd.WithDecoderConcurrency(1))
+			if err != nil {
+				return nil, err
+			}
+			response.closeDecoders = append(response.closeDecoders, decoded.Close)
+			reader = decoded
+		default:
+			return nil, fmt.Errorf("unsupported HTTP content encoding %q", encoding)
 		}
-		return errors.Join(err, response.Body.Close())
 	}
-	return nil
+	return reader, nil
+}
+
+// releaseDecoders 必须在读取结束后或读锁内调用，不能让 Close 与解码器内部状态竞争。
+func (response *Response) releaseDecoders() {
+	for i := len(response.closeDecoders) - 1; i >= 0; i-- {
+		response.closeDecoders[i]()
+	}
+	response.closeDecoders = nil
+	response.reader = nil
+}
+
+// Close 可与 Read 并发，先关闭底层 Body 解除阻塞；不能并发修改 gzip/ Brotli 解码状态。
+func (response *Response) Close() error {
+	response.closeOnce.Do(func() {
+		response.closed.Store(true)
+		if response.Body != nil {
+			response.closeErr = response.Body.Close()
+		}
+		// 正在读取时由 Read 收尾释放解码器，Close 无需等待被阻塞的 Read。
+		if response.readMu.TryLock() {
+			response.releaseDecoders()
+			response.readMu.Unlock()
+		}
+	})
+	return response.closeErr
 }
 
 func (res *Response) Data() (data []byte, err error) {
@@ -129,7 +198,10 @@ func safeErrorForLog(requestURL string, err error) string {
 	return msg
 }
 
+// HTTP 的 Configure 方法可与请求并发；每次请求持有独立配置快照。
+// 调用方传入的 CookieJar、TLS 回调和拨号函数仍须满足各自的并发契约。
 type HTTP struct {
+	mu        sync.RWMutex
 	transport http.RoundTripper
 	client    *http.Client
 	// baseDial 是 NewHTTP 创建时的基础拨号函数 (20s 拨号超时, 响应 ctx 取消/deadline).
@@ -139,7 +211,7 @@ type HTTP struct {
 	proxyURL     func(*http.Request) (*url.URL, error)
 	proxyDial    func(ctx context.Context, network, addr string) (net.Conn, error)
 	retryBackoff func(attempt int) time.Duration
-	// OnResponse / AutoRetry 保留为导出字段以兼容下游 (iauth/imadrid 直接赋值);
+	// OnResponse / AutoRetry 保留为导出字段以兼容旧调用；
 	// 推荐用 Configure* setter. 必须在调用 Request 前设置好, 之后只读.
 	OnResponse func(ctx context.Context, req *http.Request, res *http.Response, err error) (*http.Response, error, bool)
 	AutoRetry  int
@@ -147,38 +219,46 @@ type HTTP struct {
 
 // ConfigureOnResponse 设置响应回调 (推荐用法). 与直接赋值 HTTP.OnResponse 等价.
 func (h *HTTP) ConfigureOnResponse(fn func(ctx context.Context, req *http.Request, res *http.Response, err error) (*http.Response, error, bool)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.OnResponse = fn
 }
 
-// ConfigureAutoRetry 设置自动重试次数 (推荐用法).
+// ConfigureAutoRetry 设置最多尝试次数（包含第一次）；<=0 表示只发送一次。
 func (h *HTTP) ConfigureAutoRetry(n int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.AutoRetry = n
 }
 
 // ConfigureRetryBackoff 设置 retry 间隔. fn=nil 时恢复默认 DefaultRetryBackoff.
-// fn 在 init 期设, retry path 只读, 无并发保护.
+// 每次请求固定使用开始时的退避配置。
 func (h *HTTP) ConfigureRetryBackoff(fn func(attempt int) time.Duration) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.retryBackoff = fn
 }
 
-// DefaultTLSConfig 返回 NewHTTP/NewHTTP3 在 caller 传 nil 时使用的默认 TLS 配置.
-// 项目历史默认是跳过证书校验; 需要严格校验时显式传 StrictTLSConfig().
+// DefaultTLSConfig 默认验证证书链与主机名；调试代理须显式配置受信任 CA。
 func DefaultTLSConfig() *tls.Config {
-	return &tls.Config{
-		InsecureSkipVerify: true,
-		MinVersion:         tls.VersionTLS11,
-		MaxVersion:         tls.VersionTLS13,
-	}
+	return StrictTLSConfig()
 }
 
-// StrictTLSConfig 返回显式严格校验的 TLS 配置.
+// StrictTLSConfig 返回验证服务器身份且至少使用 TLS 1.2 的配置。
 func StrictTLSConfig() *tls.Config {
-	return &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		MaxVersion: tls.VersionTLS13,
-	}
+	return &tls.Config{MinVersion: tls.VersionTLS12}
 }
 
+const (
+	defaultHTTPDialTimeout         = 20 * time.Second
+	defaultHTTPHeaderTimeout       = 20 * time.Second
+	defaultHTTPExpectTimeout       = 5 * time.Second
+	defaultHTTPTLSHandshakeTimeout = 30 * time.Second
+	defaultHTTPRequestTimeout      = 120 * time.Second
+	defaultHTTPIdleTimeout         = 90 * time.Second // 与标准库默认连接池的空闲回收窗口一致。
+)
+
+// NewHTTP 创建独立连接池，nil TLS 配置使用安全默认值。
 func NewHTTP(config *tls.Config) *HTTP {
 	if config == nil {
 		config = DefaultTLSConfig()
@@ -186,18 +266,19 @@ func NewHTTP(config *tls.Config) *HTTP {
 	// 基础拨号用 DialContext (而非废弃的 Transport.Dial): 拨号阶段同样响应
 	// ctx 取消与 deadline, 保留原 20s 拨号超时语义.
 	baseDial := (&net.Dialer{
-		Timeout: 20 * time.Second,
+		Timeout: defaultHTTPDialTimeout,
 	}).DialContext
 	transport := &http.Transport{
 		DialContext:           baseDial,
-		ResponseHeaderTimeout: 20 * time.Second,
-		ExpectContinueTimeout: 5 * time.Second,
-		TLSHandshakeTimeout:   30 * time.Second,
-		TLSClientConfig:       config,
+		ResponseHeaderTimeout: defaultHTTPHeaderTimeout,
+		ExpectContinueTimeout: defaultHTTPExpectTimeout,
+		TLSHandshakeTimeout:   defaultHTTPTLSHandshakeTimeout,
+		TLSClientConfig:       config.Clone(),
+		IdleConnTimeout:       defaultHTTPIdleTimeout,
 	}
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   120 * time.Second,
+		Timeout:   defaultHTTPRequestTimeout,
 	}
 	h := &HTTP{
 		transport: transport,
@@ -207,8 +288,12 @@ func NewHTTP(config *tls.Config) *HTTP {
 	return h
 }
 
+// Dispose 关闭当前连接池中的空闲连接；HTTP/3 会关闭整个 QUIC transport。
 func (h *HTTP) Dispose() {
-	switch transport := h.transport.(type) {
+	h.mu.RLock()
+	transport := h.transport
+	h.mu.RUnlock()
+	switch transport := transport.(type) {
 	case *http.Transport:
 		transport.CloseIdleConnections()
 	case *http3.Transport:
@@ -218,46 +303,60 @@ func (h *HTTP) Dispose() {
 	}
 }
 
-// ResetConnections 为后续请求换用全新的连接池，同时保留当前 Transport 的
-// TLS、代理、拨号和超时配置。调用方必须保证此时没有并发中的 HTTP 请求。
-func (h *HTTP) ResetConnections() error {
-	if h == nil || h.client == nil {
-		return errors.New("HTTP client is unavailable")
-	}
+// configureTransport 在副本上修改配置后替换连接池，防止改写正在被请求使用的 Transport。
+// 旧请求继续使用原配置，后续请求不会复用代理切换前的连接。
+// 调用方须持有 h.mu 写锁；fn 出错时不发布任何配置。
+func (h *HTTP) configureTransport(fn func(*http.Transport) error) error {
 	transport, ok := h.transport.(*http.Transport)
 	if !ok {
-		return errors.New("HTTP transport does not support connection reset")
+		return errors.New("HTTP transport does not support TCP configuration")
 	}
 	replacement := transport.Clone()
-	transport.CloseIdleConnections()
+	if fn != nil {
+		if err := fn(replacement); err != nil {
+			return err
+		}
+	}
 	h.transport = replacement
 	h.client.Transport = replacement
+	transport.CloseIdleConnections()
 	return nil
 }
 
-func (h *HTTP) ConfigureV2() error {
-	switch transport := h.transport.(type) {
-	case *http.Transport:
-		return http2.ConfigureTransport(transport)
-	case *http3.Transport:
-		return errors.New("quic protocol can not set to http2.0")
+// ResetConnections 为后续请求换用全新连接池；已发出的请求继续完成。
+func (h *HTTP) ResetConnections() error {
+	if h == nil {
+		return errors.New("HTTP client is unavailable")
 	}
-	return nil
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.configureTransport(nil)
+}
+
+// ConfigureV2 启用标准库的 HTTP/2 协商，避免第三方 TLSNextProto 闭包跨池共享连接。
+func (h *HTTP) ConfigureV2() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.configureTransport(func(t *http.Transport) error {
+		t.ForceAttemptHTTP2 = true
+		return nil
+	})
 }
 
 func (h *HTTP) ConfigureCookie(cookies http.CookieJar) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.client.Jar = cookies
 }
 
 func (h *HTTP) ConfigureProxy(proxy func(*http.Request) (*url.URL, error), storeCache bool) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if err := h.configureTransport(func(t *http.Transport) error { t.Proxy = proxy; return nil }); err != nil {
+		return err
+	}
 	if storeCache {
 		h.proxyURL = proxy
-	}
-	switch transport := h.transport.(type) {
-	case *http.Transport:
-		transport.Proxy = proxy
-	case *http3.Transport:
-		return errors.New("quic protocol can not set proxy")
 	}
 	return nil
 }
@@ -266,61 +365,63 @@ func (h *HTTP) ConfigureDebug() error {
 	return h.ConfigureProxy(HTTPDebugProxy.ProxyURL, false)
 }
 
-func (h *HTTP) ConfigureProxyDial(dialContext func(ctx context.Context, network, addr string) (net.Conn, error), storeCache bool) error {
+func (h *HTTP) ConfigureProxyDial(dialContext func(context.Context, string, string) (net.Conn, error), storeCache bool) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if err := h.configureTransport(func(t *http.Transport) error {
+		t.DialContext = dialContext
+		if t.DialContext == nil {
+			t.DialContext = h.baseDial
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
 	if storeCache {
 		h.proxyDial = dialContext
-	}
-	switch transport := h.transport.(type) {
-	case *http.Transport:
-		if dialContext != nil {
-			transport.DialContext = dialContext
-		} else {
-			// 传 nil 表示去掉代理拨号: 回基础拨号, 不能让 transport 退到无超时的零值 Dialer.
-			transport.DialContext = h.baseDial
-		}
-	case *http3.Transport:
-		return errors.New("quic protocol can not set proxy")
 	}
 	return nil
 }
 
-// ConfigureProxyClear 清除当前代理设置, 拨号恢复到 NewHTTP 的基础拨号 (保留 20s 拨号超时).
-// 不清除 proxyURL/proxyDial 缓存, 之后可用 ConfigureProxyReset 还原.
+// ConfigureProxyClear 暂停代理并更换连接池，保留缓存以供 ConfigureProxyReset 恢复。
 func (h *HTTP) ConfigureProxyClear() {
-	switch transport := h.transport.(type) {
-	case *http.Transport:
-		transport.Proxy = nil
-		transport.DialContext = h.baseDial
-	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	_ = h.configureTransport(func(t *http.Transport) error {
+		t.Proxy, t.DialContext = nil, h.baseDial
+		return nil
+	})
 }
 
-// ConfigureProxyReset 还原到缓存的代理设置 (ConfigureProxy / ConfigureProxyDial 的
-// storeCache=true 路径). 未缓存代理拨号时回到基础拨号, 与 ConfigureProxyClear 行为一致.
+// ConfigureProxyReset 以新连接池恢复缓存的代理配置。
 func (h *HTTP) ConfigureProxyReset() {
-	switch transport := h.transport.(type) {
-	case *http.Transport:
-		transport.Proxy = h.proxyURL
-		if h.proxyDial != nil {
-			transport.DialContext = h.proxyDial
-		} else {
-			transport.DialContext = h.baseDial
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	_ = h.configureTransport(func(t *http.Transport) error {
+		t.Proxy, t.DialContext = h.proxyURL, h.proxyDial
+		if t.DialContext == nil {
+			t.DialContext = h.baseDial
 		}
-	}
+		return nil
+	})
 }
 
 func (h *HTTP) ConfigureTimeout(timeout time.Duration) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.client.Timeout = timeout
 }
 
-// ConfigureResponseHeaderTimeout 设置等待响应头的超时。
-// 调用方应在发起请求前完成配置，后续请求只读该值。
+// ConfigureResponseHeaderTimeout 设置后续请求等待响应头的上限。
 func (h *HTTP) ConfigureResponseHeaderTimeout(timeout time.Duration) {
-	if transport, ok := h.transport.(*http.Transport); ok {
-		transport.ResponseHeaderTimeout = timeout
-	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	_ = h.configureTransport(func(t *http.Transport) error { t.ResponseHeaderTimeout = timeout; return nil })
 }
 
-func (h *HTTP) ConfigureRedirect(checkRedirect func(req *http.Request, via []*http.Request) error) {
+func (h *HTTP) ConfigureRedirect(checkRedirect func(*http.Request, []*http.Request) error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.client.CheckRedirect = checkRedirect
 }
 
@@ -334,130 +435,108 @@ func (h *HTTP) Request(ctx context.Context, url string, headers http.Header, bod
 	return h.RequestMethod(ctx, url, method, headers, body)
 }
 
-func (h *HTTP) requestWithRequest(ctx context.Context, request *http.Request) (*Response, error) {
-	response, err := h.client.Do(request)
-	var closeIdleConn bool
-	if h.OnResponse != nil {
-		response, err, closeIdleConn = h.OnResponse(ctx, request, response, err)
+// RequestMethod 保留 AutoRetry 的历史含义：正数为最多尝试次数，非正数为一次。
+// 自动重发仅限可重放的幂等请求；非幂等操作应由业务方明确判断结果后重试。
+// 每次尝试使用独立 Request/Body，避免 Transport 异步关闭旧 body 时污染下一次发送。
+func (h *HTTP) RequestMethod(ctx context.Context, rawURL, method string, headers http.Header, body io.Reader) (response *Response, err error) {
+	h.mu.RLock()
+	client := *h.client
+	total, backoff, onResponse := h.AutoRetry, h.retryBackoff, h.OnResponse
+	h.mu.RUnlock()
+	if total <= 0 {
+		total = 1
 	}
-	if err != nil || closeIdleConn {
-		h.client.CloseIdleConnections()
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &Response{Response: response}, nil
-}
-
-// requestMethodDo 发送请求
-func (h *HTTP) requestMethodDo(ctx context.Context, url string, method string, headers http.Header, body io.Reader) (response *Response, err error) {
-	request, err := http.NewRequestWithContext(ctx, method, url, body)
-	if err != nil {
-		return nil, err
-	}
-	if body != nil {
-		// 如果是 utils.Reader 则扩展处理
-		if breader, ok := body.(*utils.Reader); ok {
-			defer func() {
-				err = errors.Join(err, breader.Close())
-			}()
-			request.ContentLength = breader.Size()
-			request.Body = breader.Temporary()
-			request.GetBody = func() (io.ReadCloser, error) {
-				return breader.Temporary(), nil // 快照, 用于301重定向等场景
-			}
-		}
-	}
-	if headers != nil {
-		request.Header = http.Header(headers).Clone()
-	}
-	return h.requestWithRequest(ctx, request)
-}
-
-func (h *HTTP) RequestMethod(ctx context.Context, url string, method string, headers http.Header, body io.Reader) (response *Response, err error) {
-	// AutoRetry <= 0 表示不重试, 单发一次. 旧实现只判 ==0, 负值会落进下方
-	// for i:=total;i>0 循环体一次不执行, 返回 (nil,nil) 让 caller NPE; 这里收敛.
-	if h.AutoRetry <= 0 {
-		return h.requestMethodDo(ctx, url, method, headers, body)
-	}
-	var breader *utils.Reader
-	if body != nil {
-		if bodyCloser, ok := body.(io.Closer); ok {
-			defer func() {
-				err = errors.Join(err, bodyCloser.Close())
-			}()
-		}
-		switch v := body.(type) {
-		case *bytes.Buffer:
-			// 应该不会发生错误, 因为 bytes.Buffer 不会出错
-			if breader, err = utils.NewReader(v.Bytes()); err != nil {
-				return nil, err
-			}
-		case *utils.Reader:
-			// 创建快照用作body重试
-			breader = v.Temporary()
-		default:
-			// 其他类型都尝试读取到内存中
-			if breader, err = utils.NewReader(v); err != nil {
-				// 转换 body 失败, 则不进行重试
-				return h.requestMethodDo(ctx, url, method, headers, body)
-			}
-		}
-		body = breader
-		defer func() {
-			err = errors.Join(err, breader.Close())
-		}()
-	}
-	request, err := http.NewRequestWithContext(ctx, method, url, body)
+	request, err := http.NewRequestWithContext(ctx, method, rawURL, body)
 	if err != nil {
 		return nil, err
 	}
 	if headers != nil {
-		request.Header = http.Header(headers).Clone()
+		request.Header = headers.Clone()
 	}
-	backoff := h.retryBackoff
+	if reader, ok := body.(*utils.Reader); ok {
+		// utils.Temporary 默认从起点开始；HTTP body 必须从传入 reader 的当前位置发送。
+		start, remaining := reader.Size()-reader.UnLen(), reader.UnLen()
+		request.ContentLength = remaining
+		request.GetBody = func() (io.ReadCloser, error) {
+			if remaining == 0 {
+				return http.NoBody, nil
+			}
+			snapshot := reader.Temporary()
+			_, err := snapshot.Seek(start, io.SeekStart)
+			return snapshot, err
+		}
+		if request.Body, err = request.GetBody(); err != nil {
+			return nil, err
+		}
+		defer func() { err = errors.Join(err, reader.Close()) }()
+	}
+	// 无 GetBody 的流保持单次流式发送，不能猜测 seek 能力或无界读入内存。
+	if request.Body != nil && request.Body != http.NoBody && request.GetBody == nil {
+		total = 1
+	}
+	switch request.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace, http.MethodPut, http.MethodDelete:
+	default:
+		if _, idempotent := request.Header["Idempotency-Key"]; !idempotent {
+			if _, idempotent = request.Header["X-Idempotency-Key"]; !idempotent {
+				total = 1
+			}
+		}
+	}
 	if backoff == nil {
 		backoff = DefaultRetryBackoff
 	}
-	total := h.AutoRetry
-	for i := total; i > 0; i-- {
+	for attempt := 0; attempt < total; attempt++ {
+		current := request.Clone(ctx)
+		if attempt > 0 && request.GetBody != nil {
+			if current.Body, err = request.GetBody(); err != nil {
+				return nil, err
+			}
+		}
+		result, requestErr := client.Do(current)
+		original := result
+		closeIdle := false
+		if onResponse != nil {
+			result, requestErr, closeIdle = onResponse(ctx, current, result, requestErr)
+		}
+		if result == nil && requestErr == nil {
+			requestErr = errors.New("HTTP response callback returned neither response nor error")
+		}
+		if requestErr != nil {
+			// 回调把成功响应转换成错误时，库仍负责释放该次响应，不能把连接占到重试结束。
+			if original != nil && original.Body != nil {
+				requestErr = errors.Join(requestErr, original.Body.Close())
+			}
+			if result != nil && result != original && result.Body != nil {
+				requestErr = errors.Join(requestErr, result.Body.Close())
+			}
+		}
+		if requestErr != nil || closeIdle {
+			client.CloseIdleConnections()
+		}
+		if requestErr == nil {
+			return &Response{Response: result}, nil
+		}
+		err = requestErr
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		if breader != nil {
-			request.ContentLength = breader.Size()
-			request.Body = breader.Temporary()
-			request.GetBody = func() (io.ReadCloser, error) {
-				return breader.Temporary(), nil
+		if attempt+1 < total {
+			timer := time.NewTimer(backoff(attempt))
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
 			}
-		}
-		if response, err = h.requestWithRequest(ctx, request); err != nil {
-			// RUN-5: 还有可重试次数才 sleep; 最后一次失败不 sleep 直接返回.
-			if i > 1 {
-				attempt := total - i // 0,1,2...
-				delay := backoff(attempt)
-				timer := time.NewTimer(delay)
-				select {
-				case <-timer.C:
-				case <-ctx.Done():
-					timer.Stop()
-					return nil, ctx.Err()
-				}
-			}
-			continue
-		} else {
-			break
 		}
 	}
-	if err != nil {
-		// OPS-2: retry 耗尽才 warn 一次, 避免 retry 中途风暴 log.
+	if total > 1 {
 		slog.Warn("net.HTTP RequestMethod exhausted retries",
-			slog.String("method", method),
-			slog.String("url", safeURLForLog(url)),
-			slog.Int("retries", total),
-			slog.String("err", safeErrorForLog(url, err)))
+			slog.String("method", request.Method), slog.String("url", safeURLForLog(rawURL)),
+			slog.Int("attempts", total), slog.String("err", safeErrorForLog(rawURL, err)))
 	}
-	return response, err
+	return nil, err
 }
 
 func Request(ctx context.Context, url string, headers http.Header, body io.Reader) (*Response, error) {
