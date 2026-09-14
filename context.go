@@ -17,6 +17,14 @@ const (
 
 var ErrHTTPNotInContext = errors.New("http not in context")
 
+type requestTransportKey struct{}
+
+// ContextWithTransport 为当前请求链指定传输出口，不修改共享 HTTP 客户端。
+// 多个调用方可在同一连接池上并发选择不同出口；认证、重定向和响应处理仍由 HTTP 负责。
+func ContextWithTransport(ctx context.Context, transport http.RoundTripper) context.Context {
+	return context.WithValue(ctx, requestTransportKey{}, transport)
+}
+
 func Context(ctx context.Context, h *HTTP) context.Context {
 	return context.WithValue(ctx, ContextHTTPKey, h)
 }

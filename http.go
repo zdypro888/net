@@ -443,6 +443,9 @@ func (h *HTTP) RequestMethod(ctx context.Context, rawURL, method string, headers
 	client := *h.client
 	total, backoff, onResponse := h.AutoRetry, h.retryBackoff, h.OnResponse
 	h.mu.RUnlock()
+	if transport, ok := ctx.Value(requestTransportKey{}).(http.RoundTripper); ok && transport != nil {
+		client.Transport = transport
+	}
 	if total <= 0 {
 		total = 1
 	}
