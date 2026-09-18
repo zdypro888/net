@@ -20,6 +20,9 @@ var ErrConnectionClosed = errors.New("connection closed")
 // ErrDuplicateRequestID 表示同一连接中存在重复的在途请求 ID。
 var ErrDuplicateRequestID = errors.New("duplicate request id")
 
+// ErrPushQueueFull 表示业务处理积压；关闭当前连接，不能静默丢弃推送或阻塞控制响应。
+var ErrPushQueueFull = errors.New("push queue capacity exceeded")
+
 var errCanceledRequestIDLimit = errors.New("canceled request id retention limit reached")
 
 type duplicateRequestIDError struct {
@@ -231,10 +234,25 @@ func (client *Client[M, T]) startConnection(ctx context.Context, conn T) {
 		client.heartTime = time.Now().Add(60 * time.Second)
 	}
 
+	// 推送按序独立执行；Handle 内部即使再次发送请求，也不阻塞响应匹配循环。
+	pushes := make(chan M, bufSize)
+	client.waiter.Go(func() {
+		for {
+			select {
+			case <-handleCtx.Done():
+				return
+			case msg := <-pushes:
+				if handleCtx.Err() != nil {
+					return
+				}
+				conn.Handle(handleCtx, msg)
+			}
+		}
+	})
 	// 启动工作协程. 用 Go 1.25 WaitGroup.Go 自动 Add(1)/Done, 避免显式
 	// Add/Done 配对错位的经典坑.
 	client.waiter.Go(func() {
-		client.asyncGo(cctx, handleCtx, cancel, handleCancel, conn, closeCurrent, asynchan, recvchan)
+		client.asyncGo(cctx, handleCtx, cancel, handleCancel, conn, closeCurrent, asynchan, recvchan, pushes)
 	})
 	client.waiter.Go(func() { client.receiveGo(cctx, conn, recvchan) })
 }
@@ -335,7 +353,7 @@ func (client *Client[M, T]) receiveGo(ctx context.Context, conn T, recvchan chan
 // 2. 处理接收队列（recvchan）中的响应
 // 3. 匹配请求和响应（通过 Notify.Id）
 // 4. 分发未匹配的消息到 Handle
-func (client *Client[M, T]) asyncGo(ctx context.Context, handleCtx context.Context, cancel context.CancelFunc, handleCancel context.CancelFunc, conn T, closeConn func() error, asynchan chan *asynRequest[M, T], recvchan <-chan M) {
+func (client *Client[M, T]) asyncGo(ctx context.Context, handleCtx context.Context, cancel context.CancelFunc, handleCancel context.CancelFunc, conn T, closeConn func() error, asynchan chan *asynRequest[M, T], recvchan <-chan M, pushes chan<- M) {
 	requests := newRequestTracker[M]()
 	var zeroM M
 	running := true
@@ -363,9 +381,12 @@ func (client *Client[M, T]) asyncGo(ctx context.Context, handleCtx context.Conte
 					}
 				}
 				if !foundNotify {
-					// 无匹配请求，作为服务端推送处理. 用 handleCtx (Close 时被 cancel)
-					// 而非 ctx: 让阻塞的用户 Handle 在 Close 发起时能解阻塞 (D-P1-1).
-					conn.Handle(handleCtx, recv)
+					select {
+					case pushes <- recv:
+					default:
+						client.setLastError(ErrPushQueueFull)
+						running = false
+					}
 				}
 			}
 		case asyncall, ok := <-asynchan:
@@ -478,15 +499,15 @@ func (client *Client[M, T]) asyncGo(ctx context.Context, handleCtx context.Conte
 	client.sendMu.Unlock()
 	client.active.Store(false)
 
+	// Close 可能等待 Handle 退出，必须先取消业务处理。
+	handleCancel()
 	// 关闭底层连接，让 receiveGo 退出. close 错误只记日志, 不写入 lastError:
 	// 保持 Close/pending Request 的返回错误归一为 ErrConnectionClosed(与 receiveGo
 	// 及其它 Close 错误处理一致), 避免 conn.Close 偶发错误污染对外错误契约.
 	if err := closeConn(); err != nil {
 		slog.Warn("net.Client teardown close failed", slog.Any("err", err))
 	}
-	// 先 cancel handleCtx 再 cancel cctx (cctx cancel 会级联 cancel handleCtx,
-	// 显式调用是为了清晰 + 释放 context 资源, 幂等).
-	handleCancel()
+	// 底层连接已关闭，再取消接收协程的父上下文。
 	cancel()
 
 	// 处理 recvchan 中残留的数据，尝试匹配响应

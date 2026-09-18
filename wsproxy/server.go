@@ -63,6 +63,9 @@ type Server struct {
 	active     map[*Session]string
 	handshakes map[*websocket.Conn]struct{}
 	Token      string
+	// RegisterOnly 将此入口限制为设备注册；拨号只能由持有 Server 的本地代码发起。
+	// 默认关闭，保留现有双向代理入口行为；首次接收连接后不可修改。
+	RegisterOnly bool
 	// ScopeByToken 启用后，注册和远程拨号都必须携带 token，各 token 的连接池完全隔离。
 	// Token 字段是旧版单一服务口令，两种模式不可同时使用。
 	ScopeByToken bool
@@ -193,6 +196,11 @@ func (server *Server) OnConnection(conn *websocket.Conn) {
 			return
 		}
 	case MethodClientDialout:
+		if server.RegisterOnly {
+			server.badHandshakes.Add(1)
+			_ = conn.Close()
+			return
+		}
 		// A1 修复: client → server 的拨号请求方法是 MethodClientDialout (Client.Dial
 		// 发送的就是它); 旧实现错写成 MethodSlaverDialout (那是 server → slaver 的
 		// 指令方向), 导致 Client.Dial 对自家 Server 必然落入 default 被关闭.
