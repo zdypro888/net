@@ -242,7 +242,18 @@ func (c *Client[T]) handleMessageGo(session *Session[T], msgchan <-chan *Packet[
 							slog.Warn("wsc client reconnect close failed",
 								slog.Any("reset_err", err), slog.Any("close_err", closeErr))
 						}
-						running = false
+						// 只有会话真的关闭才退出。reset 还可能因入队超时失败，此时 Session 仍存活；
+						// 若在这里退出，handleChan 被关闭而后续 Connect 会复用旧 session，接收链永久卡死。
+						if errors.Is(err, ErrSessionClosed) || session.closed() {
+							running = false
+							break
+						}
+						select {
+						case <-stopChan:
+							running = false
+						case <-time.After(3 * time.Second):
+						}
+						continue
 					}
 					break
 				}
