@@ -495,7 +495,10 @@ func (client *Client[M, T]) asyncGo(ctx context.Context, handleCtx context.Conte
 	}
 	client.signalStop()
 	// 停止信号之后等待已取得本代队列的发送者退出，随后排空才不会遗漏迟到入队的请求。
+	// [审计修复 2026-09-24] 仅新增本注释与下方 lint:ignore，代码未变。
+	// 有意的空临界区：写锁作为屏障，等待持有读锁的 async 调用全部返回。
 	client.sendMu.Lock()
+	//lint:ignore SA2001 见上：空临界区是屏障而非遗漏。
 	client.sendMu.Unlock()
 	client.active.Store(false)
 
