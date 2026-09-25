@@ -217,6 +217,15 @@ type HTTP struct {
 	AutoRetry  int
 }
 
+// ClientSnapshot 为接受标准 http.Client 的协议组件复用同一连接池和代理配置。
+// 返回客户端值的副本；调用方可修改重定向规则，不得修改共享的 Transport 或 Jar。
+func (h *HTTP) ClientSnapshot() *http.Client {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	client := *h.client
+	return &client
+}
+
 // ConfigureOnResponse 设置响应回调 (推荐用法). 与直接赋值 HTTP.OnResponse 等价.
 func (h *HTTP) ConfigureOnResponse(fn func(ctx context.Context, req *http.Request, res *http.Response, err error) (*http.Response, error, bool)) {
 	h.mu.Lock()

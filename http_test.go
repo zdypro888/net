@@ -387,3 +387,18 @@ func TestResetConnectionsReplacesPoolAndPreservesDialer(t *testing.T) {
 	workers.Wait()
 
 }
+
+// 标准客户端可独立设置重定向，但必须复用已经选择的网络出口。
+func TestClientSnapshotPreservesTransportAndIsolatesOptions(t *testing.T) {
+	h := NewHTTP(nil)
+	defer h.Dispose()
+	first := h.ClientSnapshot()
+	second := h.ClientSnapshot()
+	if first == second || first.Transport != second.Transport {
+		t.Fatal("snapshot must copy client and share transport")
+	}
+	first.Timeout = time.Millisecond
+	if h.ClientSnapshot().Timeout == time.Millisecond {
+		t.Fatal("snapshot mutated parent")
+	}
+}
