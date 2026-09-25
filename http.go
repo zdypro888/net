@@ -446,6 +446,7 @@ func (h *HTTP) RequestMethod(ctx context.Context, rawURL, method string, headers
 	if transport, ok := ctx.Value(requestTransportKey{}).(http.RoundTripper); ok && transport != nil {
 		client.Transport = transport
 	}
+	client.Transport = NetworkTransport(ctx, client.Transport)
 	if total <= 0 {
 		total = 1
 	}
