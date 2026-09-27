@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -352,7 +353,18 @@ func (h *HTTP) ConfigureV2() error {
 	})
 }
 
+// ConfigureCookie 绑定请求 Cookie 容器；typed nil 与 nil 都表示禁用 Cookie。
+// 不能把非空接口中的空指针交给 net/http，否则第一次 Cookies 调用就会崩溃。
 func (h *HTTP) ConfigureCookie(cookies http.CookieJar) {
+	if cookies != nil {
+		value := reflect.ValueOf(cookies)
+		switch value.Kind() {
+		case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+			if value.IsNil() {
+				cookies = nil
+			}
+		}
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.client.Jar = cookies
