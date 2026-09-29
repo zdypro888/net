@@ -201,7 +201,7 @@ func TestObserverWorksWithoutPolicy(t *testing.T) {
 func TestRedirectDoesNotInheritOperationOverride(t *testing.T) {
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/start" {
-			http.Redirect(w, r, "/end", 302)
+			http.Redirect(w, r, "/end", http.StatusFound)
 			return
 		}
 		t.Error("redirect bypassed proxy")
