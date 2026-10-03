@@ -64,13 +64,14 @@ func captureHTTPHandshakeError(dialErr error, response *http.Response) error {
 // Client WebSocket 客户端（基于 Session）。
 // 支持 Connect/Close 模式，Close 后可再次 Connect。
 type Client[T any] struct {
-	locker         sync.RWMutex
-	serverURL      string
-	session        *Session[T]
-	handleChan     chan *Packet[T]
-	codecs         *codecSet
-	bufferSize     int
-	maxMessageSize int64
+	handshakeHeaders http.Header
+	locker           sync.RWMutex
+	serverURL        string
+	session          *Session[T]
+	handleChan       chan *Packet[T]
+	codecs           *codecSet
+	bufferSize       int
+	maxMessageSize   int64
 }
 
 // NewClient 创建客户端。可选 WithCodecs 配置支持的编码 (默认仅 JSON)。
@@ -88,7 +89,7 @@ func NewClientWithBuffer[T any](serverURL string, bufferSize int, opts ...Option
 	for _, opt := range opts {
 		opt(&o)
 	}
-	client := &Client[T]{serverURL: serverURL, codecs: newCodecSet(o.codecs), bufferSize: bufferSize, maxMessageSize: o.resolvedMaxMessageSize()}
+	client := &Client[T]{handshakeHeaders: o.handshakeHeaders.Clone(), serverURL: serverURL, codecs: newCodecSet(o.codecs), bufferSize: bufferSize, maxMessageSize: o.resolvedMaxMessageSize()}
 	client.resetSessionLocked()
 	return client
 }
@@ -124,7 +125,7 @@ func (c *Client[T]) dial(ctx context.Context, guid string) (*websocket.Conn, Cod
 	// 同一握手上限覆盖 DNS/TCP/TLS、HTTP Upgrade 和应用握手。
 	ctx, cancel := context.WithTimeout(ctx, HandshakeTimeout)
 	defer cancel()
-	conn, response, err := websocket.DefaultDialer.DialContext(ctx, c.serverURL, nil)
+	conn, response, err := websocket.DefaultDialer.DialContext(ctx, c.serverURL, c.handshakeHeaders.Clone())
 	if err != nil {
 		return nil, nil, captureHTTPHandshakeError(err, response)
 	}

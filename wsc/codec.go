@@ -2,6 +2,7 @@ package wsc
 
 import (
 	"encoding/json"
+	"net/http"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -53,6 +54,7 @@ var defaultCodec Codec = JSONCodec{}
 type Option func(*options)
 
 type options struct {
+	handshakeHeaders   http.Header
 	codecs             []Codec
 	maxMessageSize     int64
 	sessionIdleTimeout *time.Duration
@@ -142,4 +144,11 @@ func (cs *codecSet) negotiate(requested []string) (Codec, bool) {
 		}
 	}
 	return nil, false
+}
+
+// WithHandshakeHeaders 配置客户端 Upgrade 请求头；调用时复制，防止外部修改或重连时发生竞态。
+// 服务端忽略此选项。认证信息应使用请求头，不能拼到 URL 查询参数中。
+func WithHandshakeHeaders(headers http.Header) Option {
+	snapshot := headers.Clone()
+	return func(o *options) { o.handshakeHeaders = snapshot.Clone() }
 }
