@@ -2,6 +2,7 @@ package net
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -223,5 +224,37 @@ func TestRedirectDoesNotInheritOperationOverride(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatal("redirect inherited direct operation route")
+	}
+}
+
+// [审计修复 2026-10-07] 自定义 TLS 验证需要覆盖显式路由，但不能改动共享出口连接池。
+func TestNetworkTransportWithTLSIsolatedRouteVerification(t *testing.T) {
+	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) }))
+	defer target.Close()
+	config := target.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	config.InsecureSkipVerify = false
+	roots := x509.NewCertPool()
+	roots.AddCert(target.Certificate())
+	config.RootCAs = roots
+	policy, err := NewNetworkPolicy(NetworkPolicyConfig{Default: NetworkRoute{Mode: "direct"}, Steps: map[string]NetworkRoute{"smsless": {Mode: "direct"}}, Requests: []HTTPRequestRoute{{Method: "GET", URL: target.URL, Step: "smsless", Route: NetworkRoute{Mode: "direct"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer policy.CloseIdleConnections()
+	ctx := WithNetworkStep(ContextWithNetworkPolicy(context.Background(), policy), "smsless")
+	transport := NetworkTransportWithTLS(ctx, http.DefaultTransport, config)
+	defer transport.(interface{ CloseIdleConnections() }).CloseIdleConnections()
+	client := &http.Client{Transport: transport}
+	req, _ := http.NewRequestWithContext(ctx, "GET", target.URL, nil)
+	res, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != 204 {
+		t.Fatal(res.StatusCode)
+	}
+	if (policy.fallback.transport.TLSClientConfig != nil && policy.fallback.transport.TLSClientConfig.RootCAs != nil) || (policy.steps["smsless"].transport.TLSClientConfig != nil && policy.steps["smsless"].transport.TLSClientConfig.RootCAs != nil) {
+		t.Fatal("shared policy mutated")
 	}
 }

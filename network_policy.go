@@ -2,6 +2,7 @@ package net
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	rawnet "net"
 	"net/http"
@@ -207,6 +208,7 @@ type networkRoundTripper struct {
 	operation string
 	observer  *networkObserver
 	fallback  http.RoundTripper
+	owned     []*http.Transport
 }
 
 // RoundTrip 在实际发送时选择出口，因此重定向后的请求也按目标方法和地址匹配。
@@ -289,6 +291,62 @@ func NetworkTransport(ctx context.Context, fallback http.RoundTripper) http.Roun
 	step, _ := ctx.Value(networkStepKey{}).(string)
 	operation, _ := ctx.Value(networkOperationKey{}).(string)
 	return &networkRoundTripper{policy: p, step: step, operation: operation, observer: observer, fallback: fallback}
+}
+
+// [审计修复 2026-10-07] NetworkTransportWithTLS 为协议专属 TLS 配置复制每个出口的连接池。
+// 原来业务客户端的 TLS 配置会被代理/直连策略的新 Transport 覆盖；复制保留路由和观察器，不能修改共享策略。
+// 自定义非 http.Transport 的 fallback 仍由其自身负责 TLS。
+func NetworkTransportWithTLS(ctx context.Context, fallback http.RoundTripper, config *tls.Config) http.RoundTripper {
+	if fallback == nil {
+		fallback = http.DefaultTransport
+	}
+	if previous, ok := fallback.(*networkRoundTripper); ok {
+		fallback = previous.fallback
+	}
+	var owned []*http.Transport
+	clone := func(t *http.Transport) *http.Transport {
+		if t == nil {
+			return nil
+		}
+		c := t.Clone()
+		if config != nil {
+			c.TLSClientConfig = config.Clone()
+		}
+		owned = append(owned, c)
+		return c
+	}
+	if t, ok := fallback.(*http.Transport); ok {
+		fallback = clone(t)
+	}
+	p, _ := ctx.Value(networkPolicyKey{}).(*NetworkPolicy)
+	if p == nil {
+		p = &NetworkPolicy{}
+	}
+	copyPolicy := &NetworkPolicy{fallback: p.fallback, steps: make(map[string]networkRouteState), requests: make(map[requestRouteKey]networkRouteState), operations: make(map[string]networkRouteState)}
+	copyPolicy.fallback.transport = clone(p.fallback.transport)
+	for k, v := range p.steps {
+		v.transport = clone(v.transport)
+		copyPolicy.steps[k] = v
+	}
+	for k, v := range p.requests {
+		v.transport = clone(v.transport)
+		copyPolicy.requests[k] = v
+	}
+	for k, v := range p.operations {
+		v.transport = clone(v.transport)
+		copyPolicy.operations[k] = v
+	}
+	observer, _ := ctx.Value(networkObserverKey{}).(*networkObserver)
+	step, _ := ctx.Value(networkStepKey{}).(string)
+	operation, _ := ctx.Value(networkOperationKey{}).(string)
+	return &networkRoundTripper{policy: copyPolicy, fallback: fallback, step: step, operation: operation, observer: observer, owned: owned}
+}
+
+// [审计修复 2026-10-07] 只释放此包装器拥有的连接池，不能关闭别的任务共享的出口。
+func (t *networkRoundTripper) CloseIdleConnections() {
+	for _, c := range t.owned {
+		c.CloseIdleConnections()
+	}
 }
 
 // CloseIdleConnections 释放本轮策略创建的空闲连接，不中断正在执行的请求。
