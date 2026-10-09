@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestNetworkPolicyIsolatedRoutesAndNoFallback(t *testing.T) {
@@ -256,5 +257,39 @@ func TestNetworkTransportWithTLSIsolatedRouteVerification(t *testing.T) {
 	}
 	if (policy.fallback.transport.TLSClientConfig != nil && policy.fallback.transport.TLSClientConfig.RootCAs != nil) || (policy.steps["smsless"].transport.TLSClientConfig != nil && policy.steps["smsless"].transport.TLSClientConfig.RootCAs != nil) {
 		t.Fatal("shared policy mutated")
+	}
+}
+
+func TestRoutedTransportPreservesCallerTimeoutsAndPools(t *testing.T) {
+	policy, err := NewNetworkPolicy(NetworkPolicyConfig{Default: NetworkRoute{Mode: "direct"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer policy.CloseIdleConnections()
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	base.ResponseHeaderTimeout = 17 * time.Millisecond
+	base.TLSHandshakeTimeout = 3 * time.Second
+	base.ExpectContinueTimeout = 7 * time.Second
+	base.MaxConnsPerHost = 2
+	base.Proxy = http.ProxyFromEnvironment
+	routed := policy.transportFor(policy.fallback.transport, base)
+	if routed.ResponseHeaderTimeout != base.ResponseHeaderTimeout || routed.TLSHandshakeTimeout != base.TLSHandshakeTimeout || routed.ExpectContinueTimeout != base.ExpectContinueTimeout || routed.MaxConnsPerHost != 2 {
+		t.Fatal("route changed caller budget")
+	}
+	if routed.Proxy != nil || base.Proxy == nil {
+		t.Fatal("route leaked proxy or changed caller")
+	}
+	if policy.transportFor(policy.fallback.transport, base) != routed {
+		t.Fatal("connection pool not reused")
+	}
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() }))
+	defer target.Close()
+	ctx := ContextWithNetworkPolicy(t.Context(), policy)
+	response, err := (&http.Client{Transport: NetworkTransport(ctx, base)}).Get(target.URL)
+	if response != nil {
+		response.Body.Close()
+	}
+	if err == nil {
+		t.Fatal("response header budget ignored")
 	}
 }

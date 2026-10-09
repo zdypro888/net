@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -46,6 +47,7 @@ type networkRouteState struct {
 type requestRouteKey struct{ method, endpoint, step string }
 
 type NetworkPolicy struct {
+	transports sync.Map // 每个调用方与出口共用连接池；不会改变调用方配置。
 	operations map[string]networkRouteState
 	requests   map[requestRouteKey]networkRouteState
 	fallback   networkRouteState
@@ -140,7 +142,7 @@ func newNetworkRoute(route NetworkRoute) (networkRouteState, error) {
 		return s, fmt.Errorf("unknown network route mode %q", route.Mode)
 	}
 	// 新连接池明确清除环境代理，不继承其它任务的代理或自定义拨号器。
-	s.transport = &http.Transport{ForceAttemptHTTP2: true, MaxIdleConns: 100, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 10 * time.Second, ExpectContinueTimeout: time.Second, DialContext: (&rawnet.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext}
+	s.transport = &http.Transport{ForceAttemptHTTP2: true, MaxIdleConns: 100, IdleConnTimeout: defaultHTTPIdleTimeout, TLSHandshakeTimeout: defaultHTTPTLSHandshakeTimeout, ResponseHeaderTimeout: defaultHTTPHeaderTimeout, ExpectContinueTimeout: defaultHTTPExpectTimeout, DialContext: (&rawnet.Dialer{Timeout: defaultHTTPDialTimeout, KeepAlive: 30 * time.Second}).DialContext}
 	if s.route.Proxy != nil {
 		s.transport.DialContext = s.route.Proxy.DialContext
 	}
@@ -241,7 +243,7 @@ func (t *networkRoundTripper) RoundTrip(r *http.Request) (*http.Response, error)
 	}
 	transport := t.fallback
 	if state.transport != nil {
-		transport = state.transport
+		transport = t.policy.transportFor(state.transport, t.fallback)
 	}
 	started := time.Now()
 	response, err := transport.RoundTrip(r)
@@ -269,6 +271,32 @@ func (t *networkRoundTripper) RoundTrip(r *http.Request) (*http.Response, error)
 		t.observer.report(event)
 	}
 	return response, err
+}
+
+type routedTransportKey struct{ route, base *http.Transport }
+
+// transportFor 只替换出口，保留业务方的握手、响应头、连接池和 TLS 策略。
+// 自定义拨号器可能包含旧代理，因此不能沿用；显式路由始终使用自己的拨号器。
+func (p *NetworkPolicy) transportFor(route *http.Transport, fallback http.RoundTripper) *http.Transport {
+	base, ok := fallback.(*http.Transport)
+	if !ok {
+		return route
+	}
+	key := routedTransportKey{route, base}
+	if cached, ok := p.transports.Load(key); ok {
+		return cached.(*http.Transport)
+	}
+	t := base.Clone()
+	t.Proxy, t.Dial, t.DialTLS, t.DialTLSContext = nil, nil, nil, nil
+	t.DialContext = route.DialContext
+	if route.TLSClientConfig != nil {
+		t.TLSClientConfig = route.TLSClientConfig.Clone()
+	}
+	actual, loaded := p.transports.LoadOrStore(key, t)
+	if loaded {
+		t.CloseIdleConnections()
+	}
+	return actual.(*http.Transport)
 }
 
 // NetworkTransport 为普通 HTTP 客户端安装逐请求路由，不修改共享客户端。
@@ -344,6 +372,10 @@ func NetworkTransportWithTLS(ctx context.Context, fallback http.RoundTripper, co
 
 // [审计修复 2026-10-07] 只释放此包装器拥有的连接池，不能关闭别的任务共享的出口。
 func (t *networkRoundTripper) CloseIdleConnections() {
+	// WithTLS 的策略副本归此包装器所有；普通包装器不能关闭共享策略连接池。
+	if len(t.owned) > 0 {
+		t.policy.transports.Range(func(_, value any) bool { value.(*http.Transport).CloseIdleConnections(); return true })
+	}
 	for _, c := range t.owned {
 		c.CloseIdleConnections()
 	}
@@ -354,6 +386,7 @@ func (p *NetworkPolicy) CloseIdleConnections() {
 	if p == nil {
 		return
 	}
+	p.transports.Range(func(_, value any) bool { value.(*http.Transport).CloseIdleConnections(); return true })
 	if p.fallback.transport != nil {
 		p.fallback.transport.CloseIdleConnections()
 	}

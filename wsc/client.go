@@ -123,9 +123,13 @@ func (c *Client[T]) sessionClosedLocked() bool {
 // 响应里回选定的 codec。响应不带 codec (旧服务端) 时回退到默认 JSON。
 func (c *Client[T]) dial(ctx context.Context, guid string) (*websocket.Conn, Codec, error) {
 	// 同一握手上限覆盖 DNS/TCP/TLS、HTTP Upgrade 和应用握手。
-	ctx, cancel := context.WithTimeout(ctx, HandshakeTimeout)
+	timeout := handshakeTimeout(ctx)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	conn, response, err := websocket.DefaultDialer.DialContext(ctx, c.serverURL, c.handshakeHeaders.Clone())
+	// 同一个预算贯穿所有握手层，避免 DefaultDialer 的另一固定上限截断配置。
+	dialer := *websocket.DefaultDialer
+	dialer.HandshakeTimeout = timeout
+	conn, response, err := dialer.DialContext(ctx, c.serverURL, c.handshakeHeaders.Clone())
 	if err != nil {
 		return nil, nil, captureHTTPHandshakeError(err, response)
 	}
@@ -143,10 +147,7 @@ func (c *Client[T]) dial(ctx context.Context, guid string) (*websocket.Conn, Cod
 		}
 		return errors.Join(err, closeErr)
 	}
-	deadline := time.Now().Add(HandshakeTimeout)
-	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
-		deadline = ctxDeadline
-	}
+	deadline, _ := ctx.Deadline()
 	// 握手
 	if err := conn.SetWriteDeadline(deadline); err != nil {
 		return nil, nil, closeWithContextError(err)
@@ -270,6 +271,15 @@ func (c *Client[T]) handleMessageGo(session *Session[T], msgchan <-chan *Packet[
 		}
 	}
 	close(handleChan)
+}
+
+// ConnectWithTimeout 为本次连接设置独立握手总预算，不修改客户端后续连接的默认值。
+func (c *Client[T]) ConnectWithTimeout(ctx context.Context, timeout time.Duration) error {
+	ctx, err := WithHandshakeTimeout(ctx, timeout)
+	if err != nil {
+		return err
+	}
+	return c.Connect(ctx)
 }
 
 // Connect 执行连接

@@ -58,6 +58,8 @@ var HTTPDebugProxy = &Proxy{Address: "http://127.0.0.1:8888"}
 type Proxy struct {
 	Address string `bson:"Address" json:"Address"`
 	WSToken string `bson:"WSToken,omitempty" json:"WSToken,omitempty"`
+	// ConnectTimeout 是拨号、TLS 和代理握手共用的总预算；零值保留 30 秒默认值。
+	ConnectTimeout time.Duration `bson:"ConnectTimeout,omitempty" json:"ConnectTimeout,omitempty"`
 	// TLSConfig 仅用于 https scheme proxy 的 CONNECT 隧道 TLS 握手.
 	// nil 使用安全默认值；私有 CA 可通过该字段的 RootCAs 显式配置。
 	TLSConfig *tls.Config     `bson:"-" json:"-"`
@@ -115,6 +117,16 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 	if _, _, err := net.SplitHostPort(address); err != nil {
 		return nil, err
 	}
+	if proxy.ConnectTimeout < 0 {
+		return nil, errors.New("proxy: connect timeout must be non-negative")
+	}
+	timeout := proxy.ConnectTimeout
+	if timeout == 0 {
+		timeout = proxyConnectTimeout
+	}
+	// 在拨号前建立唯一总预算，避免每个握手阶段重新获得完整时限。
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	proxyURL, err := proxy.resolve()
 	if err != nil {
 		return nil, err
@@ -136,11 +148,9 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 			d.Authenticate = auth.Authenticate
 		}
 		// SOCKS 握手和 TCP 拨号共用内部上限；成功后 context 不控制已交还的连接。
-		ctx, cancel := context.WithTimeout(ctx, proxyConnectTimeout)
-		defer cancel()
 		return d.DialContext(ctx, network, address)
 	case "http", "https":
-		dialer := &net.Dialer{Timeout: proxyConnectTimeout}
+		dialer := &net.Dialer{Timeout: timeout}
 		conn, err := dialer.DialContext(ctx, "tcp", proxyURL.Host)
 		if err != nil {
 			return nil, err
@@ -163,7 +173,7 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 			}
 			return errors.Join(err, closeErr)
 		}
-		deadline := deadlineWithin(ctx, proxyConnectTimeout)
+		deadline := deadlineWithin(ctx, timeout)
 		if err := conn.SetDeadline(deadline); err != nil {
 			return nil, closeWithContextError(err)
 		}
@@ -234,6 +244,10 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 		}
 		return conn, nil
 	case "ws", "wss":
+		ctx, err = wsproxy.WithHandshakeTimeout(ctx, timeout)
+		if err != nil {
+			return nil, err
+		}
 		if proxy.server != nil {
 			if proxy.WSToken != "" {
 				return proxy.server.DialContextToken(ctx, proxy.WSToken, network, address)
@@ -242,6 +256,7 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 		} else {
 			client := wsproxy.NewClient(proxyURL.String())
 			client.Token = proxy.WSToken
+			client.HandshakeTimeout = timeout
 			return client.Dial(ctx, network, address)
 		}
 	}

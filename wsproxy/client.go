@@ -17,6 +17,8 @@ type Client struct {
 	Id     string
 	WSAddr string
 	Token  string
+	// HandshakeTimeout 覆盖 WebSocket 升级与代理握手的总预算；零值为 30 秒。
+	HandshakeTimeout time.Duration
 }
 
 // NewClient 创建使用指定 WebSocket 服务地址的代理客户端。
@@ -32,9 +34,19 @@ func (client *Client) Dial(ctx context.Context, network, address string) (net.Co
 	if err := validateTarget(network, address); err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, dialHandshakeTimeout)
+	if client.HandshakeTimeout < 0 {
+		return nil, errors.New("wsproxy: handshake timeout must be non-negative")
+	}
+	timeout := client.HandshakeTimeout
+	if timeout == 0 {
+		timeout = dialHandshakeTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	wsConn, response, err := websocket.DefaultDialer.DialContext(ctx, client.WSAddr, nil)
+	// 克隆默认 dialer，升级和应用层握手服从同一个总预算。
+	dialer := *websocket.DefaultDialer
+	dialer.HandshakeTimeout = timeout
+	wsConn, response, err := dialer.DialContext(ctx, client.WSAddr, nil)
 	if err != nil {
 		if response != nil && response.Body != nil {
 			err = errors.Join(err, response.Body.Close())
@@ -44,7 +56,7 @@ func (client *Client) Dial(ctx context.Context, network, address string) (net.Co
 	stopContextClose := closeWebSocketOnContextDone(ctx, wsConn)
 	defer stopContextClose()
 	wsConn.SetReadLimit(MaxMessageSize)
-	deadline := handshakeDeadline(ctx)
+	deadline, _ := ctx.Deadline()
 	closeWithContextError := func(err error) error {
 		closeErr := wsConn.Close()
 		if ctxErr := ctx.Err(); ctxErr != nil {

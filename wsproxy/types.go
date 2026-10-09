@@ -22,10 +22,24 @@ const (
 	slaverHeartbeatWriteTTL = 5 * time.Second
 )
 
+type handshakeTimeoutKey struct{}
+
+// WithHandshakeTimeout 覆盖本机代理握手预算；远端服务和设备仍执行各自的预算。
+func WithHandshakeTimeout(ctx context.Context, timeout time.Duration) (context.Context, error) {
+	if ctx == nil || timeout <= 0 {
+		return ctx, errors.New("wsproxy: handshake timeout must be positive")
+	}
+	return context.WithValue(ctx, handshakeTimeoutKey{}, timeout), nil
+}
+
 func handshakeDeadline(ctx context.Context) time.Time {
-	deadline := time.Now().Add(dialHandshakeTimeout)
-	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
-		deadline = ctxDeadline
+	timeout, _ := ctx.Value(handshakeTimeoutKey{}).(time.Duration)
+	if timeout == 0 {
+		timeout = dialHandshakeTimeout
+	}
+	deadline := time.Now().Add(timeout)
+	if parent, ok := ctx.Deadline(); ok && parent.Before(deadline) {
+		return parent
 	}
 	return deadline
 }
