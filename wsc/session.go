@@ -53,6 +53,7 @@ type SessionStats struct {
 
 // Session 通用会话（客户端和服务端共用）
 type Session[T any] struct {
+	budgets    Budgets
 	guid       string
 	handchan   chan *Packet[T]
 	bufferSize int
@@ -224,7 +225,11 @@ func (s *Session[T]) signalStop() {
 	})
 }
 
-func createSessionWithBuffer[T any](guid string, bufferSize int) *Session[T] {
+func createSessionWithBuffer[T any](guid string, bufferSize int, policies ...Budgets) *Session[T] {
+	p, _ := (Budgets{}).normalized()
+	if len(policies) != 0 {
+		p, _ = policies[0].normalized()
+	}
 	if bufferSize <= 0 {
 		bufferSize = DefaultBufferSize
 	}
@@ -233,6 +238,7 @@ func createSessionWithBuffer[T any](guid string, bufferSize int) *Session[T] {
 	asyncChan := make(chan *asyncInfo[T], bufferSize)
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Session[T]{
+		budgets:    p,
 		ctx:        ctx,
 		cancel:     cancel,
 		guid:       guid,
@@ -433,7 +439,7 @@ func (s *Session[T]) asyncGo(asyncChan <-chan *asyncInfo[T], handchan chan *Pack
 				continue
 			}
 			// wsConn 所有权转移到 rawconn, rawconn.Close 时会关闭连接
-			wsConn := createWSConnection[T](info.Conn, s.bufferSize, info.Codec)
+			wsConn := createWSConnection[T](info.Conn, s.bufferSize, info.Codec, s.budgets)
 			generation := s.advanceGeneration()
 			s.setConnectionArgs(generation, info.Args)
 			hasConnectionArgs := info.Args != nil

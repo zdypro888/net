@@ -64,6 +64,7 @@ func captureHTTPHandshakeError(dialErr error, response *http.Response) error {
 // Client WebSocket 客户端（基于 Session）。
 // 支持 Connect/Close 模式，Close 后可再次 Connect。
 type Client[T any] struct {
+	budgets          Budgets
 	handshakeHeaders http.Header
 	locker           sync.RWMutex
 	serverURL        string
@@ -89,7 +90,7 @@ func NewClientWithBuffer[T any](serverURL string, bufferSize int, opts ...Option
 	for _, opt := range opts {
 		opt(&o)
 	}
-	client := &Client[T]{handshakeHeaders: o.handshakeHeaders.Clone(), serverURL: serverURL, codecs: newCodecSet(o.codecs), bufferSize: bufferSize, maxMessageSize: o.resolvedMaxMessageSize()}
+	client := &Client[T]{budgets: o.resolvedBudgets(), handshakeHeaders: o.handshakeHeaders.Clone(), serverURL: serverURL, codecs: newCodecSet(o.codecs), bufferSize: bufferSize, maxMessageSize: o.resolvedMaxMessageSize()}
 	client.resetSessionLocked()
 	return client
 }
@@ -102,7 +103,7 @@ func (c *Client[T]) Handle() <-chan *Packet[T] {
 }
 
 func (c *Client[T]) resetSessionLocked() {
-	session := createSessionWithBuffer[T](uuid.New().String(), c.bufferSize)
+	session := createSessionWithBuffer[T](uuid.New().String(), c.bufferSize, c.budgets)
 	handleChan := make(chan *Packet[T], c.bufferSize)
 	c.session = session
 	c.handleChan = handleChan
@@ -123,7 +124,10 @@ func (c *Client[T]) sessionClosedLocked() bool {
 // 响应里回选定的 codec。响应不带 codec (旧服务端) 时回退到默认 JSON。
 func (c *Client[T]) dial(ctx context.Context, guid string) (*websocket.Conn, Codec, error) {
 	// 同一握手上限覆盖 DNS/TCP/TLS、HTTP Upgrade 和应用握手。
-	timeout := handshakeTimeout(ctx)
+	timeout := c.budgets.HandshakeTimeout
+	if configured, ok := ctx.Value(handshakeTimeoutKey{}).(time.Duration); ok {
+		timeout = configured
+	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	// 同一个预算贯穿所有握手层，避免 DefaultDialer 的另一固定上限截断配置。
@@ -233,7 +237,7 @@ func (c *Client[T]) handleMessageGo(session *Session[T], msgchan <-chan *Packet[
 						select {
 						case <-stopChan:
 							running = false
-						case <-time.After(3 * time.Second):
+						case <-time.After(c.budgets.ReconnectDelay):
 						}
 						continue
 					}
@@ -253,7 +257,7 @@ func (c *Client[T]) handleMessageGo(session *Session[T], msgchan <-chan *Packet[
 						select {
 						case <-stopChan:
 							running = false
-						case <-time.After(3 * time.Second):
+						case <-time.After(c.budgets.ReconnectDelay):
 						}
 						continue
 					}

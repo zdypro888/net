@@ -15,6 +15,8 @@ import (
 type Slaver struct {
 	Id    string
 	Token string
+	// ReconnectDelay 是注册失败后的本地退避，零值保留三秒默认；Run 开始时冻结。
+	ReconnectDelay time.Duration
 }
 
 func NewSlaver() *Slaver {
@@ -37,6 +39,13 @@ func (slaver *Slaver) Start(ctx context.Context, serverAddr string) {
 
 // Run 维持待命连接，接到拨号命令后补充下一条；取消时等待已派发的隧道全部退出。
 func (slaver *Slaver) Run(ctx context.Context, addr string) error {
+	reconnectDelay := slaver.ReconnectDelay
+	if reconnectDelay < 0 {
+		return errors.New("wsproxy: reconnect delay must be non-negative")
+	}
+	if reconnectDelay == 0 {
+		reconnectDelay = 3 * time.Second
+	}
 	var workers sync.WaitGroup
 	defer workers.Wait()
 	for {
@@ -50,7 +59,7 @@ func (slaver *Slaver) Run(ctx context.Context, addr string) error {
 			}
 			slog.Warn("wsproxy slaver registration failed; backoff before retry", slog.Any("err", err))
 			select {
-			case <-time.After(3 * time.Second):
+			case <-time.After(reconnectDelay):
 			case <-ctx.Done():
 				return ctx.Err()
 			}
@@ -62,8 +71,12 @@ func (slaver *Slaver) Run(ctx context.Context, addr string) error {
 
 // waitDialRequest 完成有界注册，再用 Ping/Pong 维持待命连接；失败时始终收回连接所有权。
 func (slaver *Slaver) waitDialRequest(ctx context.Context, addr string) (conn *websocket.Conn, packet connPacket, err error) {
-	dialCtx, cancelDial := context.WithTimeout(ctx, dialHandshakeTimeout)
-	conn, response, err := websocket.DefaultDialer.DialContext(dialCtx, addr, nil)
+	// TCP/Upgrade 与注册写出共用一次截止时间，尊重 WithHandshakeTimeout。
+	deadline := handshakeDeadline(ctx)
+	dialCtx, cancelDial := context.WithDeadline(ctx, deadline)
+	dialer := *websocket.DefaultDialer
+	dialer.HandshakeTimeout = time.Until(deadline)
+	conn, response, err := dialer.DialContext(dialCtx, addr, nil)
 	cancelDial()
 	if err != nil {
 		if response != nil && response.Body != nil {
@@ -83,7 +96,7 @@ func (slaver *Slaver) waitDialRequest(ctx context.Context, addr string) (conn *w
 		}
 	}()
 	conn.SetReadLimit(MaxMessageSize)
-	if err = conn.SetWriteDeadline(handshakeDeadline(ctx)); err != nil {
+	if err = conn.SetWriteDeadline(deadline); err != nil {
 		return conn, packet, err
 	}
 	if err = conn.WriteJSON(&connPacket{Id: slaver.Id, Method: MethodRegisterSlaver, Token: slaver.Token}); err != nil {
@@ -123,7 +136,8 @@ func (slaver *Slaver) dialContext(ctx context.Context, wsConn *websocket.Conn, n
 	defer wsConn.Close()
 	stopContextClose := closeWebSocketOnContextDone(ctx, wsConn)
 	defer stopContextClose()
-	dialCtx, cancelDial := context.WithTimeout(ctx, dialHandshakeTimeout)
+	deadline := handshakeDeadline(ctx)
+	dialCtx, cancelDial := context.WithDeadline(ctx, deadline)
 	conn, dialErr := (&net.Dialer{}).DialContext(dialCtx, network, address)
 	cancelDial()
 	packet := &connPacket{Id: slaver.Id, Method: MethodSlaverDialoutSuccess}
@@ -133,7 +147,7 @@ func (slaver *Slaver) dialContext(ctx context.Context, wsConn *websocket.Conn, n
 	} else {
 		defer conn.Close()
 	}
-	if err := wsConn.SetWriteDeadline(handshakeDeadline(ctx)); err != nil {
+	if err := wsConn.SetWriteDeadline(deadline); err != nil {
 		return
 	}
 	if err := wsConn.WriteJSON(packet); err != nil {

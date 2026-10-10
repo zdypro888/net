@@ -24,6 +24,7 @@ func (mc *messagechannel[T]) ToPacket() *Packet[T] {
 
 // wsconnection 封装 WebSocket 连接，实现 net.Conn 接口
 type wsconnection[T any] struct {
+	budgets Budgets
 	conn    *websocket.Conn
 	msgchan chan *messagechannel[T]
 	// stop 先解除 Handle 的背压，sendMu 再隔离 close(msgchan) 与仍在发送的 Handle。
@@ -37,7 +38,11 @@ type wsconnection[T any] struct {
 
 // createWSConnection 创建 WebSocket 连接封装, msgchan 由 Conn 管理。codec 为 nil 时
 // 回退到默认 JSON codec。
-func createWSConnection[T any](conn *websocket.Conn, bufferSize int, codec Codec) *wsconnection[T] {
+func createWSConnection[T any](conn *websocket.Conn, bufferSize int, codec Codec, policies ...Budgets) *wsconnection[T] {
+	p, _ := (Budgets{}).normalized()
+	if len(policies) != 0 {
+		p, _ = policies[0].normalized()
+	}
 	if bufferSize <= 0 {
 		bufferSize = DefaultBufferSize
 	}
@@ -47,6 +52,7 @@ func createWSConnection[T any](conn *websocket.Conn, bufferSize int, codec Codec
 	// 读上限已由 Client.dial / Server.OnConnection 按各自配置在握手前设于同一 conn,
 	// 此处不再重复 SetReadLimit, 以免用 const 覆盖掉调用方配置的 WithMaxMessageSize。
 	return &wsconnection[T]{
+		budgets: p,
 		conn:    conn,
 		msgchan: make(chan *messagechannel[T], bufferSize),
 		stop:    make(chan struct{}),
@@ -106,7 +112,7 @@ func (c *wsconnection[T]) Write(ctx context.Context, data *Message[T]) error {
 	if err != nil {
 		return err
 	}
-	deadline := time.Now().Add(WriteTimeout)
+	deadline := time.Now().Add(c.budgets.WriteTimeout)
 	if callerDeadline, ok := ctx.Deadline(); ok && callerDeadline.Before(deadline) {
 		deadline = callerDeadline
 	}

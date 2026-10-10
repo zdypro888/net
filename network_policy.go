@@ -16,6 +16,9 @@ import (
 type NetworkRoute struct {
 	Mode  string `json:"mode"`
 	Proxy *Proxy `json:"proxy,omitempty"`
+	// DialTimeout 是强制直连出口的独立拨号预算，零值沿用默认；父 context 始终优先。
+	// 代理出口使用 Proxy.ConnectTimeout，inherit 沿用调用方拨号器。
+	DialTimeout time.Duration `json:"dialTimeout,omitempty"`
 }
 
 // NetworkPolicyConfig 为整个流程设置默认出口，并按步骤覆盖。空模式等同 inherit。
@@ -110,6 +113,12 @@ func NewNetworkPolicy(config NetworkPolicyConfig) (*NetworkPolicy, error) {
 }
 func newNetworkRoute(route NetworkRoute) (networkRouteState, error) {
 	s := networkRouteState{route: route}
+	if route.DialTimeout < 0 {
+		return s, fmt.Errorf("route dial timeout must be non-negative")
+	}
+	if route.Mode != "direct" && route.DialTimeout != 0 {
+		return s, fmt.Errorf("route dial timeout requires direct mode; configure proxy timeout on Proxy")
+	}
 	switch route.Mode {
 	case "", "inherit":
 		if route.Proxy != nil {
@@ -142,7 +151,11 @@ func newNetworkRoute(route NetworkRoute) (networkRouteState, error) {
 		return s, fmt.Errorf("unknown network route mode %q", route.Mode)
 	}
 	// 新连接池明确清除环境代理，不继承其它任务的代理或自定义拨号器。
-	s.transport = &http.Transport{ForceAttemptHTTP2: true, MaxIdleConns: 100, IdleConnTimeout: defaultHTTPIdleTimeout, TLSHandshakeTimeout: defaultHTTPTLSHandshakeTimeout, ResponseHeaderTimeout: defaultHTTPHeaderTimeout, ExpectContinueTimeout: defaultHTTPExpectTimeout, DialContext: (&rawnet.Dialer{Timeout: defaultHTTPDialTimeout, KeepAlive: 30 * time.Second}).DialContext}
+	dialTimeout := route.DialTimeout
+	if dialTimeout == 0 {
+		dialTimeout = defaultHTTPDialTimeout
+	}
+	s.transport = &http.Transport{ForceAttemptHTTP2: true, MaxIdleConns: 100, IdleConnTimeout: defaultHTTPIdleTimeout, TLSHandshakeTimeout: defaultHTTPTLSHandshakeTimeout, ResponseHeaderTimeout: defaultHTTPHeaderTimeout, ExpectContinueTimeout: defaultHTTPExpectTimeout, DialContext: (&rawnet.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}).DialContext}
 	if s.route.Proxy != nil {
 		s.transport.DialContext = s.route.Proxy.DialContext
 	}

@@ -27,7 +27,8 @@ import (
 )
 
 // DefaultRetryBackoff 是 HTTP.RequestMethod 默认的 retry 间隔.
-// 指数 + 抖动, 100ms * 2^attempt, capped 5s. attempt 从 0 起计数 (即 0 = 第一次重试).
+// 基础间隔按 100ms * 2^attempt 增长并截断到 5s，再加 0~25% 抖动；最终小于 6.25s。
+// attempt 从 0 起计数 (即 0 = 第一次重试)，基础上限不等于包含抖动的总上限。
 // RUN-5 修复: 旧实现 retry 之间 0 sleep, 服务端 5xx 风暴时立即捶 N 次.
 // 可通过 HTTP.ConfigureRetryBackoff 覆盖。
 func DefaultRetryBackoff(attempt int) time.Duration {
@@ -270,32 +271,42 @@ const (
 
 // NewHTTP 创建独立连接池，nil TLS 配置使用安全默认值。
 func NewHTTP(config *tls.Config) *HTTP {
+	h, _ := NewHTTPWithOptions(config, HTTPOptions{})
+	return h
+}
+
+// NewHTTPWithOptions 在创建连接池前校验并冻结阶段预算，NewHTTP 保留兼容默认。
+func NewHTTPWithOptions(config *tls.Config, options HTTPOptions) (*HTTP, error) {
+	options, err := options.normalized()
+	if err != nil {
+		return nil, err
+	}
 	if config == nil {
 		config = DefaultTLSConfig()
 	}
 	// 基础拨号用 DialContext (而非废弃的 Transport.Dial): 拨号阶段同样响应
 	// ctx 取消与 deadline, 保留原 20s 拨号超时语义.
 	baseDial := (&net.Dialer{
-		Timeout: defaultHTTPDialTimeout,
+		Timeout: options.DialTimeout,
 	}).DialContext
 	transport := &http.Transport{
 		DialContext:           baseDial,
-		ResponseHeaderTimeout: defaultHTTPHeaderTimeout,
-		ExpectContinueTimeout: defaultHTTPExpectTimeout,
-		TLSHandshakeTimeout:   defaultHTTPTLSHandshakeTimeout,
+		ResponseHeaderTimeout: options.HeaderTimeout,
+		ExpectContinueTimeout: options.ExpectTimeout,
+		TLSHandshakeTimeout:   options.TLSHandshakeTimeout,
 		TLSClientConfig:       config.Clone(),
-		IdleConnTimeout:       defaultHTTPIdleTimeout,
+		IdleConnTimeout:       options.IdleTimeout,
 	}
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   defaultHTTPRequestTimeout,
+		Timeout:   options.RequestTimeout,
 	}
 	h := &HTTP{
 		transport: transport,
 		client:    client,
 		baseDial:  baseDial,
 	}
-	return h
+	return h, nil
 }
 
 // Dispose 关闭当前连接池中的空闲连接；HTTP/3 会关闭整个 QUIC transport。

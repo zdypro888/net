@@ -54,6 +54,7 @@ var defaultCodec Codec = JSONCodec{}
 type Option func(*options)
 
 type options struct {
+	budgets            Budgets
 	handshakeHeaders   http.Header
 	codecs             []Codec
 	maxMessageSize     int64

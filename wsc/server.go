@@ -13,6 +13,7 @@ import (
 
 // Server 管理多个 Session
 type Server[T any] struct {
+	budgets            Budgets
 	locker             sync.Mutex
 	sessions           map[string]*Session[T]
 	handshakes         map[*websocket.Conn]struct{}
@@ -56,6 +57,7 @@ func NewServerWithBuffer[T any](bufferSize int, opts ...Option) *Server[T] {
 		sessionIdleTimeout = *o.sessionIdleTimeout
 	}
 	return &Server[T]{
+		budgets:            o.resolvedBudgets(),
 		sessions:           make(map[string]*Session[T]),
 		handshakes:         make(map[*websocket.Conn]struct{}),
 		cleanupTimers:      make(map[string]*cleanupTimer),
@@ -161,7 +163,9 @@ func (server *Server[T]) OnConnection(conn *websocket.Conn, args any) (*Session[
 		server.locker.Unlock()
 	}()
 	conn.SetReadLimit(server.maxMessageSize)
-	if err := conn.SetReadDeadline(time.Now().Add(HandshakeTimeout)); err != nil {
+	// 服务端应用握手共用一次预算，不能给读写阶段分别重新发放完整时间。
+	handshakeDeadline := time.Now().Add(server.budgets.HandshakeTimeout)
+	if err := conn.SetReadDeadline(handshakeDeadline); err != nil {
 		return nil, errors.Join(err, conn.Close())
 	}
 	var req HandshakeRequest
@@ -171,7 +175,7 @@ func (server *Server[T]) OnConnection(conn *websocket.Conn, args any) (*Session[
 	// 校验握手请求
 	if req.GUID == "" || req.Version != ProtocolVersion {
 		handshakeErr := fmt.Errorf("client[%s] handshake failed. version=%s", req.GUID, req.Version)
-		if err := conn.SetWriteDeadline(time.Now().Add(HandshakeTimeout)); err != nil {
+		if err := conn.SetWriteDeadline(handshakeDeadline); err != nil {
 			return nil, errors.Join(handshakeErr, err, conn.Close())
 		}
 		if err := conn.WriteJSON(HandshakeResponse{Status: 500, Message: "invalid request"}); err != nil {
@@ -183,7 +187,7 @@ func (server *Server[T]) OnConnection(conn *websocket.Conn, args any) (*Session[
 	codec, ok := server.codecs.negotiate(req.Codecs)
 	if !ok {
 		handshakeErr := fmt.Errorf("client[%s] handshake failed: no common codec, client offered %v", req.GUID, req.Codecs)
-		if err := conn.SetWriteDeadline(time.Now().Add(HandshakeTimeout)); err != nil {
+		if err := conn.SetWriteDeadline(handshakeDeadline); err != nil {
 			return nil, errors.Join(handshakeErr, err, conn.Close())
 		}
 		if err := conn.WriteJSON(HandshakeResponse{Status: 500, Message: "no common codec"}); err != nil {
@@ -194,7 +198,7 @@ func (server *Server[T]) OnConnection(conn *websocket.Conn, args any) (*Session[
 	if err := conn.SetReadDeadline(time.Time{}); err != nil {
 		return nil, errors.Join(err, conn.Close())
 	}
-	if err := conn.SetWriteDeadline(time.Now().Add(HandshakeTimeout)); err != nil {
+	if err := conn.SetWriteDeadline(handshakeDeadline); err != nil {
 		return nil, errors.Join(err, conn.Close())
 	}
 	if err := conn.WriteJSON(HandshakeResponse{Status: 200, Codec: codec.Name()}); err != nil {
@@ -219,7 +223,7 @@ func (server *Server[T]) OnConnection(conn *websocket.Conn, args any) (*Session[
 		session = existing
 		session.setOnDisconnect(server.scheduleSessionCleanup)
 	} else {
-		session = createSessionWithBuffer[T](req.GUID, server.bufferSize)
+		session = createSessionWithBuffer[T](req.GUID, server.bufferSize, server.budgets)
 		session.setOnDisconnect(server.scheduleSessionCleanup)
 		// D4: 调用方直接 session.Close() (不经 RemoveSession) 时也要把表项摘除,
 		// 否则禁用 idle cleanup (WithSessionIdleTimeout<=0) 的配置下僵尸条目永不回收.

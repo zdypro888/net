@@ -38,6 +38,10 @@ func (client *Client) Dial(ctx context.Context, network, address string) (net.Co
 		return nil, errors.New("wsproxy: handshake timeout must be non-negative")
 	}
 	timeout := client.HandshakeTimeout
+	// 单次调用的显式预算优先于客户端默认，随后仍由父 deadline 截断。
+	if override, ok := ctx.Value(handshakeTimeoutKey{}).(time.Duration); ok {
+		timeout = override
+	}
 	if timeout == 0 {
 		timeout = dialHandshakeTimeout
 	}
