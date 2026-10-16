@@ -475,6 +475,9 @@ func (h *HTTP) RequestMethod(ctx context.Context, rawURL, method string, headers
 	client := *h.client
 	total, backoff, onResponse := h.AutoRetry, h.retryBackoff, h.OnResponse
 	h.mu.RUnlock()
+	if session, ok := ctx.Value(httpSessionKey{}).(httpSession); ok {
+		client.Jar, client.CheckRedirect = session.jar, session.redirect
+	}
 	if transport, ok := ctx.Value(requestTransportKey{}).(http.RoundTripper); ok && transport != nil {
 		client.Transport = transport
 	}

@@ -19,6 +19,18 @@ var ErrHTTPNotInContext = errors.New("http not in context")
 
 type requestTransportKey struct{}
 
+type httpSessionKey struct{}
+type httpSession struct {
+	jar      http.CookieJar
+	redirect func(*http.Request, []*http.Request) error
+}
+
+// ContextWithHTTPSession 为本次协议交互隔离 Cookie 和重定向策略，保留既有代理、TLS 和观察器。
+// 不修改共享客户端；同一 ctx 派生的多轮请求复用传入的会话容器。
+func ContextWithHTTPSession(ctx context.Context, jar http.CookieJar, redirect func(*http.Request, []*http.Request) error) context.Context {
+	return context.WithValue(ctx, httpSessionKey{}, httpSession{jar: jar, redirect: redirect})
+}
+
 // ContextWithTransport 为当前请求链指定传输出口，不修改共享 HTTP 客户端。
 // 多个调用方可在同一连接池上并发选择不同出口；认证、重定向和响应处理仍由 HTTP 负责。
 func ContextWithTransport(ctx context.Context, transport http.RoundTripper) context.Context {
