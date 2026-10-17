@@ -58,11 +58,12 @@ type slaverEntry struct {
 
 // Server 表示一个代理服务器
 type Server struct {
-	locker     sync.Mutex
-	sessions   *list.List // 使用 list 保持顺序，FIFO 方式使用连接; 元素类型 *slaverEntry
-	active     map[*Session]string
-	handshakes map[*websocket.Conn]struct{}
-	Token      string
+	locker      sync.Mutex
+	poolChanged chan struct{} // 登记新待命连接时广播；等待者按 token 重查，禁止跨租户取用。
+	sessions    *list.List    // 使用 list 保持顺序，FIFO 方式使用连接; 元素类型 *slaverEntry
+	active      map[*Session]string
+	handshakes  map[*websocket.Conn]struct{}
+	Token       string
 	// RegisterOnly 将此入口限制为设备注册；拨号只能由持有 Server 的本地代码发起。
 	// 默认关闭，保留现有双向代理入口行为；首次接收连接后不可修改。
 	RegisterOnly bool
@@ -78,6 +79,9 @@ type Server struct {
 	// MaxSessions 限制注册池容量, <=0 时用 DefaultMaxSessions. 超限的注册被拒绝
 	// (关闭连接, slaver 侧按既有 backoff 重试), 防止死注册无界堆积.
 	MaxSessions int
+
+	// SessionWaitTimeout 允许池短暂耗尽时等待重连补充；零值立即失败，仍受拨号总预算约束。
+	SessionWaitTimeout time.Duration
 
 	// 生命周期管理: ctx 用于让 in-flight onClientDialout / copyLoop 在 CloseAll
 	// 时被 cancel. workerWG 等待所有 watcher 和 dialout goroutine 退出.
@@ -98,11 +102,12 @@ type Server struct {
 func NewServer() *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
-		sessions:   list.New(),
-		active:     make(map[*Session]string),
-		handshakes: make(map[*websocket.Conn]struct{}),
-		ctx:        ctx,
-		cancel:     cancel,
+		sessions:    list.New(),
+		poolChanged: make(chan struct{}),
+		active:      make(map[*Session]string),
+		handshakes:  make(map[*websocket.Conn]struct{}),
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 }
 
@@ -267,6 +272,8 @@ func (server *Server) registerSlaverSession(scope string, session *Session) bool
 	}
 	entry := &slaverEntry{session: session, scope: scope, reply: make(chan slaverRead, 1)}
 	elem := server.sessions.PushBack(entry)
+	close(server.poolChanged)
+	server.poolChanged = make(chan struct{})
 	server.workerWG.Go(func() { server.watchSlaver(entry, elem) })
 	server.locker.Unlock()
 	return true
@@ -281,18 +288,27 @@ func (server *Server) registerSlaverSession(scope string, session *Session) bool
 //
 // list.Remove 对已移除元素是 no-op, popped 标记保证出池责任(回收+计数)只归一方.
 func (server *Server) watchSlaver(entry *slaverEntry, elem *list.Element) {
-	if err := entry.session.Conn.SetReadDeadline(time.Now().Add(slaverHeartbeatTimeout)); err != nil {
+	// 入池到 watcher 调度之间也可能被取用；期限更新和 pop 使用同一把锁，
+	// 已转交拨号的连接不得再被待命心跳重新设置空闲期限。
+	refresh := func() error {
+		server.locker.Lock()
+		defer server.locker.Unlock()
+		if entry.popped {
+			return nil
+		}
+		return entry.session.Conn.SetReadDeadline(time.Now().Add(slaverHeartbeatTimeout))
+	}
+	if err := refresh(); err != nil {
 		read := slaverRead{err: err}
 		entry.reply <- read
 		server.removePooledSlaver(entry, elem, read)
 		return
 	}
 	entry.session.Conn.SetPingHandler(func(message string) error {
-		now := time.Now()
-		if err := entry.session.Conn.SetReadDeadline(now.Add(slaverHeartbeatTimeout)); err != nil {
+		if err := refresh(); err != nil {
 			return err
 		}
-		return entry.session.Conn.WriteControl(websocket.PongMessage, []byte(message), now.Add(slaverHeartbeatWriteTTL))
+		return entry.session.Conn.WriteControl(websocket.PongMessage, []byte(message), time.Now().Add(slaverHeartbeatWriteTTL))
 	})
 	var packet connPacket
 	err := entry.session.Conn.ReadJSON(&packet)
@@ -369,6 +385,40 @@ func (server *Server) popSession(scope string) (*slaverEntry, error) {
 	}
 }
 
+// waitSession 只等待拨号前的待命通道，尚未发送目标请求，不会重放上传或切换出口。
+func (server *Server) waitSession(ctx context.Context, scope string) (*slaverEntry, error) {
+	if server.SessionWaitTimeout <= 0 {
+		return server.popSession(scope)
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, server.SessionWaitTimeout)
+	defer cancel()
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := waitCtx.Err(); err != nil {
+			return nil, errors.Join(ErrNoConnection, err)
+		}
+		// 先订阅再取连接，避免取空与登记之间丢失唤醒。
+		server.locker.Lock()
+		changed := server.poolChanged
+		server.locker.Unlock()
+		entry, err := server.popSession(scope)
+		if !errors.Is(err, ErrNoConnection) {
+			return entry, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-server.ctx.Done():
+			return nil, ErrServerClosed
+		case <-waitCtx.Done():
+			return nil, errors.Join(ErrNoConnection, waitCtx.Err())
+		case <-changed:
+		}
+	}
+}
+
 func (server *Server) untrackSession(session *Session) {
 	server.locker.Lock()
 	delete(server.active, session)
@@ -399,8 +449,11 @@ func (server *Server) dialContextScope(ctx context.Context, scope, network, addr
 	if server.closed.Load() {
 		return nil, ErrServerClosed
 	}
-	// popSession 已经从池中移除了会话，每个连接只用一次
-	entry, err := server.popSession(scope)
+	// 等待补池和拨号握手共享同一次预算，不能因重连把调用期限无限向后推。
+	deadline := handshakeDeadline(ctx)
+	ctx, cancelDial := context.WithDeadline(ctx, deadline)
+	defer cancelDial()
+	entry, err := server.waitSession(ctx, scope)
 	if err != nil {
 		if errors.Is(err, ErrNoConnection) {
 			server.noSessionDials.Add(1)
@@ -425,7 +478,11 @@ func (server *Server) dialContextScope(ctx context.Context, scope, network, addr
 
 	// 设置写超时，防止阻塞。与 client.Dial 一致直接用 deadline，不经 now+Until —
 	// 否则 ctx 即将到期时算出的负 timeout 会把可用连接的 deadline 设成过去 → 立即超时。
-	deadline := handshakeDeadline(ctx)
+	// [nbpro 断线回归] 清除尚未到期的待命 read deadline，再由握手 timer 接管。
+	// 等响应后才清除会使旧心跳期限提前杀死有效拨号；UnderlyingConn 支持并发期限更新。
+	if err := session.Conn.UnderlyingConn().SetReadDeadline(time.Time{}); err != nil {
+		return nil, closeWithContextError(err)
+	}
 	if err := session.Conn.SetWriteDeadline(deadline); err != nil {
 		return nil, closeWithContextError(err)
 	}
