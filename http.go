@@ -203,9 +203,11 @@ func safeErrorForLog(requestURL string, err error) string {
 // HTTP 的 Configure 方法可与请求并发；每次请求持有独立配置快照。
 // 调用方传入的 CookieJar、TLS 回调和拨号函数仍须满足各自的并发契约。
 type HTTP struct {
-	mu        sync.RWMutex
-	transport http.RoundTripper
-	client    *http.Client
+	mu            sync.RWMutex
+	transport     http.RoundTripper
+	client        *http.Client
+	requestRouter func(http.RoundTripper) http.RoundTripper
+	closeRouter   func()
 	// baseDial 是 NewHTTP 创建时的基础拨号函数 (20s 拨号超时, 响应 ctx 取消/deadline).
 	// ConfigureProxyClear / ConfigureProxyReset(未存代理拨号时) 恢复到它, 保证清除代理后
 	// 拨号超时语义不丢. NewHTTP3 (http3.Transport) 不走 DialContext, 该字段为 nil 且不被使用.
@@ -225,7 +227,22 @@ func (h *HTTP) ClientSnapshot() *http.Client {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	client := *h.client
+	if h.requestRouter != nil {
+		client.Transport = h.requestRouter(client.Transport)
+	}
 	return &client
+}
+
+// ConfigureRequestRouter 安装独立会话的逐请求选路包装；配置变更与请求快照使用同一把锁。
+// wrap 不得执行网络请求；close 只回收该包装器拥有的空闲连接。
+func (h *HTTP) ConfigureRequestRouter(wrap func(http.RoundTripper) http.RoundTripper, close func()) {
+	h.mu.Lock()
+	previous := h.closeRouter
+	h.requestRouter, h.closeRouter = wrap, close
+	h.mu.Unlock()
+	if previous != nil {
+		previous()
+	}
 }
 
 // ConfigureOnResponse 设置响应回调 (推荐用法). 与直接赋值 HTTP.OnResponse 等价.
@@ -313,7 +330,11 @@ func NewHTTPWithOptions(config *tls.Config, options HTTPOptions) (*HTTP, error) 
 func (h *HTTP) Dispose() {
 	h.mu.RLock()
 	transport := h.transport
+	closeRouter := h.closeRouter
 	h.mu.RUnlock()
+	if closeRouter != nil {
+		closeRouter()
+	}
 	switch transport := transport.(type) {
 	case *http.Transport:
 		transport.CloseIdleConnections()
@@ -473,6 +494,9 @@ func (h *HTTP) Request(ctx context.Context, url string, headers http.Header, bod
 func (h *HTTP) RequestMethod(ctx context.Context, rawURL, method string, headers http.Header, body io.Reader) (response *Response, err error) {
 	h.mu.RLock()
 	client := *h.client
+	if h.requestRouter != nil {
+		client.Transport = h.requestRouter(client.Transport)
+	}
 	total, backoff, onResponse := h.AutoRetry, h.retryBackoff, h.OnResponse
 	h.mu.RUnlock()
 	if session, ok := ctx.Value(httpSessionKey{}).(httpSession); ok {
