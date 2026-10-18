@@ -3,7 +3,9 @@ package wsproxy
 import (
 	"container/list"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"log/slog"
 	"net"
@@ -73,6 +75,8 @@ type Server struct {
 	// AuthorizeToken 在分池模式下校验 token 是否属于有效租户；为空时只校验非空。
 	// 回调不得记录 token，也不应执行耗时较长的操作。
 	AuthorizeToken func(context.Context, string) error
+	// ResolveRegistrationToken 只为出口注册解析租户池；设备凭据不能借此获得远程拨号权限。
+	ResolveRegistrationToken func(context.Context, string) (string, error)
 	// MaxSessionsPerToken 限制单个 token 的待命连接数，<=0 表示不单独限制。
 	MaxSessionsPerToken int
 
@@ -158,7 +162,15 @@ func (server *Server) OnConnection(conn *websocket.Conn) {
 			}
 			return
 		}
-		if server.AuthorizeToken != nil {
+		if server.ResolveRegistrationToken != nil && incoming.Method == MethodRegisterSlaver {
+			var err error
+			scope, err = server.ResolveRegistrationToken(server.ctx, incoming.Token)
+			if err != nil || scope == "" {
+				server.tokenRejects.Add(1)
+				_ = conn.Close()
+				return
+			}
+		} else if server.AuthorizeToken != nil {
 			if err := server.AuthorizeToken(server.ctx, incoming.Token); err != nil {
 				server.tokenRejects.Add(1)
 				slog.Warn("wsproxy OnConnection token rejected",
@@ -171,7 +183,9 @@ func (server *Server) OnConnection(conn *websocket.Conn) {
 				return
 			}
 		}
-		scope = incoming.Token
+		if scope == "" {
+			scope = incoming.Token
+		}
 	} else if server.Token != "" && subtle.ConstantTimeCompare([]byte(incoming.Token), []byte(server.Token)) != 1 {
 		// 常数时间比较防止远端攻击者按 Token 字符位 timing 爆破.
 		server.tokenRejects.Add(1)
@@ -194,7 +208,7 @@ func (server *Server) OnConnection(conn *websocket.Conn) {
 	switch incoming.Method {
 	case MethodRegisterSlaver:
 		// 注册连接 (入池 + 启动 watcher); 池满或服务器已关时拒绝.
-		if !server.registerSlaverSession(scope, &Session{Id: incoming.Id, Conn: conn}) {
+		if !server.registerSlaverSession(scope, &Session{Id: incoming.Id, Conn: conn, authorization: incoming.Token}) {
 			if err := conn.Close(); err != nil {
 				slog.Warn("wsproxy OnConnection close rejected slaver failed", slog.Any("err", err))
 			}
@@ -731,3 +745,55 @@ func (server *Server) CloseAll() {
 // iprogram/cmd/iclouder/web.* 直接引用此变量, 不要随意删除.
 // 调用方典型: 起一个 HTTP server, Upgrade 后 go DefaultServer.OnConnection(conn).
 var DefaultServer = NewServer()
+
+// CloseCredentialHash 单独撤销一台出口，不关闭同用户的其它出口；摘要不能用于新建连接。
+func (server *Server) CloseCredentialHash(hash string) {
+	server.locker.Lock()
+	var closing []*Session
+	for elem := server.sessions.Front(); elem != nil; {
+		next := elem.Next()
+		entry := elem.Value.(*slaverEntry)
+		if credentialHash(entry.session.authorization) == hash {
+			entry.popped = true
+			server.sessions.Remove(elem)
+			closing = append(closing, entry.session)
+		}
+		elem = next
+	}
+	for session := range server.active {
+		if credentialHash(session.authorization) == hash {
+			closing = append(closing, session)
+		}
+	}
+	server.locker.Unlock()
+	for _, session := range closing {
+		_ = session.Close()
+	}
+}
+func credentialHash(token string) string {
+	hash := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(hash[:])
+}
+
+// RevalidateRegistrations 周期复核出口授权及租户池归属，撤销或过期后关闭已有隧道。
+func (server *Server) RevalidateRegistrations(ctx context.Context) {
+	if server.ResolveRegistrationToken == nil {
+		return
+	}
+	server.locker.Lock()
+	tokens := map[string]string{}
+	for elem := server.sessions.Front(); elem != nil; elem = elem.Next() {
+		entry := elem.Value.(*slaverEntry)
+		tokens[entry.session.authorization] = entry.scope
+	}
+	for session, scope := range server.active {
+		tokens[session.authorization] = scope
+	}
+	server.locker.Unlock()
+	for token, scope := range tokens {
+		actual, e := server.ResolveRegistrationToken(ctx, token)
+		if e != nil || actual != scope {
+			server.CloseCredentialHash(credentialHash(token))
+		}
+	}
+}
