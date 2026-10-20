@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/zdypro888/net/waitstate"
 )
 
 // ErrNoConnection 表示当前没有可用于拨号的代理连接。
@@ -406,6 +407,12 @@ func (server *Server) waitSession(ctx context.Context, scope string) (*slaverEnt
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, server.SessionWaitTimeout)
 	defer cancel()
+	var endWait func()
+	defer func() {
+		if endWait != nil {
+			endWait()
+		}
+	}()
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -420,6 +427,10 @@ func (server *Server) waitSession(ctx context.Context, scope string) (*slaverEnt
 		entry, err := server.popSession(scope)
 		if !errors.Is(err, ErrNoConnection) {
 			return entry, err
+		}
+		// 仅池确实为空时报告；通知只含固定原因，不暴露租户 token 或目标地址。
+		if endWait == nil {
+			endWait = waitstate.Begin(ctx, "等待代理客户端提供可用连接")
 		}
 		select {
 		case <-ctx.Done():
@@ -474,6 +485,8 @@ func (server *Server) dialContextScope(ctx context.Context, scope, network, addr
 		}
 		return nil, err
 	}
+	doneWait := waitstate.After(ctx, time.Second, "等待代理完成目标连接")
+	defer doneWait()
 	session := entry.session
 	stopContextClose := closeWebSocketOnContextDone(ctx, session.Conn)
 	defer stopContextClose()

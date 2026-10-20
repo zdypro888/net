@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/zdypro888/net/socks5"
+	"github.com/zdypro888/net/waitstate"
 	"github.com/zdypro888/net/wsproxy"
 	"github.com/zdypro888/utils"
 )
@@ -130,6 +131,11 @@ func (proxy *Proxy) DialContext(ctx context.Context, network, address string) (n
 	proxyURL, err := proxy.resolve()
 	if err != nil {
 		return nil, err
+	}
+	// 本地反向代理在池等待和握手处提供更精确通知，其余代理共用拨号阶段说明。
+	if proxy.server == nil || (proxyURL.Scheme != "ws" && proxyURL.Scheme != "wss") {
+		done := waitstate.After(ctx, time.Second, "等待代理建立网络连接")
+		defer done()
 	}
 	switch proxyURL.Scheme {
 	case "socks5", "socks5h":
