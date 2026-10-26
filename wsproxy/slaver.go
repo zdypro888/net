@@ -38,6 +38,7 @@ func (slaver *Slaver) Start(ctx context.Context, serverAddr string) {
 }
 
 // Run 维持待命连接，接到拨号命令后补充下一条；取消时等待已派发的隧道全部退出。
+// 同一 Slaver 可并发 Run 以预建多条通道，均沿用同一节点 Id；启动后配置必须保持只读。
 func (slaver *Slaver) Run(ctx context.Context, addr string) error {
 	reconnectDelay := slaver.ReconnectDelay
 	if reconnectDelay < 0 {

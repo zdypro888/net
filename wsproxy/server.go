@@ -64,7 +64,7 @@ type slaverEntry struct {
 type Server struct {
 	locker      sync.Mutex
 	poolChanged chan struct{} // 登记新待命连接时广播；等待者按 token 重查，禁止跨租户取用。
-	sessions    *list.List    // 使用 list 保持顺序，FIFO 方式使用连接; 元素类型 *slaverEntry
+	sessions    *list.List    // 节点之间轮换，节点内按 FIFO 取通道；元素类型 *slaverEntry
 	active      map[*Session]string
 	handshakes  map[*websocket.Conn]struct{}
 	Token       string
@@ -376,7 +376,7 @@ func (server *Server) removePooledSlaver(entry *slaverEntry, elem *list.Element,
 	}
 }
 
-// popSession 从连接池中取出第一个可用会话（FIFO），并在同一个临界区把它
+// popSession 先按节点轮换，再按节点内 FIFO 取通道；在同一个临界区把它
 // 转移到 active 集合，避免 CloseAll 在两种所有权状态之间漏掉连接。
 func (server *Server) popSession(scope string) (*slaverEntry, error) {
 	for {
@@ -411,6 +411,16 @@ func (server *Server) popSession(scope string) (*slaverEntry, error) {
 				slog.Debug("wsproxy popSession close stale slaver failed", slog.Any("err", err))
 			}
 		default:
+			// 已取用节点的剩余通道移到队尾；通道多只增加容量，不获得额外节点权重。
+			// 只移动同租户、同节点的通道，不改变其它租户或节点内部的先后顺序。
+			for elem, remaining := server.sessions.Front(), server.sessions.Len(); elem != nil && remaining > 0; remaining-- {
+				next := elem.Next()
+				peer := elem.Value.(*slaverEntry)
+				if peer.scope == scope && peer.session.Id == entry.session.Id {
+					server.sessions.MoveToBack(elem)
+				}
+				elem = next
+			}
 			entry.session.setOnClose(server.untrackSession)
 			server.active[entry.session] = scope
 			server.locker.Unlock()
