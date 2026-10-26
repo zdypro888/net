@@ -60,6 +60,13 @@ type slaverEntry struct {
 	popped  bool            // 由 server.locker 保护: 已出池 (popSession/CloseAll), watcher 不再负责回收与计数
 }
 
+// RegistrationIdentity 由宿主验证设备凭据后返回；Scope 仅作内存分池，禁止公开。
+// ClientID 非空时作为权威节点编号，客户端不能靠自报随机 Id 增加调度权重。
+type RegistrationIdentity struct {
+	Scope    string `json:"-"`
+	ClientID string `json:"clientId"`
+}
+
 // Server 表示一个代理服务器
 type Server struct {
 	locker      sync.Mutex
@@ -78,7 +85,7 @@ type Server struct {
 	// 回调不得记录 token，也不应执行耗时较长的操作。
 	AuthorizeToken func(context.Context, string) error
 	// ResolveRegistrationToken 只为出口注册解析租户池；设备凭据不能借此获得远程拨号权限。
-	ResolveRegistrationToken func(context.Context, string) (string, error)
+	ResolveRegistrationToken func(context.Context, string) (RegistrationIdentity, error)
 	// MaxSessionsPerToken 限制单个 token 的待命连接数，<=0 表示不单独限制。
 	MaxSessionsPerToken int
 
@@ -179,7 +186,12 @@ func (server *Server) onConnection(conn *websocket.Conn, sourceIP string) {
 		}
 		if server.ResolveRegistrationToken != nil && incoming.Method == MethodRegisterSlaver {
 			var err error
-			scope, err = server.ResolveRegistrationToken(server.ctx, incoming.Token)
+			var identity RegistrationIdentity
+			identity, err = server.ResolveRegistrationToken(server.ctx, incoming.Token)
+			scope = identity.Scope
+			if identity.ClientID != "" {
+				incoming.Id = identity.ClientID
+			}
 			if err != nil || scope == "" {
 				server.tokenRejects.Add(1)
 				_ = conn.Close()
@@ -834,7 +846,7 @@ func (server *Server) RevalidateRegistrations(ctx context.Context) {
 	server.locker.Unlock()
 	for token, scope := range tokens {
 		actual, e := server.ResolveRegistrationToken(ctx, token)
-		if e != nil || actual != scope {
+		if e != nil || actual.Scope != scope {
 			server.CloseCredentialHash(credentialHash(token))
 		}
 	}

@@ -23,11 +23,11 @@ func TestDeviceRegistrationScopeAndIndependentRevocation(t *testing.T) {
 		}
 		return errors.New("device cannot dial")
 	}
-	proxy.ResolveRegistrationToken = func(_ context.Context, key string) (string, error) {
+	proxy.ResolveRegistrationToken = func(_ context.Context, key string) (RegistrationIdentity, error) {
 		if key == "device-a" || key == "device-b" {
-			return "owner-scope", nil
+			return RegistrationIdentity{Scope: "owner-scope", ClientID: key}, nil
 		}
-		return "", errors.New("unauthorized")
+		return RegistrationIdentity{}, errors.New("unauthorized")
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, e := (&websocket.Upgrader{}).Upgrade(w, r, nil)
@@ -42,7 +42,7 @@ func TestDeviceRegistrationScopeAndIndependentRevocation(t *testing.T) {
 			t.Fatal(e)
 		}
 		t.Cleanup(func() { c.Close() })
-		if e = c.WriteJSON(connPacket{Id: key, Method: method, Token: key}); e != nil {
+		if e = c.WriteJSON(connPacket{Id: "untrusted-self-reported", Method: method, Token: key}); e != nil {
 			t.Fatal(e)
 		}
 		return c
@@ -59,7 +59,12 @@ func TestDeviceRegistrationScopeAndIndependentRevocation(t *testing.T) {
 			t.Fatalf("connections=%d want=%d", n, want)
 		}
 	}
-	wait(2)
+	_ = register("device-a", MethodRegisterSlaver)
+	wait(3)
+	rows := proxy.ConnectionsToken("owner-scope")
+	if len(rows) != 2 || rows[0].ClientID != "device-a" || rows[0].Idle != 2 || rows[1].ClientID != "device-b" {
+		t.Fatal("trusted device IDs were not applied", rows)
+	}
 	proxy.CloseCredentialHash(credentialHash("device-a"))
 	wait(1)
 	denied := register("device-b", MethodClientDialout)
@@ -72,7 +77,9 @@ func TestDeviceRegistrationScopeAndIndependentRevocation(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	proxy.ResolveRegistrationToken = func(context.Context, string) (string, error) { return "other-owner", nil }
+	proxy.ResolveRegistrationToken = func(context.Context, string) (RegistrationIdentity, error) {
+		return RegistrationIdentity{Scope: "other-owner"}, nil
+	}
 	proxy.RevalidateRegistrations(context.Background())
 	entry.session.deadlineMu.Lock()
 	closed := entry.session.closed
