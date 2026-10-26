@@ -14,6 +14,8 @@ import (
 // Session 表示一个代理会话, 需要实现 net.Conn 接口
 type Session struct {
 	authorization string // 仅内存复核使用，不序列化或记录到日志。
+	sourceIP      string // 服务接入层确认的来源；不代表目标站点看到的出口。
+	connectedAt   time.Time
 	Id            string
 	Conn          *websocket.Conn
 	reader        io.Reader // 当前二进制帧，按调用方缓冲区流式读取

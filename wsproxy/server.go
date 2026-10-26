@@ -9,6 +9,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -118,6 +119,19 @@ func NewServer() *Server {
 
 // OnConnection 处理新连接
 func (server *Server) OnConnection(conn *websocket.Conn) {
+	server.onConnection(conn, "")
+}
+
+// OnConnectionFrom 接收宿主按可信反代规则解析的来源 IP；不采信协议包中的自报地址。
+func (server *Server) OnConnectionFrom(conn *websocket.Conn, source netip.Addr) {
+	ip := ""
+	if source.IsValid() {
+		ip = source.Unmap().String()
+	}
+	server.onConnection(conn, ip)
+}
+
+func (server *Server) onConnection(conn *websocket.Conn, sourceIP string) {
 	conn.SetReadLimit(MaxMessageSize)
 	server.locker.Lock()
 	if server.closed.Load() {
@@ -209,7 +223,7 @@ func (server *Server) OnConnection(conn *websocket.Conn) {
 	switch incoming.Method {
 	case MethodRegisterSlaver:
 		// 注册连接 (入池 + 启动 watcher); 池满或服务器已关时拒绝.
-		if !server.registerSlaverSession(scope, &Session{Id: incoming.Id, Conn: conn, authorization: incoming.Token}) {
+		if !server.registerSlaverSession(scope, &Session{Id: incoming.Id, Conn: conn, authorization: incoming.Token, sourceIP: sourceIP}) {
 			if err := conn.Close(); err != nil {
 				slog.Warn("wsproxy OnConnection close rejected slaver failed", slog.Any("err", err))
 			}
@@ -252,6 +266,11 @@ func (server *Server) OnConnection(conn *websocket.Conn) {
 // registerSlaverSession 把注册成功的 slaver 连接入池并启动 watcher.
 // OnConnection 注册分支与测试共用. 返回 false 表示服务器已关闭或池已满 (调用方负责关连接).
 func (server *Server) registerSlaverSession(scope string, session *Session) bool {
+	if session.sourceIP == "" {
+		host, _, _ := net.SplitHostPort(session.Conn.RemoteAddr().String())
+		session.sourceIP = host
+	}
+	session.connectedAt = time.Now().UTC()
 	limit := server.MaxSessions
 	if limit <= 0 {
 		limit = DefaultMaxSessions
