@@ -254,7 +254,7 @@ func (client *Client[M, T]) startConnection(ctx context.Context, conn T) {
 	client.waiter.Go(func() {
 		client.asyncGo(cctx, handleCtx, cancel, handleCancel, conn, closeCurrent, asynchan, recvchan, pushes)
 	})
-	client.waiter.Go(func() { client.receiveGo(cctx, conn, recvchan) })
+	client.waiter.Go(func() { client.receiveGo(cctx, conn, recvchan, stopChan) })
 }
 
 // Reset 重置 Client 使用新的连接。如果存在则关闭旧连接。
@@ -327,13 +327,19 @@ func (client *Client[M, T]) Stats() ClientStats {
 // receiveGo 是接收协程，负责从连接读取数据。
 // 读取到的数据发送到 recvchan 供 asyncGo 处理。
 // 当连接断开或发生错误时退出。
-func (client *Client[M, T]) receiveGo(ctx context.Context, conn T, recvchan chan M) {
+func (client *Client[M, T]) receiveGo(ctx context.Context, conn T, recvchan chan M, stopping <-chan struct{}) {
 	for {
 		data, err := conn.Read(ctx)
 		if err != nil {
-			// C-P2-2: 非主动 Close 导致的读失败, 记录真实断连原因便于运维诊断;
-			// 主动 Close (closed 先置位, teardown 再关 conn) 属预期, 不刷日志.
-			if !client.closed.Load() {
+			// 每代停止屏障在内部收尾关闭socket之前置位；父上下文取消同样是预期退出。
+			// 不按错误文本屏蔽net.ErrClosed：没有生命周期停止证据时仍记录真实断连。
+			expected := ctx.Err() != nil
+			select {
+			case <-stopping:
+				expected = true
+			default:
+			}
+			if !expected {
 				slog.Warn("net client receive loop exited on read error", slog.Any("err", err))
 			}
 			break
